@@ -10,8 +10,8 @@ import numpy
 import tifffile
 from PIL import Image
 
-import convert_to_svs
-from dmetrix_to_svs import DmetrixParser, convert_one
+from img2svs.app import convert_to_svs
+from img2svs.converters.dmetrix_to_svs import DmetrixParser, convert_one
 
 
 def _encoded_image(

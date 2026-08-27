@@ -13,7 +13,7 @@ import numpy
 import tifffile
 from PIL import Image
 
-from svs_common import (
+from img2svs.core.svs_common import (
     APERIO_VERSION,
     BatchOptions,
     add_jpeg_quality_argument,
@@ -27,12 +27,12 @@ from svs_common import (
     normalize_jpeg_quality,
     pixels_per_centimeter,
     run_conversion_jobs,
-    should_use_bigtiff,
 )
 
-SUPPORTED_SUFFIXES = {".ndpi"}
+SUPPORTED_SUFFIXES = {".mrxs"}
 DEFAULT_TILE_SIZE = 256
-DEFAULT_JPEG_QUALITY = 90
+DEFAULT_JPEG_QUALITY = 70
+BIGTIFF_THRESHOLD_BYTES = 3_500_000_000
 
 
 def _looks_like_vips_root(path: Path) -> bool:
@@ -131,15 +131,50 @@ def load_pyvips():
         import pyvips
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "NDPI conversion requires the optional 'pyvips' package. "
+            "MRXS conversion requires the optional 'pyvips' package. "
             "Install pyvips and make sure libvips is available before rerunning."
         ) from exc
     except OSError as exc:
         raise RuntimeError(
-            "NDPI conversion requires libvips runtime libraries. "
+            "MRXS conversion requires libvips runtime libraries. "
             "Please install libvips and make sure VIPS_HOME or PATH points to it."
         ) from exc
     return pyvips
+
+
+def mrxs_data_directory(path: Path) -> Path:
+    """返回 .mrxs 旁边存放 Data*.dat 的同名目录。"""
+
+    return path.with_suffix("")
+
+
+def mrxs_total_bytes(path: Path) -> int:
+    """估算 .mrxs 整个幻灯片的占用空间，包含数据目录中的全部文件。"""
+
+    total = path.stat().st_size if path.exists() else 0
+    data_dir = mrxs_data_directory(path)
+    if data_dir.is_dir():
+        for entry in data_dir.rglob("*"):
+            if entry.is_file():
+                try:
+                    total += entry.stat().st_size
+                except OSError:
+                    continue
+    return total
+
+
+def should_use_bigtiff_for_mrxs(path: Path, level0_pixels: int = 0) -> bool:
+    """根据原始像素体积或数据目录大小判断是否需要 BigTIFF。
+
+    MRXS 主图分辨率往往非常大，即便 JPEG 压缩后也容易超过 32-bit TIFF
+    的 4 GB 上限，所以在此估算 L0 原始 RGB 字节数（每像素 3 字节）作为
+    主要依据，再叠加数据目录大小做兜底。
+    """
+
+    raw_bytes = level0_pixels * 3
+    if raw_bytes >= BIGTIFF_THRESHOLD_BYTES:
+        return True
+    return mrxs_total_bytes(path) >= BIGTIFF_THRESHOLD_BYTES
 
 
 @dataclass(frozen=True)
@@ -167,14 +202,14 @@ class PyramidLevel:
 
 @dataclass(frozen=True)
 class AssociatedImageEntry:
-    """描述 NDPI 中可读取的关联图名称。"""
+    """描述 MRXS 中可读取的关联图名称。"""
 
     kind: str
 
 
 @dataclass(frozen=True)
-class NdpiSlide:
-    """保存 NDPI 解析完成后的统一幻灯片对象。"""
+class MrxsSlide:
+    """保存 MRXS 解析完成后的统一幻灯片对象。"""
 
     path: Path
     metadata: SlideMetadata
@@ -185,19 +220,19 @@ class NdpiSlide:
 
 @dataclass(frozen=True)
 class CliOptions(BatchOptions):
-    """NDPI 转换入口额外支持的编码参数。"""
+    """MRXS 转换入口额外支持的编码参数。"""
 
     tile_size: int = DEFAULT_TILE_SIZE
     jpeg_quality: int = DEFAULT_JPEG_QUALITY
 
 
 def parse_args(argv: Sequence[str] | None = None) -> CliOptions:
-    """解析 NDPI 转换脚本的命令行参数。"""
+    """解析 MRXS 转换脚本的命令行参数。"""
 
     parser = argparse.ArgumentParser(
-        description="Convert Hamamatsu .ndpi whole-slide images to Aperio SVS."
+        description="Convert 3DHISTECH Pannoramic .mrxs whole-slide images to Aperio SVS."
     )
-    add_batch_arguments(parser, "Path to an input .ndpi file or directory.")
+    add_batch_arguments(parser, "Path to an input .mrxs file or directory.")
     parser.add_argument(
         "--tile-size",
         type=int,
@@ -273,8 +308,8 @@ def aperio_main_description(metadata: SlideMetadata, tile_size: int, level: Pyra
     )
 
 
-def print_slide_info(slide: NdpiSlide) -> None:
-    """打印 NDPI 幻灯片的摘要信息。"""
+def print_slide_info(slide: MrxsSlide) -> None:
+    """打印 MRXS 幻灯片的摘要信息。"""
 
     print(
         f"Image : {slide.metadata.width}x{slide.metadata.height}, "
@@ -288,8 +323,8 @@ def print_slide_info(slide: NdpiSlide) -> None:
     print(f"Assoc : {format_associated_summary(slide.associated_images)}")
 
 
-class NdpiParser:
-    """负责把 NDPI 文件解析成统一的幻灯片对象。"""
+class MrxsParser:
+    """负责把 MRXS 文件解析成统一的幻灯片对象。"""
 
     def __init__(self, path: Path, *, tile_size: int, jpeg_quality: int):
         self.path = path
@@ -297,7 +332,7 @@ class NdpiParser:
         self.jpeg_quality = jpeg_quality
         self.pyvips = load_pyvips()
 
-    def parse(self) -> NdpiSlide:
+    def parse(self) -> MrxsSlide:
         """读取 openslide 暴露的元数据并构建层级信息。"""
 
         image = self._open_slide_image()
@@ -318,7 +353,7 @@ class NdpiParser:
             for name in self._associated_names(image)
             if name in {"label", "macro"}
         )
-        return NdpiSlide(
+        return MrxsSlide(
             path=self.path,
             metadata=metadata,
             tile_size=self.tile_size,
@@ -351,7 +386,7 @@ class NdpiParser:
                 downsample = float(2**index)
 
         if width <= 0 or height <= 0:
-            raise ValueError(f"Invalid NDPI level size at level {index}")
+            raise ValueError(f"Invalid MRXS level size at level {index}")
         return PyramidLevel(
             index=index,
             width=width,
@@ -386,7 +421,7 @@ class NdpiParser:
         return int(image.width), int(image.height)
 
     def _open_slide_image(self, level: int = 0):
-        """优先显式使用 openslideload 打开 NDPI，避免被误判成普通 TIFF。"""
+        """优先显式使用 openslideload 打开 MRXS，避免被误判成普通文件。"""
 
         if hasattr(self.pyvips.Image, "openslideload"):
             return self.pyvips.Image.openslideload(
@@ -406,6 +441,12 @@ class NdpiParser:
             maybe_float(get_field_or_none(image, "openslide.mpp-y")),
         ]
 
+        for field in (
+            "mirax.LAYER_0_LEVEL_0_SECTION.MICROMETER_PER_PIXEL_X",
+            "mirax.LAYER_0_LEVEL_0_SECTION.MICROMETER_PER_PIXEL_Y",
+        ):
+            candidates.append(maybe_float(get_field_or_none(image, field)))
+
         xres = maybe_float(get_field_or_none(image, "xres"))
         yres = maybe_float(get_field_or_none(image, "yres"))
         if xres and xres > 0:
@@ -415,13 +456,16 @@ class NdpiParser:
 
         values = [value for value in candidates if value and value > 0]
         if not values:
-            raise ValueError("Unable to determine NDPI MPP from metadata")
+            raise ValueError("Unable to determine MRXS MPP from metadata")
         return sum(values) / len(values)
 
     def _resolve_app_mag(self, image) -> float:
         """读取物镜倍率，缺失时回退到 0。"""
 
-        for field in ("openslide.objective-power", "hamamatsu.Objective.Lens.Magnificant"):
+        for field in (
+            "openslide.objective-power",
+            "mirax.GENERAL.OBJECTIVE_MAGNIFICATION",
+        ):
             value = maybe_float(get_field_or_none(image, field))
             if value and value > 0:
                 return value
@@ -441,9 +485,9 @@ class NdpiParser:
 
 
 class SvsWriter:
-    """负责把 NDPI 内容写成 Aperio 风格 SVS。"""
+    """负责把 MRXS 内容写成 Aperio 风格 SVS。"""
 
-    def __init__(self, slide: NdpiSlide):
+    def __init__(self, slide: MrxsSlide):
         self.slide = slide
         self.pyvips = load_pyvips()
         self.resolution = pixels_per_centimeter(slide.metadata.mpp)
@@ -455,11 +499,9 @@ class SvsWriter:
         thumbnail = self._build_thumbnail()
         associated_images = {} if skip_associated else self._load_associated_images()
 
-        self._write_main_level_with_vips(output_path)
+        self._write_pyramid_with_vips(output_path)
         with tifffile.TiffWriter(output_path, append=True) as tif:
             self._write_thumbnail(tif, thumbnail)
-            for level in self.slide.levels[1:]:
-                self._write_reduced_level(tif, level)
             self._write_associated_images(tif, associated_images)
 
     def _open_level_image(self, index: int):
@@ -472,7 +514,7 @@ class SvsWriter:
         return self._level_cache[index]
 
     def _open_slide_image(self, level: int = 0):
-        """优先显式使用 openslideload 打开 NDPI 的指定层。"""
+        """优先显式使用 openslideload 打开 MRXS 的指定层。"""
 
         if hasattr(self.pyvips.Image, "openslideload"):
             return self.pyvips.Image.openslideload(
@@ -484,8 +526,13 @@ class SvsWriter:
             kwargs["level"] = level
         return self.pyvips.Image.new_from_file(str(self.slide.path), **kwargs)
 
-    def _write_main_level_with_vips(self, output_path: Path) -> None:
-        """用 libvips 直接写出主图页，避免 Python 逐 tile 重编码。"""
+    def _write_pyramid_with_vips(self, output_path: Path) -> None:
+        """用 libvips 一次性写出含降采样层的完整金字塔。
+
+        让 libvips 在内核里多线程做降采样和 JPEG 编码，避免 Python 逐 tile
+        decode/encode 的开销。生成的页数等于 ceil(log2(max_dim/tile_size))+1，
+        因此与 openslide 给出的层数可能不完全一致。
+        """
 
         image = self._open_level_image(0).copy()
         image.set_type(
@@ -504,30 +551,15 @@ class SvsWriter:
             tile=True,
             tile_width=self.slide.tile_size,
             tile_height=self.slide.tile_size,
-            pyramid=False,
-            bigtiff=should_use_bigtiff(self.slide.path),
+            pyramid=True,
+            subifd=False,
+            bigtiff=should_use_bigtiff_for_mrxs(
+                self.slide.path,
+                level0_pixels=self.slide.levels[0].width * self.slide.levels[0].height,
+            ),
             xres=self.resolution / 10.0,
             yres=self.resolution / 10.0,
             resunit="cm",
-        )
-
-    def _write_reduced_level(self, tif: tifffile.TiffWriter, level: PyramidLevel) -> None:
-        """把降采样层作为普通 TIFF page 追加到输出文件。"""
-
-        tif.write(
-            data=vips_to_numpy(self._open_level_image(level.index)),
-            photometric="rgb",
-            tile=(self.slide.tile_size, self.slide.tile_size),
-            compression="jpeg",
-            compressionargs=jpeg_compressionargs(self.slide.metadata.jpeg_quality),
-            subfiletype=1,
-            resolution=(
-                self.resolution / level.downsample,
-                self.resolution / level.downsample,
-            ),
-            resolutionunit="CENTIMETER",
-            metadata=None,
-            software=False,
         )
 
     def _write_thumbnail(self, tif: tifffile.TiffWriter, thumbnail: numpy.ndarray) -> None:
@@ -581,7 +613,7 @@ class SvsWriter:
         return numpy.asarray(thumbnail)
 
     def _load_associated_images(self) -> dict[str, numpy.ndarray]:
-        """读取 NDPI 中可访问的关联图。"""
+        """读取 MRXS 中可访问的关联图。"""
 
         images: dict[str, numpy.ndarray] = {}
         for entry in self.slide.associated_images:
@@ -610,7 +642,7 @@ def convert_one(
     tile_size: int = DEFAULT_TILE_SIZE,
     jpeg_quality: int = DEFAULT_JPEG_QUALITY,
 ) -> None:
-    """完成单个 NDPI 文件到 SVS 的转换。"""
+    """完成单个 MRXS 文件到 SVS 的转换。"""
 
     if output_path.exists() and not overwrite:
         print(f"Skip  : {input_path} -> {output_path} (already exists)")
@@ -624,9 +656,15 @@ def convert_one(
         field_name="--jpeg-quality",
     )
 
+    data_dir = mrxs_data_directory(input_path)
+    if not data_dir.is_dir():
+        raise FileNotFoundError(
+            f"MRXS data directory missing next to slide file: expected {data_dir}"
+        )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    slide = NdpiParser(
+    slide = MrxsParser(
         input_path,
         tile_size=tile_size,
         jpeg_quality=jpeg_quality,
@@ -648,8 +686,8 @@ def main() -> None:
     jobs = build_single_format_jobs(
         options,
         supported_suffixes=SUPPORTED_SUFFIXES,
-        suffix_label=".ndpi",
-        output_error_message="--output can only be used with a single .ndpi input file",
+        suffix_label=".mrxs",
+        output_error_message="--output can only be used with a single .mrxs input file",
         runner_factory=lambda input_path, output_path: lambda: convert_one(
             input_path=input_path,
             output_path=output_path,

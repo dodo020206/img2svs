@@ -8,15 +8,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
-import csp_to_svs
-import convert_to_svs
-import dmetrix_to_svs
-import kfb_to_svs
-import mdsx_to_svs
-import mrxs_to_svs
-import ndpi_to_svs
-import sdpc_to_svs
-from svs_common import ConversionJob, collect_inputs, format_elapsed, resolve_output_path
+from img2svs.app import convert_to_svs
+from img2svs.converters import (
+    csp_to_svs,
+    dmetrix_to_svs,
+    kfb_to_svs,
+    mdsx_to_svs,
+    mrxs_to_svs,
+    ndpi_to_svs,
+    sdpc_to_svs,
+)
+from img2svs.core.svs_common import (
+    ConversionJob,
+    collect_inputs,
+    format_elapsed,
+    resolve_output_path,
+)
 
 GUI_SUPPORTED_SUFFIXES = (
     csp_to_svs.SUPPORTED_SUFFIXES

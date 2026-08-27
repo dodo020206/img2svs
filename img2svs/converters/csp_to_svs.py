@@ -14,7 +14,7 @@ import numpy
 import tifffile
 from PIL import Image
 
-from svs_common import (
+from img2svs.core.svs_common import (
     APERIO_VERSION,
     BatchOptions,
     add_batch_arguments,

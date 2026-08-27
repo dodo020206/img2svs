@@ -32,6 +32,29 @@
 .venv\Scripts\python.exe svs_gui.py
 ```
 
+命令行批量转换使用统一入口：
+
+```bat
+.venv\Scripts\python.exe convert_to_svs.py 输入文件或目录
+```
+
+## 项目结构
+
+代码按功能集中归档，根目录只保留日常使用入口和构建文件：
+
+```text
+img2svs\
+  app\          GUI、统一命令行调度和任务执行服务
+  converters\   各厂商格式转换器
+  core\         公共 SVS 数据结构、参数和批处理能力
+tests\           自动化测试
+tools\           性能测试等开发工具
+packaging\       PyInstaller 打包配置
+vips\            随 EXE 分发的 libvips 运行库
+```
+
+根目录的 `svs_gui.py` 和 `convert_to_svs.py` 是兼容入口，实际功能代码均在 `img2svs` 包内。
+
 ## 界面使用方式
 
 1. 点击“添加文件”或“添加目录”。
@@ -95,7 +118,13 @@ dist\PathologySVSConverter.exe
 
 ## 说明
 
-- GUI 通过现有的 `csp_to_svs.py`、`dmetrix_to_svs.py`、`sdpc_to_svs.py`、`kfb_to_svs.py`、`mdsx_to_svs.py`、`mrxs_to_svs.py`、`ndpi_to_svs.py` 统一调度。
+- GUI 和命令行入口统一调度 `img2svs\converters` 中的各格式转换器。
 - `NDPI/MRXS` 当前通过 `pyvips + libvips` 读取 OpenSlide 暴露的切片内容并生成金字塔 TIFF，以 `.svs` 扩展名输出。
 - `CSP/DMETRIX/KFB/MDSX/MSDX/MRXS/SDPC/DYQX/NDPI` 现在都支持指定输出 JPEG 质量，能够直接影响生成的 `SVS` 体积。帝麦克斯文件保持“原始/推荐”时会直通复制 JPEG 瓦片，转换更快且避免重复压缩。
 - “停止队列”会在当前文件完成后停止剩余任务，不会强制中断正在写入的文件。
+
+开发验证可运行：
+
+```bat
+.venv-package\Scripts\python.exe -m unittest discover -s tests -v
+```

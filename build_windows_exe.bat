@@ -72,10 +72,10 @@ if exist "dist\RCX*.tmp" (
 
 if defined UPX_DIR (
     echo [INFO] UPX_DIR=%UPX_DIR%
-    "%PYTHON_EXE%" -m PyInstaller --noconfirm --clean --upx-dir "%UPX_DIR%" svs_converter_gui.spec
+    "%PYTHON_EXE%" -m PyInstaller --noconfirm --clean --upx-dir "%UPX_DIR%" packaging\svs_converter_gui.spec
 ) else (
     echo [INFO] UPX_DIR is not set. Building without an explicit UPX path.
-    "%PYTHON_EXE%" -m PyInstaller --noconfirm --clean svs_converter_gui.spec
+    "%PYTHON_EXE%" -m PyInstaller --noconfirm --clean packaging\svs_converter_gui.spec
 )
 
 if errorlevel 1 (
