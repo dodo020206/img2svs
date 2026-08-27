@@ -15,22 +15,23 @@ import numpy
 import tifffile
 from PIL import Image
 from img2svs.core.svs_common import (
-    APERIO_VERSION,
     BatchOptions,
     add_jpeg_quality_argument,
     add_batch_arguments,
-    aperio_associated_description,
+    aperio_main_description,
     batch_options_from_args,
     blank_rgb_jpeg,
     build_single_format_jobs,
     decode_rgb_image,
     format_associated_summary,
     format_level_summary,
-    jpeg_compressionargs,
     normalize_jpeg_quality,
     pixels_per_centimeter,
     run_conversion_jobs,
     should_use_bigtiff,
+    write_associated_images,
+    write_pyramid_level,
+    write_thumbnail_page,
 )
 
 SUPPORTED_SUFFIXES = {".mdsx", ".msdx"}
@@ -270,20 +271,6 @@ def coalesce(*values):
         if value is not None:
             return value
     return None
-
-
-def aperio_main_description(
-    metadata: SlideMetadata, tile_size: int, level: PyramidLevel
-) -> str:
-    """生成主图页面写入 SVS 时使用的 Aperio 描述字符串。"""
-
-    return (
-        f"{APERIO_VERSION}\n"
-        f"{level.width}x{level.height} [0,0 {level.width}x{level.height}] "
-        f"({tile_size}x{tile_size}) JPEG/RGB Q={metadata.jpeg_quality}"
-        f"|AppMag = {metadata.app_mag:g}"
-        f"|MPP = {metadata.mpp:.6f}"
-    )
 
 
 def print_slide_info(slide: BkioSlide) -> None:
@@ -551,83 +538,48 @@ class SvsWriter:
                 self._write_thumbnail(tif, thumbnail)
                 for level in self.slide.levels[1:]:
                     self._write_tiled_level(tif, mm, level, reduced=True)
-                self._write_associated_images(tif, associated_images)
+                write_associated_images(
+                    tif, associated_images, jpeg_quality=self.slide.metadata.jpeg_quality
+                )
 
     def _write_tiled_level(
         self, tif: tifffile.TiffWriter, mm: mmap.mmap, level: PyramidLevel, *, reduced: bool
     ) -> None:
         """写出一个瓦片化的主图或降采样层。"""
 
-        common_kwargs = dict(
-            shape=(level.height, level.width, 3),
-            dtype=numpy.uint8,
-            photometric="rgb",
-            tile=(self.tile_size, self.tile_size),
-            compression="jpeg",
-            resolutionunit="CENTIMETER",
-            metadata=None,
-        )
         if self.reencode_jpeg_tiles:
-            common_kwargs["data"] = self._decoded_tile_iterator(mm, level)
-            common_kwargs["compressionargs"] = jpeg_compressionargs(
-                self.slide.metadata.jpeg_quality
-            )
+            data = self._decoded_tile_iterator(mm, level)
+            compressionargs = True
         else:
-            common_kwargs["data"] = self._tile_iterator(mm, level)
-        if reduced:
-            tif.write(
-                **common_kwargs,
-                subfiletype=1,
-                resolution=(
-                    self.resolution / (2**level.index),
-                    self.resolution / (2**level.index),
-                ),
-                software=False,
-            )
-        else:
-            tif.write(
-                **common_kwargs,
-                description=aperio_main_description(
-                    self.slide.metadata, self.tile_size, level
-                ),
-                resolution=(self.resolution, self.resolution),
-                software="mdsx_to_svs.py",
-            )
+            data = self._tile_iterator(mm, level)
+            compressionargs = False
+        write_pyramid_level(
+            tif,
+            data=data,
+            width=level.width,
+            height=level.height,
+            tile_size=self.tile_size,
+            jpeg_quality=self.slide.metadata.jpeg_quality,
+            resolution=self.resolution / (2**level.index) if reduced else self.resolution,
+            reduced=reduced,
+            description=aperio_main_description(
+                self.slide.metadata, self.tile_size, level
+            ),
+            software="mdsx_to_svs.py",
+            compressionargs=compressionargs,
+        )
 
     def _write_thumbnail(
         self, tif: tifffile.TiffWriter, thumbnail: numpy.ndarray
     ) -> None:
         """写出缩略图页面。"""
 
-        tif.write(
-            data=thumbnail,
-            photometric="rgb",
-            compression="jpeg",
-            compressionargs=jpeg_compressionargs(self.slide.metadata.jpeg_quality),
-            resolution=(self.resolution, self.resolution),
-            resolutionunit="CENTIMETER",
-            metadata=None,
-            software=False,
+        write_thumbnail_page(
+            tif,
+            thumbnail,
+            resolution=self.resolution,
+            jpeg_quality=self.slide.metadata.jpeg_quality,
         )
-
-    def _write_associated_images(
-        self, tif: tifffile.TiffWriter, associated_images: dict[str, numpy.ndarray]
-    ) -> None:
-        """按 Aperio 约定写出 label 和 macro 页面。"""
-
-        for kind in ("label", "macro"):
-            image = associated_images.get(kind)
-            if image is None:
-                continue
-            tif.write(
-                data=image,
-                photometric="rgb",
-                compression="jpeg",
-                compressionargs=jpeg_compressionargs(self.slide.metadata.jpeg_quality),
-                description=aperio_associated_description(kind),
-                metadata=None,
-                software=False,
-            )
 
     def _build_thumbnail(self, mm: mmap.mmap, max_size: int = 1024) -> numpy.ndarray:
         """从较低分辨率层重建缩略图。"""
