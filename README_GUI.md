@@ -5,6 +5,7 @@
 支持的输入格式：
 
 - `CSP`
+- `DMETRIX`（帝麦克斯）
 - `SDPC`
 - `DYQX`
 - `KFB`
@@ -31,15 +32,51 @@
 .venv\Scripts\python.exe svs_gui.py
 ```
 
+命令行批量转换使用统一入口：
+
+```bat
+.venv\Scripts\python.exe convert_to_svs.py 输入文件或目录
+```
+
+## 项目结构
+
+代码按功能集中归档，根目录只保留日常使用入口和构建文件：
+
+```text
+img2svs\
+  app\          GUI、统一命令行调度和任务执行服务
+  converters\   各厂商格式转换器
+  core\         公共 SVS 数据结构、参数和批处理能力
+tests\           自动化测试
+tools\           性能测试等开发工具
+packaging\       PyInstaller 打包配置
+vips\            随 EXE 分发的 libvips 运行库
+```
+
+根目录的 `svs_gui.py` 和 `convert_to_svs.py` 是兼容入口，实际功能代码均在 `img2svs` 包内。
+
 ## 界面使用方式
 
-1. 点击“添加文件”或“添加目录”。
+1. 将切片文件或文件夹直接拖入选择区，也可以点击“添加文件”或“添加目录”。
 2. 如需统一输出位置，选择“输出目录”；留空则输出到源文件同目录。
 3. 保持“自动识别（推荐）”即可，除非你只想处理单一格式。
 4. 可在“SVS 保存质量”中选择输出质量。数值越低，SVS 文件通常越小；“原始/推荐”会沿用源图质量，`NDPI` 默认按 `90` 保存，`MRXS` 默认按 `70` 保存。
 5. 点击“开始转换”。
 
+常用快捷键：
+
+- `Ctrl+O`：添加切片文件。
+- `Ctrl+Shift+O`：添加切片目录。
+- `Delete`：移除列表中选中的项目。
+- `F5`：开始转换。
+- `Esc`：请求停止剩余队列。
+
+主界面会根据窗口宽度自动切换左右分栏或上下布局；运行日志默认收起，发生失败时会自动展开并定位到日志区域。
+拖拽会自动过滤不支持的文件并在状态区显示新增、重复和忽略数量；支持的文件格式与“添加文件”按钮一致。
+
 ## 打包为 Windows 可执行文件
+
+项目的 Windows EXE 固定使用 `Python 3.11` 构建；`build_windows_exe.bat` 会检查版本，不接受其他 Python 主次版本。
 
 先在 Windows 环境准备依赖：
 
@@ -92,7 +129,14 @@ dist\PathologySVSConverter.exe
 
 ## 说明
 
-- GUI 通过现有的 `csp_to_svs.py`、`sdpc_to_svs.py`、`kfb_to_svs.py`、`mdsx_to_svs.py`、`mrxs_to_svs.py`、`ndpi_to_svs.py` 统一调度。
+- GUI 和命令行入口统一调度 `img2svs\converters` 中的各格式转换器。
+- GUI 会把每个文件交给独立 worker 进程处理，避免大切片解析占用界面线程；DMetrix 索引使用紧凑数组保存，降低内存峰值。
 - `NDPI/MRXS` 当前通过 `pyvips + libvips` 读取 OpenSlide 暴露的切片内容并生成金字塔 TIFF，以 `.svs` 扩展名输出。
-- `CSP/KFB/MDSX/MSDX/MRXS/SDPC/DYQX/NDPI` 现在都支持指定输出 JPEG 质量，能够直接影响生成的 `SVS` 体积。
+- `CSP/DMETRIX/KFB/MDSX/MSDX/MRXS/SDPC/DYQX/NDPI` 现在都支持指定输出 JPEG 质量，能够直接影响生成的 `SVS` 体积。帝麦克斯文件保持“原始/推荐”时会直通复制 JPEG 瓦片，转换更快且避免重复压缩。
 - “停止队列”会在当前文件完成后停止剩余任务，不会强制中断正在写入的文件。
+
+开发验证可运行：
+
+```bat
+.venv-package\Scripts\python.exe -m unittest discover -s tests -v
+```

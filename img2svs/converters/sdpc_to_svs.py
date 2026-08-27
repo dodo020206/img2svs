@@ -19,7 +19,7 @@ import numpy
 import tifffile
 from PIL import Image, UnidentifiedImageError
 
-from svs_common import (
+from img2svs.core.svs_common import (
     APERIO_VERSION,
     BatchOptions,
     add_jpeg_quality_argument,

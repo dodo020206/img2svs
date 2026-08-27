@@ -9,7 +9,7 @@ from unittest import mock
 
 import numpy
 
-from sdpc_to_svs import (
+from img2svs.converters.sdpc_to_svs import (
     ByteRange,
     PyramidLevel,
     SdpcSlide,

@@ -26,6 +26,12 @@ if not defined PYTHON_EXE (
     exit /b 1
 )
 
+"%PYTHON_EXE%" -c "import sys; print('[INFO] Python runtime:', sys.version.split()[0]); raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)"
+if errorlevel 1 (
+    echo [ERROR] Windows EXE packaging requires Python 3.11.
+    exit /b 1
+)
+
 if not defined VIPS_HOME if exist "%cd%\vips" set "VIPS_HOME=%cd%\vips"
 if not defined VIPS_HOME if exist "%cd%\third_party\vips" set "VIPS_HOME=%cd%\third_party\vips"
 if not defined VIPS_HOME if exist "C:\vips" set "VIPS_HOME=C:\vips"
@@ -66,15 +72,35 @@ if exist "dist\RCX*.tmp" (
 
 if defined UPX_DIR (
     echo [INFO] UPX_DIR=%UPX_DIR%
-    "%PYTHON_EXE%" -m PyInstaller --noconfirm --clean --upx-dir "%UPX_DIR%" svs_converter_gui.spec
+    "%PYTHON_EXE%" -m PyInstaller --noconfirm --clean --upx-dir "%UPX_DIR%" packaging\svs_converter_gui.spec
 ) else (
     echo [INFO] UPX_DIR is not set. Building without an explicit UPX path.
-    "%PYTHON_EXE%" -m PyInstaller --noconfirm --clean svs_converter_gui.spec
+    "%PYTHON_EXE%" -m PyInstaller --noconfirm --clean packaging\svs_converter_gui.spec
 )
 
 if errorlevel 1 (
     echo [ERROR] PyInstaller build failed.
     exit /b %errorlevel%
+)
+
+for %%P in ("%PYTHON_EXE%") do set "PYINSTALLER_DEFAULT_ICON=%%~dpP..\Lib\site-packages\PyInstaller\bootloader\images\icon-windowed.ico"
+set "ICON_VERIFY_SHELL=powershell.exe"
+where pwsh.exe >nul 2>nul
+if not errorlevel 1 set "ICON_VERIFY_SHELL=pwsh.exe"
+"%ICON_VERIFY_SHELL%" -NoProfile -ExecutionPolicy Bypass -File "packaging\verify_windows_exe_icon.ps1" -ExePath "%OUTPUT_TARGET%" -ExpectedIconPath "assets\app_icon.ico" -PyInstallerDefaultIconPath "%PYINSTALLER_DEFAULT_ICON%"
+if errorlevel 1 (
+    echo [ERROR] Packaged EXE icon verification failed.
+    exit /b %errorlevel%
+)
+
+if /I "%PACKAGE_MODE%"=="onedir" (
+    if exist "dist\PathologySVSConverter.zip" del /f /q "dist\PathologySVSConverter.zip"
+    echo [INFO] Creating dist\PathologySVSConverter.zip
+    tar.exe -a -c -f "dist\PathologySVSConverter.zip" -C "dist" "PathologySVSConverter"
+    if errorlevel 1 (
+        echo [ERROR] ZIP packaging failed.
+        exit /b %errorlevel%
+    )
 )
 
 echo.

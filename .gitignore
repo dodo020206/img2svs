@@ -8,6 +8,8 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+.python-package/
+.venv-package/
 build/
 develop-eggs/
 dist/
@@ -31,6 +33,7 @@ MANIFEST
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!packaging/svs_converter_gui.spec
 
 # Installer logs
 pip-log.txt

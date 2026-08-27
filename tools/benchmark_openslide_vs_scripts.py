@@ -19,7 +19,7 @@ import tifffile
 from PIL import Image
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = PROJECT_DIR / "tmp" / "openslide_vs_current_bench"
 DEFAULT_TILE_SIZE = 256
 DEFAULT_QUALITY = 90
@@ -89,37 +89,37 @@ def default_cases() -> list[BenchmarkCase]:
         BenchmarkCase(
             name="NDPI",
             input_path=PROJECT_DIR / "test_data" / "tt1.ndpi",
-            current_script=PROJECT_DIR / "ndpi_to_svs.py",
+            current_script=PROJECT_DIR / "convert_to_svs.py",
             current_supported=True,
         ),
         BenchmarkCase(
             name="MRXS",
             input_path=find_first("test_data/*mrxs/*.mrxs") or PROJECT_DIR / "missing.mrxs",
-            current_script=PROJECT_DIR / "mrxs_to_svs.py",
+            current_script=PROJECT_DIR / "convert_to_svs.py",
             current_supported=True,
         ),
         BenchmarkCase(
             name="CSP",
             input_path=PROJECT_DIR / "test_data" / "case3.csp",
-            current_script=PROJECT_DIR / "csp_to_svs.py",
+            current_script=PROJECT_DIR / "convert_to_svs.py",
             current_supported=True,
         ),
         BenchmarkCase(
             name="SDPC",
             input_path=PROJECT_DIR / "test_data" / "20220514_145829_0.sdpc",
-            current_script=PROJECT_DIR / "sdpc_to_svs.py",
+            current_script=PROJECT_DIR / "convert_to_svs.py",
             current_supported=True,
         ),
         BenchmarkCase(
             name="KFB",
             input_path=find_first("test_data/*.kfb") or PROJECT_DIR / "missing.kfb",
-            current_script=PROJECT_DIR / "kfb_to_svs.py",
+            current_script=PROJECT_DIR / "convert_to_svs.py",
             current_supported=True,
         ),
         BenchmarkCase(
             name="MDSX",
             input_path=PROJECT_DIR / "test_data" / "2600394-IHC-10" / "1.mdsx",
-            current_script=PROJECT_DIR / "mdsx_to_svs.py",
+            current_script=PROJECT_DIR / "convert_to_svs.py",
             current_supported=True,
         ),
     ]
@@ -357,6 +357,8 @@ def run_current_case(
         "--skip-associated",
         "--jpeg-quality",
         str(quality),
+        "--format",
+        case.name.lower(),
     ]
     start = time.perf_counter()
     completed = subprocess.run(

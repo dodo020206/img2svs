@@ -303,8 +303,10 @@ def pixels_per_centimeter(mpp: float) -> float:
 
 
 def should_use_bigtiff(input_path: Path) -> bool:
-    """根据输入文件大小粗略判断输出是否应使用 BigTIFF。"""
+    """根据输入文件大小判断输出是否可能需要 BigTIFF。"""
 
+    # 大多数病理查看器对传统 Aperio TIFF 的兼容性最好。超过这个阈值时，
+    # 输出才有较大概率接近传统 TIFF 的 4 GB 限制，再切换到 BigTIFF。
     return input_path.stat().st_size >= 3_500_000_000
 
 

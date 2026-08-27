@@ -13,7 +13,7 @@ import numpy
 import tifffile
 from PIL import Image
 
-from svs_common import (
+from img2svs.core.svs_common import (
     APERIO_VERSION,
     BatchOptions,
     add_jpeg_quality_argument,
@@ -455,11 +455,13 @@ class SvsWriter:
         thumbnail = self._build_thumbnail()
         associated_images = {} if skip_associated else self._load_associated_images()
 
-        self._write_main_level_with_vips(output_path)
+        # Let libvips generate the complete pyramid in one streaming pipeline.
+        # The previous implementation materialized every reduced level as a
+        # full NumPy array before appending it with tifffile.  For a 50k x 90k
+        # slide, even level 1 can require several GiB of RGB memory.
+        self._write_pyramid_with_vips(output_path)
         with tifffile.TiffWriter(output_path, append=True) as tif:
             self._write_thumbnail(tif, thumbnail)
-            for level in self.slide.levels[1:]:
-                self._write_reduced_level(tif, level)
             self._write_associated_images(tif, associated_images)
 
     def _open_level_image(self, index: int):
@@ -484,8 +486,8 @@ class SvsWriter:
             kwargs["level"] = level
         return self.pyvips.Image.new_from_file(str(self.slide.path), **kwargs)
 
-    def _write_main_level_with_vips(self, output_path: Path) -> None:
-        """用 libvips 直接写出主图页，避免 Python 逐 tile 重编码。"""
+    def _write_pyramid_with_vips(self, output_path: Path) -> None:
+        """用 libvips 流式写出主图和降采样层。"""
 
         image = self._open_level_image(0).copy()
         image.set_type(
@@ -504,30 +506,11 @@ class SvsWriter:
             tile=True,
             tile_width=self.slide.tile_size,
             tile_height=self.slide.tile_size,
-            pyramid=False,
+            pyramid=True,
             bigtiff=should_use_bigtiff(self.slide.path),
             xres=self.resolution / 10.0,
             yres=self.resolution / 10.0,
             resunit="cm",
-        )
-
-    def _write_reduced_level(self, tif: tifffile.TiffWriter, level: PyramidLevel) -> None:
-        """把降采样层作为普通 TIFF page 追加到输出文件。"""
-
-        tif.write(
-            data=vips_to_numpy(self._open_level_image(level.index)),
-            photometric="rgb",
-            tile=(self.slide.tile_size, self.slide.tile_size),
-            compression="jpeg",
-            compressionargs=jpeg_compressionargs(self.slide.metadata.jpeg_quality),
-            subfiletype=1,
-            resolution=(
-                self.resolution / level.downsample,
-                self.resolution / level.downsample,
-            ),
-            resolutionunit="CENTIMETER",
-            metadata=None,
-            software=False,
         )
 
     def _write_thumbnail(self, tif: tifffile.TiffWriter, thumbnail: numpy.ndarray) -> None:
