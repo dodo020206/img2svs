@@ -4,14 +4,17 @@ from __future__ import annotations
 import argparse
 import io
 import mmap
+import os
 import re
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
 import numpy
 import tifffile
+import imagecodecs
 from PIL import Image
 
 from img2svs.core.svs_common import (
@@ -439,7 +442,13 @@ class SvsWriter:
     def __init__(self, slide: CspSlide, *, source_jpeg_quality: int = DEFAULT_JPEG_QUALITY):
         self.slide = slide
         self.source_jpeg_quality = source_jpeg_quality
-        self.reencode_jpeg_tiles = self.source_jpeg_quality != slide.metadata.jpeg_quality
+        # 部分 Windows 病理查看器无法读取 CSP 中直接复用的 JPEG 瓦片，
+        # 且直接复用会让 case3 这类文件超过 2 GB。大 CSP 统一写成标准
+        # JPEG 瓦片，通常可把输出控制在兼容范围内。
+        self.reencode_jpeg_tiles = (
+            self.source_jpeg_quality != slide.metadata.jpeg_quality
+            or slide.path.stat().st_size >= 2_000_000_000
+        )
         self.resolution = pixels_per_centimeter(slide.metadata.mpp)
         self.blank_tile = blank_rgb_jpeg(
             slide.tile_size,
@@ -484,10 +493,8 @@ class SvsWriter:
             metadata=None,
         )
         if self.reencode_jpeg_tiles:
-            common_kwargs["data"] = self._decoded_tile_iterator(mm, level)
-            common_kwargs["compressionargs"] = jpeg_compressionargs(
-                self.slide.metadata.jpeg_quality
-            )
+            # 预先并行编码为 JPEG 字节，避免 tifffile 在主线程逐块编码。
+            common_kwargs["data"] = self._standard_jpeg_tile_iterator(mm, level)
         else:
             common_kwargs["data"] = self._tiff_jpeg_tile_iterator(mm, level)
 
@@ -631,6 +638,45 @@ class SvsWriter:
                 continue
             yield decode_rgb_image(data)
 
+    def _standard_jpeg_tile_iterator(
+        self, mm: mmap.mmap, level: PyramidLevel
+    ) -> Iterator[bytes]:
+        """并行把 CSP 瓦片编码为查看器兼容的标准 JPEG。"""
+
+        worker_count = min(8, max(2, os.cpu_count() or 1))
+        pending = []
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for entry in self.slide.level_tiles[level.index]:
+                if entry is None:
+                    pending.append(self.blank_tile)
+                else:
+                    data = read_range_from_mmap(mm, entry.data_range)
+                    pending.append(
+                        executor.submit(self._encode_standard_tile, data)
+                        if data
+                        else self.blank_tile
+                    )
+
+                if len(pending) >= worker_count * 2:
+                    item = pending.pop(0)
+                    yield item.result() if hasattr(item, "result") else item
+
+            while pending:
+                item = pending.pop(0)
+                yield item.result() if hasattr(item, "result") else item
+
+    def _encode_standard_tile(self, data: bytes) -> bytes:
+        """解码并快速重新编码一个完整的标准 JPEG 瓦片。"""
+
+        tile = imagecodecs.jpeg_decode(data)
+        if tile.shape[:2] != (self.slide.tile_size, self.slide.tile_size):
+            padded = self.blank_array_tile.copy()
+            tile_h = min(tile.shape[0], self.slide.tile_size)
+            tile_w = min(tile.shape[1], self.slide.tile_size)
+            padded[:tile_h, :tile_w] = tile[:tile_h, :tile_w]
+            tile = padded
+        return imagecodecs.jpeg_encode(tile, level=self.slide.metadata.jpeg_quality)
+
     def _encode_padded_tile(self, tile: numpy.ndarray) -> bytes:
         """把边缘小瓦片补成完整 tile 后重新编码为 JPEG。"""
 
@@ -639,13 +685,9 @@ class SvsWriter:
         tile_w = min(tile.shape[1], self.slide.tile_size)
         padded[:tile_h, :tile_w] = tile[:tile_h, :tile_w]
         image = Image.fromarray(padded, mode="RGB")
-        buffer = io.BytesIO()
-        image.save(
-            buffer,
-            format="JPEG",
-            quality=self.slide.metadata.jpeg_quality,
+        return imagecodecs.jpeg_encode(
+            numpy.asarray(image), level=self.slide.metadata.jpeg_quality
         )
-        return buffer.getvalue()
 
     def _load_associated_images(self, mm: mmap.mmap) -> dict[str, numpy.ndarray]:
         """读取所有关联图并解码为 RGB 数组。"""
@@ -669,9 +711,8 @@ def convert_one(
     """把单个 CSP 文件转换为 SVS。"""
 
     if output_path.exists() and not overwrite:
-        raise FileExistsError(
-            f"Output already exists: {output_path}. Use --overwrite to replace it."
-        )
+        print(f"Skip  : {input_path} -> {output_path} (already exists)")
+        return
 
     slide = CspParser(input_path).parse()
     slide = CspSlide(

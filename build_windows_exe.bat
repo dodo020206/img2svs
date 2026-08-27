@@ -83,6 +83,26 @@ if errorlevel 1 (
     exit /b %errorlevel%
 )
 
+for %%P in ("%PYTHON_EXE%") do set "PYINSTALLER_DEFAULT_ICON=%%~dpP..\Lib\site-packages\PyInstaller\bootloader\images\icon-windowed.ico"
+set "ICON_VERIFY_SHELL=powershell.exe"
+where pwsh.exe >nul 2>nul
+if not errorlevel 1 set "ICON_VERIFY_SHELL=pwsh.exe"
+"%ICON_VERIFY_SHELL%" -NoProfile -ExecutionPolicy Bypass -File "packaging\verify_windows_exe_icon.ps1" -ExePath "%OUTPUT_TARGET%" -ExpectedIconPath "assets\app_icon.ico" -PyInstallerDefaultIconPath "%PYINSTALLER_DEFAULT_ICON%"
+if errorlevel 1 (
+    echo [ERROR] Packaged EXE icon verification failed.
+    exit /b %errorlevel%
+)
+
+if /I "%PACKAGE_MODE%"=="onedir" (
+    if exist "dist\PathologySVSConverter.zip" del /f /q "dist\PathologySVSConverter.zip"
+    echo [INFO] Creating dist\PathologySVSConverter.zip
+    tar.exe -a -c -f "dist\PathologySVSConverter.zip" -C "dist" "PathologySVSConverter"
+    if errorlevel 1 (
+        echo [ERROR] ZIP packaging failed.
+        exit /b %errorlevel%
+    )
+)
+
 echo.
 echo [OK] Build completed: %OUTPUT_TARGET%
 endlocal

@@ -381,6 +381,7 @@ def execute_jobs_subprocess(
 
         started_at = time.perf_counter()
         process: subprocess.Popen[str] | None = None
+        worker_output: list[str] = []
         try:
             process = subprocess.Popen(
                 _worker_command(job, options),
@@ -423,11 +424,23 @@ def execute_jobs_subprocess(
                 if message is None:
                     reader_finished = True
                 elif message:
+                    worker_output.append(message)
                     noop_log(message)
             return_code = process.wait()
             reader.join(timeout=1)
             if return_code != 0:
-                raise RuntimeError(f"worker exited with code {return_code}")
+                error_prefix = f"{job.input_path}: "
+                detail = next(
+                    (
+                        line[len(error_prefix) :]
+                        for line in reversed(worker_output)
+                        if line.startswith(error_prefix)
+                    ),
+                    None,
+                )
+                raise RuntimeError(
+                    detail or f"worker exited with code {return_code}"
+                )
         except Exception as exc:
             elapsed = time.perf_counter() - started_at
             noop_log(f"Failed: {job.input_path} ({exc})")

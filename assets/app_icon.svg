@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <title>Pathology SVS Converter</title>
+
+  <!-- Rounded application tile; the area outside stays transparent. -->
+  <rect x="32" y="32" width="960" height="960" rx="220" fill="#102a43"/>
+  <path d="M128 240C252 102 484 64 678 114C484 122 282 214 168 378Z"
+        fill="#163d5c"/>
+
+  <!-- Output file behind the glass slide. -->
+  <path d="M548 274H720L838 392V756C838 802 802 838 756 838H548C502 838 466 802 466 756V356C466 310 502 274 548 274Z"
+        fill="#0d9488" stroke="#5eead4" stroke-width="24"/>
+  <path d="M720 274V392H838Z" fill="#99f6e4"/>
+  <rect x="574" y="474" width="178" height="34" rx="17" fill="#ccfbf1"/>
+  <rect x="574" y="542" width="132" height="34" rx="17" fill="#ccfbf1"/>
+  <rect x="574" y="610" width="160" height="34" rx="17" fill="#ccfbf1"/>
+
+  <!-- Main pathology glass slide. -->
+  <g transform="rotate(-7 374 508)">
+    <rect x="194" y="154" width="360" height="638" rx="78" fill="#071e30" opacity="0.35"/>
+    <rect x="178" y="136" width="360" height="638" rx="78" fill="#f8fafc"
+          stroke="#2dd4bf" stroke-width="30"/>
+    <path d="M256 136H460C503 136 538 171 538 214V258H178V214C178 171 213 136 256 136Z"
+          fill="#0d9488"/>
+    <circle cx="358" cy="474" r="124" fill="#ccfbf1"/>
+    <path d="M302 404C340 370 398 378 420 414C447 457 432 518 388 546C350 570 296 548 278 504C262 466 274 430 302 404Z"
+          fill="#f97360"/>
+    <path d="M326 426C350 407 385 411 399 435C418 466 403 507 370 520C340 532 305 510 302 478C300 456 309 440 326 426Z"
+          fill="#fbbf24"/>
+    <rect x="268" y="668" width="180" height="28" rx="14" fill="#0d9488"/>
+  </g>
+
+  <!-- Bold conversion cue, intentionally simple for 16 px rendering. -->
+  <path d="M464 742C536 790 638 792 710 746" fill="none" stroke="#f8fafc"
+        stroke-width="42" stroke-linecap="round"/>
+  <path d="M680 698L778 704L726 792Z" fill="#f8fafc"/>
+</svg>

@@ -37,12 +37,15 @@ datas = (
     collect_data_files("PIL")
     + collect_data_files("pyvips")
     + collect_data_files("tifffile")
+    + [
+        (str(project_dir / "assets" / "app_icon.png"), "assets"),
+        (str(project_dir / "assets" / "app_icon.ico"), "assets"),
+    ]
 )
 
 binaries = (
     collect_dynamic_libs("imagecodecs")
     + collect_dynamic_libs("av")
-    + collect_dynamic_libs("pyvips")
 )
 
 vips_candidates = []
@@ -92,10 +95,23 @@ a = Analysis(
     noarchive=False,
     optimize=1,
 )
+
+# pyvips resolves libvips through ctypes and PyInstaller may add a duplicate
+# root-level DLL automatically. Keep the bundled vips/bin copy as the only
+# libvips runtime so its OpenSlide module directory is used consistently.
+a.binaries = [
+    entry
+    for entry in a.binaries
+    if Path(str(entry[0])).name.lower()
+    not in {"libvips-42.dll", "libvips-cpp-42.dll"}
+    or str(entry[0]).replace("\\", "/").startswith("bin/")
+]
 pyz = PYZ(a.pure)
 
 exe_options = dict(
     name="PathologySVSConverter",
+    icon=str(project_dir / "assets" / "app_icon.ico"),
+    version=str(project_dir / "packaging" / "windows_version_info.txt"),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
