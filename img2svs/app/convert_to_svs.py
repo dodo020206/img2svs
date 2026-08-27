@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from img2svs.converters import (
     csp_to_svs,
@@ -26,15 +26,31 @@ from img2svs.core.svs_common import (
     run_conversion_jobs,
 )
 
-ALL_SUPPORTED_SUFFIXES = (
-    csp_to_svs.SUPPORTED_SUFFIXES
-    | dmetrix_to_svs.SUPPORTED_SUFFIXES
-    | kfb_to_svs.SUPPORTED_SUFFIXES
-    | mdsx_to_svs.SUPPORTED_SUFFIXES
-    | mrxs_to_svs.SUPPORTED_SUFFIXES
-    | ndpi_to_svs.SUPPORTED_SUFFIXES
-    | sdpc_to_svs.SUPPORTED_SUFFIXES
-)
+@dataclass(frozen=True)
+class FormatSpec:
+    """描述一个输入格式的后缀、提示文字和单文件转换入口。"""
+
+    suffixes: frozenset[str]
+    suffix_label: str
+    convert_one: Callable[..., None]
+
+
+FORMAT_REGISTRY: dict[str, FormatSpec] = {
+    "csp": FormatSpec(frozenset(csp_to_svs.SUPPORTED_SUFFIXES), ".csp", csp_to_svs.convert_one),
+    "dmetrix": FormatSpec(
+        frozenset(dmetrix_to_svs.SUPPORTED_SUFFIXES), ".dmetrix", dmetrix_to_svs.convert_one
+    ),
+    "kfb": FormatSpec(frozenset(kfb_to_svs.SUPPORTED_SUFFIXES), ".kfb", kfb_to_svs.convert_one),
+    "mdsx": FormatSpec(
+        frozenset(mdsx_to_svs.SUPPORTED_SUFFIXES), ".mdsx/.msdx", mdsx_to_svs.convert_one
+    ),
+    "mrxs": FormatSpec(frozenset(mrxs_to_svs.SUPPORTED_SUFFIXES), ".mrxs", mrxs_to_svs.convert_one),
+    "ndpi": FormatSpec(frozenset(ndpi_to_svs.SUPPORTED_SUFFIXES), ".ndpi", ndpi_to_svs.convert_one),
+    "sdpc": FormatSpec(
+        frozenset(sdpc_to_svs.SUPPORTED_SUFFIXES), ".sdpc/.dyqx", sdpc_to_svs.convert_one
+    ),
+}
+ALL_SUPPORTED_SUFFIXES = set().union(*(spec.suffixes for spec in FORMAT_REGISTRY.values()))
 
 
 @dataclass(frozen=True)
@@ -84,69 +100,26 @@ def parse_args(argv: Sequence[str] | None = None) -> CliOptions:
 def format_suffixes_for_selection(input_format: str) -> tuple[set[str], str]:
     """根据格式选择结果返回允许的后缀集合和提示文字。"""
 
-    if input_format == "csp":
-        return csp_to_svs.SUPPORTED_SUFFIXES, ".csp"
-    if input_format == "dmetrix":
-        return dmetrix_to_svs.SUPPORTED_SUFFIXES, ".dmetrix"
-    if input_format == "kfb":
-        return kfb_to_svs.SUPPORTED_SUFFIXES, ".kfb"
-    if input_format == "mdsx":
-        return mdsx_to_svs.SUPPORTED_SUFFIXES, ".mdsx/.msdx"
-    if input_format == "mrxs":
-        return mrxs_to_svs.SUPPORTED_SUFFIXES, ".mrxs"
-    if input_format == "ndpi":
-        return ndpi_to_svs.SUPPORTED_SUFFIXES, ".ndpi"
-    if input_format == "sdpc":
-        return sdpc_to_svs.SUPPORTED_SUFFIXES, ".sdpc/.dyqx"
-    return ALL_SUPPORTED_SUFFIXES, "supported slide"
+    spec = FORMAT_REGISTRY.get(input_format)
+    if spec is not None:
+        return set(spec.suffixes), spec.suffix_label
+    return set(ALL_SUPPORTED_SUFFIXES), "supported slide"
 
 
 def detect_backend(input_path: Path, input_format: str) -> str:
     """根据参数或文件后缀判断应交给哪个后端处理。"""
 
     suffix = input_path.suffix.lower()
-    if input_format == "csp":
-        if suffix not in csp_to_svs.SUPPORTED_SUFFIXES:
-            raise ValueError(f"Input file is not a .csp slide: {input_path}")
-        return "csp"
-    if input_format == "dmetrix":
-        if suffix not in dmetrix_to_svs.SUPPORTED_SUFFIXES:
-            raise ValueError(f"Input file is not a .dmetrix slide: {input_path}")
-        return "dmetrix"
-    if input_format == "kfb":
-        if suffix not in kfb_to_svs.SUPPORTED_SUFFIXES:
-            raise ValueError(f"Input file is not a .kfb slide: {input_path}")
-        return "kfb"
-    if input_format == "mdsx":
-        if suffix not in mdsx_to_svs.SUPPORTED_SUFFIXES:
-            raise ValueError(f"Input file is not an .mdsx/.msdx slide: {input_path}")
-        return "mdsx"
-    if input_format == "mrxs":
-        if suffix not in mrxs_to_svs.SUPPORTED_SUFFIXES:
-            raise ValueError(f"Input file is not an .mrxs slide: {input_path}")
-        return "mrxs"
-    if input_format == "ndpi":
-        if suffix not in ndpi_to_svs.SUPPORTED_SUFFIXES:
-            raise ValueError(f"Input file is not an .ndpi slide: {input_path}")
-        return "ndpi"
-    if input_format == "sdpc":
-        if suffix not in sdpc_to_svs.SUPPORTED_SUFFIXES:
-            raise ValueError(f"Input file is not an .sdpc/.dyqx slide: {input_path}")
-        return "sdpc"
-    if suffix in csp_to_svs.SUPPORTED_SUFFIXES:
-        return "csp"
-    if suffix in dmetrix_to_svs.SUPPORTED_SUFFIXES:
-        return "dmetrix"
-    if suffix in kfb_to_svs.SUPPORTED_SUFFIXES:
-        return "kfb"
-    if suffix in mdsx_to_svs.SUPPORTED_SUFFIXES:
-        return "mdsx"
-    if suffix in mrxs_to_svs.SUPPORTED_SUFFIXES:
-        return "mrxs"
-    if suffix in ndpi_to_svs.SUPPORTED_SUFFIXES:
-        return "ndpi"
-    if suffix in sdpc_to_svs.SUPPORTED_SUFFIXES:
-        return "sdpc"
+    if input_format != "auto":
+        spec = FORMAT_REGISTRY.get(input_format)
+        if spec is None:
+            raise ValueError(f"Unsupported input format: {input_format}")
+        if suffix not in spec.suffixes:
+            raise ValueError(f"Input file is not a {spec.suffix_label} slide: {input_path}")
+        return input_format
+    for backend, spec in FORMAT_REGISTRY.items():
+        if suffix in spec.suffixes:
+            return backend
     raise ValueError(f"Unsupported input file suffix: {input_path}")
 
 
@@ -173,169 +146,50 @@ def build_jobs(options: CliOptions) -> list[ConversionJob]:
             options.output_dir,
         )
         backend = detect_backend(slide, options.input_format)
-        if backend == "csp":
-            jobs.append(
-                ConversionJob(
-                    input_path=slide,
-                    output_path=output_path,
-                    runner=lambda slide=slide, output_path=output_path: run_csp_job(
-                        slide, output_path, options
-                    ),
-                )
+        jobs.append(
+            ConversionJob(
+                input_path=slide,
+                output_path=output_path,
+                runner=lambda slide=slide, output_path=output_path, backend=backend: run_backend_job(
+                    backend,
+                    slide,
+                    output_path,
+                    jpeg_quality=options.jpeg_quality,
+                    tile_size=options.tile_size,
+                    skip_associated=options.skip_associated,
+                    overwrite=options.overwrite,
+                ),
             )
-        elif backend == "dmetrix":
-            jobs.append(
-                ConversionJob(
-                    input_path=slide,
-                    output_path=output_path,
-                    runner=lambda slide=slide, output_path=output_path: run_dmetrix_job(
-                        slide, output_path, options
-                    ),
-                )
-            )
-        elif backend == "kfb":
-            jobs.append(
-                ConversionJob(
-                    input_path=slide,
-                    output_path=output_path,
-                    runner=lambda slide=slide, output_path=output_path: run_kfb_job(
-                        slide, output_path, options
-                    ),
-                )
-            )
-        elif backend == "mdsx":
-            jobs.append(
-                ConversionJob(
-                    input_path=slide,
-                    output_path=output_path,
-                    runner=lambda slide=slide, output_path=output_path: run_mdsx_job(
-                        slide, output_path, options
-                    ),
-                )
-            )
-        elif backend == "ndpi":
-            jobs.append(
-                ConversionJob(
-                    input_path=slide,
-                    output_path=output_path,
-                    runner=lambda slide=slide, output_path=output_path: run_ndpi_job(
-                        slide, output_path, options
-                    ),
-                )
-            )
-        elif backend == "mrxs":
-            jobs.append(
-                ConversionJob(
-                    input_path=slide,
-                    output_path=output_path,
-                    runner=lambda slide=slide, output_path=output_path: run_mrxs_job(
-                        slide, output_path, options
-                    ),
-                )
-            )
-        else:
-            jobs.append(
-                ConversionJob(
-                    input_path=slide,
-                    output_path=output_path,
-                    runner=lambda slide=slide, output_path=output_path: run_sdpc_job(
-                        slide, output_path, options
-                    ),
-                )
-            )
+        )
     return jobs
 
 
-def run_kfb_job(input_path: Path, output_path: Path, options: CliOptions) -> None:
-    """执行单个 KFB 输入的转换任务。"""
+def run_backend_job(
+    backend: str,
+    input_path: Path,
+    output_path: Path,
+    *,
+    jpeg_quality: int | None,
+    tile_size: int | None,
+    skip_associated: bool,
+    overwrite: bool,
+) -> None:
+    """通过注册表执行一个格式后端，集中处理格式特有参数。"""
 
-    print("Format: kfb")
-    kfb_to_svs.convert_one(
-        input_path=input_path,
-        output_path=output_path,
-        jpeg_quality=options.jpeg_quality,
-        skip_associated=options.skip_associated,
-        overwrite=options.overwrite,
-    )
-
-
-def run_csp_job(input_path: Path, output_path: Path, options: CliOptions) -> None:
-    """执行单个 CSP 输入的转换任务。"""
-
-    print("Format: csp")
-    csp_to_svs.convert_one(
-        input_path=input_path,
-        output_path=output_path,
-        jpeg_quality=options.jpeg_quality,
-        skip_associated=options.skip_associated,
-        overwrite=options.overwrite,
-    )
-
-
-def run_dmetrix_job(input_path: Path, output_path: Path, options: CliOptions) -> None:
-    """Execute one DMetrix conversion job."""
-
-    print("Format: dmetrix")
-    dmetrix_to_svs.convert_one(
-        input_path=input_path,
-        output_path=output_path,
-        jpeg_quality=options.jpeg_quality,
-        skip_associated=options.skip_associated,
-        overwrite=options.overwrite,
-    )
-
-
-def run_mdsx_job(input_path: Path, output_path: Path, options: CliOptions) -> None:
-    """执行单个 MDSX 输入的转换任务。"""
-
-    print("Format: mdsx")
-    mdsx_to_svs.convert_one(
-        input_path=input_path,
-        output_path=output_path,
-        tile_size=options.tile_size,
-        jpeg_quality=options.jpeg_quality,
-        skip_associated=options.skip_associated,
-        overwrite=options.overwrite,
-    )
-
-
-def run_ndpi_job(input_path: Path, output_path: Path, options: CliOptions) -> None:
-    """执行单个 NDPI 输入的转换任务。"""
-
-    print("Format: ndpi")
-    ndpi_to_svs.convert_one(
-        input_path=input_path,
-        output_path=output_path,
-        jpeg_quality=options.jpeg_quality,
-        skip_associated=options.skip_associated,
-        overwrite=options.overwrite,
-    )
-
-
-def run_mrxs_job(input_path: Path, output_path: Path, options: CliOptions) -> None:
-    """执行单个 MRXS 输入的转换任务。"""
-
-    print("Format: mrxs")
-    mrxs_to_svs.convert_one(
-        input_path=input_path,
-        output_path=output_path,
-        jpeg_quality=options.jpeg_quality,
-        skip_associated=options.skip_associated,
-        overwrite=options.overwrite,
-    )
-
-
-def run_sdpc_job(input_path: Path, output_path: Path, options: CliOptions) -> None:
-    """执行单个 SDPC/DYQX 输入的转换任务。"""
-
-    print("Format: sdpc")
-    sdpc_to_svs.convert_one(
-        input_path=input_path,
-        output_path=output_path,
-        jpeg_quality=options.jpeg_quality,
-        skip_associated=options.skip_associated,
-        overwrite=options.overwrite,
-    )
+    spec = FORMAT_REGISTRY.get(backend)
+    if spec is None:
+        raise ValueError(f"Unsupported input format: {backend}")
+    print(f"Format: {backend}")
+    kwargs = {
+        "input_path": input_path,
+        "output_path": output_path,
+        "jpeg_quality": jpeg_quality,
+        "skip_associated": skip_associated,
+        "overwrite": overwrite,
+    }
+    if backend == "mdsx":
+        kwargs["tile_size"] = tile_size
+    spec.convert_one(**kwargs)
 
 def main() -> None:
     """程序入口：构建任务并交给公共执行器运行。"""

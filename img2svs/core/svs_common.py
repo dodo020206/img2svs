@@ -296,6 +296,106 @@ def aperio_associated_description(kind: str) -> str:
     return f"{kind}\r"
 
 
+def aperio_main_description(
+    metadata: object, tile_size: int | tuple[int, int], level: object
+) -> str:
+    """生成所有转换器共用的 Aperio 主图 description。"""
+
+    if isinstance(tile_size, tuple):
+        tile_text = f"{tile_size[0]}x{tile_size[1]}"
+    else:
+        tile_text = f"{tile_size}x{tile_size}"
+    return (
+        f"{APERIO_VERSION}\n"
+        f"{level.width}x{level.height} [0,0 {level.width}x{level.height}] "
+        f"({tile_text}) JPEG/RGB Q={metadata.jpeg_quality}"
+        f"|AppMag = {metadata.app_mag:g}"
+        f"|MPP = {metadata.mpp:.6f}"
+    )
+
+
+def write_thumbnail_page(
+    tif: object,
+    thumbnail: numpy.ndarray,
+    *,
+    resolution: float,
+    jpeg_quality: int,
+) -> None:
+    """写出统一格式的 SVS 缩略图页面。"""
+
+    tif.write(
+        data=thumbnail,
+        photometric="rgb",
+        compression="jpeg",
+        compressionargs=jpeg_compressionargs(jpeg_quality),
+        resolution=(resolution, resolution),
+        resolutionunit="CENTIMETER",
+        metadata=None,
+        software=False,
+    )
+
+
+def write_associated_images(
+    tif: object,
+    images: dict[str, numpy.ndarray],
+    *,
+    jpeg_quality: int,
+) -> None:
+    """按 Aperio 约定写出 label 和 macro 关联图页面。"""
+
+    for kind in ("label", "macro"):
+        image = images.get(kind)
+        if image is None:
+            continue
+        tif.write(
+            data=image,
+            photometric="rgb",
+            compression="jpeg",
+            compressionargs=jpeg_compressionargs(jpeg_quality),
+            description=aperio_associated_description(kind),
+            metadata=None,
+            software=False,
+        )
+
+
+def write_pyramid_level(
+    tif: object,
+    *,
+    data: object,
+    width: int,
+    height: int,
+    tile_size: int | tuple[int, int],
+    jpeg_quality: int,
+    resolution: float,
+    reduced: bool,
+    description: str | None,
+    software: str | bool,
+    compressionargs: bool = True,
+) -> None:
+    """写出一个主图或降采样层，保留格式后端的 tile 数据生成方式。"""
+
+    kwargs: dict[str, object] = {
+        "data": data,
+        "shape": (height, width, 3),
+        "dtype": numpy.uint8,
+        "photometric": "rgb",
+        "tile": tile_size if isinstance(tile_size, tuple) else (tile_size, tile_size),
+        "compression": "jpeg",
+        "resolution": (resolution, resolution),
+        "resolutionunit": "CENTIMETER",
+        "metadata": None,
+    }
+    if compressionargs:
+        kwargs["compressionargs"] = jpeg_compressionargs(jpeg_quality)
+    if reduced:
+        kwargs["subfiletype"] = 1
+        kwargs["software"] = False
+    else:
+        kwargs["description"] = description
+        kwargs["software"] = software
+    tif.write(**kwargs)
+
+
 def pixels_per_centimeter(mpp: float) -> float:
     """把每像素微米数转换为 TIFF 需要的每厘米像素数。"""
 

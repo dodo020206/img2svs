@@ -20,22 +20,23 @@ import tifffile
 from PIL import Image, UnidentifiedImageError
 
 from img2svs.core.svs_common import (
-    APERIO_VERSION,
     BatchOptions,
     add_jpeg_quality_argument,
     add_batch_arguments,
-    aperio_associated_description,
+    aperio_main_description,
     batch_options_from_args,
     blank_rgb_jpeg,
     build_single_format_jobs,
     decode_rgb_image,
     format_associated_summary,
     format_level_summary,
-    jpeg_compressionargs,
     normalize_jpeg_quality,
     pixels_per_centimeter,
     run_conversion_jobs,
     should_use_bigtiff,
+    write_associated_images,
+    write_pyramid_level,
+    write_thumbnail_page,
 )
 
 PIC_HEAD_FLAG = 0x5153
@@ -291,20 +292,6 @@ def parse_args(argv: Sequence[str] | None = None) -> BatchOptions:
     add_batch_arguments(parser, "Path to an input .sdpc/.dyqx file or directory.")
     add_jpeg_quality_argument(parser)
     return batch_options_from_args(parser.parse_args(argv))
-
-
-def aperio_main_description(
-    metadata: SlideMetadata, tile_width: int, tile_height: int, level: PyramidLevel
-) -> str:
-    """生成主图页面写入 SVS 时使用的 Aperio 描述字符串。"""
-
-    return (
-        f"{APERIO_VERSION}\n"
-        f"{level.width}x{level.height} [0,0 {level.width}x{level.height}] "
-        f"({tile_width}x{tile_height}) JPEG/RGB Q={metadata.jpeg_quality}"
-        f"|AppMag = {metadata.app_mag:g}"
-        f"|MPP = {metadata.mpp:.6f}"
-    )
 
 
 def print_slide_info(slide: SdpcSlide) -> None:
@@ -704,7 +691,9 @@ class SvsWriter:
                     self._write_thumbnail(tif, thumbnail)
                     for level in self.slide.levels[1:]:
                         self._write_tiled_level(tif, mm, level, reduced=True)
-                    self._write_associated_images(tif, associated_images)
+                    write_associated_images(
+                        tif, associated_images, jpeg_quality=self.slide.metadata.jpeg_quality
+                    )
             temporary_path.replace(output_path)
         except BaseException:
             temporary_path.unlink(missing_ok=True)
@@ -715,84 +704,42 @@ class SvsWriter:
     ) -> None:
         """写出一个瓦片化的主图或降采样层。"""
 
-        common_kwargs = dict(
-            shape=(level.height, level.width, 3),
-            dtype=numpy.uint8,
-            photometric="rgb",
-            tile=(self.output_tile_height, self.output_tile_width),
-            compression="jpeg",
-            resolutionunit="CENTIMETER",
-            metadata=None,
-        )
-
         # 同质量 JPEG 可直接透传；HEVC 或变更质量时需要重新编码。
         if self.can_reuse_jpeg_tiles:
             data = self._jpeg_tile_iterator(mm, level)
+            compressionargs = False
         else:
             data = self._decoded_tile_iterator(mm, level)
-            common_kwargs["compressionargs"] = jpeg_compressionargs(
-                self.slide.metadata.jpeg_quality
-            )
-
-        if reduced:
-            tif.write(
-                data=data,
-                **common_kwargs,
-                subfiletype=1,
-                resolution=(
-                    self.resolution / level.downsample,
-                    self.resolution / level.downsample,
-                ),
-                software=False,
-            )
-        else:
-            tif.write(
-                data=data,
-                **common_kwargs,
-                description=aperio_main_description(
-                    self.slide.metadata,
-                    self.output_tile_width,
-                    self.output_tile_height,
-                    level,
-                ),
-                resolution=(self.resolution, self.resolution),
-                software="sdpc_to_svs.py",
-            )
+            compressionargs = True
+        write_pyramid_level(
+            tif,
+            data=data,
+            width=level.width,
+            height=level.height,
+            tile_size=(self.output_tile_height, self.output_tile_width),
+            jpeg_quality=self.slide.metadata.jpeg_quality,
+            resolution=self.resolution / level.downsample if reduced else self.resolution,
+            reduced=reduced,
+            description=aperio_main_description(
+                self.slide.metadata,
+                (self.output_tile_width, self.output_tile_height),
+                level,
+            ),
+            software="sdpc_to_svs.py",
+            compressionargs=compressionargs,
+        )
 
     def _write_thumbnail(
         self, tif: tifffile.TiffWriter, thumbnail: numpy.ndarray
     ) -> None:
         """写出缩略图页面。"""
 
-        tif.write(
-            data=thumbnail,
-            photometric="rgb",
-            compression="jpeg",
-            compressionargs=jpeg_compressionargs(self.slide.metadata.jpeg_quality),
-            resolution=(self.resolution, self.resolution),
-            resolutionunit="CENTIMETER",
-            metadata=None,
-            software=False,
+        write_thumbnail_page(
+            tif,
+            thumbnail,
+            resolution=self.resolution,
+            jpeg_quality=self.slide.metadata.jpeg_quality,
         )
-
-    def _write_associated_images(
-        self, tif: tifffile.TiffWriter, associated_images: dict[str, numpy.ndarray]
-    ) -> None:
-        """按 Aperio 约定写出 label 和 macro 页面。"""
-
-        for kind in ("label", "macro"):
-            image = associated_images.get(kind)
-            if image is None:
-                continue
-            tif.write(
-                data=image,
-                photometric="rgb",
-                compression="jpeg",
-                compressionargs=jpeg_compressionargs(self.slide.metadata.jpeg_quality),
-                description=aperio_associated_description(kind),
-                metadata=None,
-                software=False,
-            )
 
     def _jpeg_tile_iterator(self, mm: mmap.mmap, level: PyramidLevel) -> Iterator[bytes]:
         """按层级顺序迭代 JPEG 瓦片字节。"""

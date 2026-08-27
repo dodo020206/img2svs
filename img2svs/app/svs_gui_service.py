@@ -12,15 +12,6 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from img2svs.app import convert_to_svs
-from img2svs.converters import (
-    csp_to_svs,
-    dmetrix_to_svs,
-    kfb_to_svs,
-    mdsx_to_svs,
-    mrxs_to_svs,
-    ndpi_to_svs,
-    sdpc_to_svs,
-)
 from img2svs.core.svs_common import (
     ConversionJob,
     collect_inputs,
@@ -28,14 +19,8 @@ from img2svs.core.svs_common import (
     resolve_output_path,
 )
 
-GUI_SUPPORTED_SUFFIXES = (
-    csp_to_svs.SUPPORTED_SUFFIXES
-    | dmetrix_to_svs.SUPPORTED_SUFFIXES
-    | kfb_to_svs.SUPPORTED_SUFFIXES
-    | mdsx_to_svs.SUPPORTED_SUFFIXES
-    | mrxs_to_svs.SUPPORTED_SUFFIXES
-    | ndpi_to_svs.SUPPORTED_SUFFIXES
-    | sdpc_to_svs.SUPPORTED_SUFFIXES
+GUI_SUPPORTED_SUFFIXES = set().union(
+    *(spec.suffixes for spec in convert_to_svs.FORMAT_REGISTRY.values())
 )
 
 ProgressCallback = Callable[[int, int, ConversionJob, str], None]
@@ -123,59 +108,12 @@ def make_job_runner(
 ) -> Callable[[], None]:
     """根据后端格式构造单个任务的实际执行器。"""
 
-    if backend == "csp":
-        return lambda: csp_to_svs.convert_one(
-            input_path=input_path,
-            output_path=output_path,
-            jpeg_quality=options.jpeg_quality,
-            skip_associated=options.skip_associated,
-            overwrite=options.overwrite,
-        )
-    if backend == "dmetrix":
-        return lambda: dmetrix_to_svs.convert_one(
-            input_path=input_path,
-            output_path=output_path,
-            jpeg_quality=options.jpeg_quality,
-            skip_associated=options.skip_associated,
-            overwrite=options.overwrite,
-        )
-    if backend == "kfb":
-        return lambda: kfb_to_svs.convert_one(
-            input_path=input_path,
-            output_path=output_path,
-            jpeg_quality=options.jpeg_quality,
-            skip_associated=options.skip_associated,
-            overwrite=options.overwrite,
-        )
-    if backend == "mdsx":
-        return lambda: mdsx_to_svs.convert_one(
-            input_path=input_path,
-            output_path=output_path,
-            tile_size=options.tile_size,
-            jpeg_quality=options.jpeg_quality,
-            skip_associated=options.skip_associated,
-            overwrite=options.overwrite,
-        )
-    if backend == "mrxs":
-        return lambda: mrxs_to_svs.convert_one(
-            input_path=input_path,
-            output_path=output_path,
-            jpeg_quality=options.jpeg_quality,
-            skip_associated=options.skip_associated,
-            overwrite=options.overwrite,
-        )
-    if backend == "ndpi":
-        return lambda: ndpi_to_svs.convert_one(
-            input_path=input_path,
-            output_path=output_path,
-            jpeg_quality=options.jpeg_quality,
-            skip_associated=options.skip_associated,
-            overwrite=options.overwrite,
-        )
-    return lambda: sdpc_to_svs.convert_one(
-        input_path=input_path,
-        output_path=output_path,
+    return lambda: convert_to_svs.run_backend_job(
+        backend,
+        input_path,
+        output_path,
         jpeg_quality=options.jpeg_quality,
+        tile_size=options.tile_size,
         skip_associated=options.skip_associated,
         overwrite=options.overwrite,
     )
@@ -210,7 +148,8 @@ def plan_jobs(options: GuiConversionOptions) -> list[ConversionJob]:
         raise ValueError("Tile size must be a positive integer")
 
     if options.tile_size is not None and not any(
-        slide.suffix.lower() in mdsx_to_svs.SUPPORTED_SUFFIXES for slide, _ in slides
+        slide.suffix.lower() in convert_to_svs.FORMAT_REGISTRY["mdsx"].suffixes
+        for slide, _ in slides
     ):
         raise ValueError("Tile size validation only applies to MDSX/MSDX inputs")
 

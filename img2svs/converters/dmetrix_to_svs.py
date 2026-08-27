@@ -16,22 +16,23 @@ import tifffile
 from PIL import Image
 
 from img2svs.core.svs_common import (
-    APERIO_VERSION,
     BatchOptions,
     add_batch_arguments,
     add_jpeg_quality_argument,
-    aperio_associated_description,
+    aperio_main_description,
     batch_options_from_args,
     blank_rgb_jpeg,
     build_single_format_jobs,
     decode_rgb_image,
     format_associated_summary,
     format_level_summary,
-    jpeg_compressionargs,
     normalize_jpeg_quality,
     pixels_per_centimeter,
     run_conversion_jobs,
     should_use_bigtiff,
+    write_associated_images,
+    write_pyramid_level,
+    write_thumbnail_page,
 )
 
 SUPPORTED_SUFFIXES = {".dmetrix"}
@@ -405,18 +406,6 @@ class DmetrixParser:
         return width
 
 
-def aperio_main_description(
-    metadata: SlideMetadata, tile_size: int, level: PyramidLevel
-) -> str:
-    return (
-        f"{APERIO_VERSION}\n"
-        f"{level.width}x{level.height} [0,0 {level.width}x{level.height}] "
-        f"({tile_size}x{tile_size}) JPEG/RGB Q={metadata.jpeg_quality}"
-        f"|AppMag = {metadata.app_mag:g}"
-        f"|MPP = {metadata.mpp:.6f}"
-    )
-
-
 def _read_range(mm: mmap.mmap, data_range: ByteRange) -> bytes:
     return mm[data_range.offset : data_range.offset + data_range.length]
 
@@ -477,69 +466,44 @@ class SvsWriter:
     def _write_level(
         self, tif: tifffile.TiffWriter, mm: mmap.mmap, level: PyramidLevel, *, reduced: bool
     ) -> None:
-        kwargs = dict(
-            shape=(level.height, level.width, 3),
-            dtype=numpy.uint8,
-            photometric="rgb",
-            tile=(self.slide.tile_size, self.slide.tile_size),
-            compression="jpeg",
-            resolutionunit="CENTIMETER",
-            metadata=None,
-        )
+        data = self._decoded_tile_iterator(mm, level) if self.reencode_jpeg_tiles else self._tile_iterator(mm, level)
         if self.reencode_jpeg_tiles:
-            kwargs["data"] = self._decoded_tile_iterator(mm, level)
-            kwargs["compressionargs"] = jpeg_compressionargs(
-                self.slide.metadata.jpeg_quality
-            )
+            compressionargs = True
         else:
-            kwargs["data"] = self._tile_iterator(mm, level)
+            compressionargs = False
         downsample = self.slide.levels[0].width / level.width
-        resolution = self.resolution / downsample
-        if reduced:
-            tif.write(
-                **kwargs,
-                subfiletype=1,
-                resolution=(resolution, resolution),
-                software=False,
-            )
-        else:
-            tif.write(
-                **kwargs,
-                description=aperio_main_description(
-                    self.slide.metadata, self.slide.tile_size, level
-                ),
-                resolution=(resolution, resolution),
-                software="dmetrix_to_svs.py",
-            )
+        write_pyramid_level(
+            tif,
+            data=data,
+            width=level.width,
+            height=level.height,
+            tile_size=self.slide.tile_size,
+            jpeg_quality=self.slide.metadata.jpeg_quality,
+            resolution=self.resolution / downsample,
+            reduced=reduced,
+            description=aperio_main_description(
+                self.slide.metadata, self.slide.tile_size, level
+            ),
+            software="dmetrix_to_svs.py",
+            compressionargs=compressionargs,
+        )
 
     def _write_thumbnail(self, tif: tifffile.TiffWriter, thumbnail: numpy.ndarray) -> None:
-        tif.write(
-            data=thumbnail,
-            photometric="rgb",
-            compression="jpeg",
-            compressionargs=jpeg_compressionargs(self.slide.metadata.jpeg_quality),
-            resolution=(self.resolution, self.resolution),
-            resolutionunit="CENTIMETER",
-            metadata=None,
-            software=False,
+        write_thumbnail_page(
+            tif,
+            thumbnail,
+            resolution=self.resolution,
+            jpeg_quality=self.slide.metadata.jpeg_quality,
         )
 
     def _write_associated(
         self, tif: tifffile.TiffWriter, images: dict[str, numpy.ndarray]
     ) -> None:
-        for kind in ("label", "macro"):
-            image = images.get(kind)
-            if image is None:
-                continue
-            tif.write(
-                data=image,
-                photometric="rgb",
-                compression="jpeg",
-                compressionargs=jpeg_compressionargs(self.slide.metadata.jpeg_quality),
-                description=aperio_associated_description(kind),
-                metadata=None,
-                software=False,
-            )
+        write_associated_images(
+            tif,
+            images,
+            jpeg_quality=self.slide.metadata.jpeg_quality,
+        )
 
     def _tile_iterator(self, mm: mmap.mmap, level: PyramidLevel) -> Iterator[bytes]:
         for tile_index, data_range in enumerate(self.slide.level_tiles[level.index]):
