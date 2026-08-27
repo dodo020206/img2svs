@@ -6,9 +6,10 @@ import io
 import mmap
 import struct
 import tempfile
+from array import array
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 import numpy
 import tifffile
@@ -46,6 +47,34 @@ class ByteRange:
         return self.offset > 0 and self.length > 0
 
 
+class PackedTileRanges:
+    """紧凑保存一个层级的瓦片偏移和长度，避免每块瓦片创建字典对象。"""
+
+    __slots__ = ("_offsets", "_lengths")
+
+    def __init__(self, count: int):
+        self._offsets = array("Q", [0]) * count
+        self._lengths = array("I", [0]) * count
+
+    def __len__(self) -> int:
+        return len(self._offsets)
+
+    def __getitem__(self, index: int) -> ByteRange:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        return ByteRange(self._offsets[index], self._lengths[index])
+
+    def __iter__(self) -> Iterator[ByteRange]:
+        for offset, length in zip(self._offsets, self._lengths):
+            yield ByteRange(offset, length)
+
+    def set(self, index: int, data_range: ByteRange) -> None:
+        self._offsets[index] = data_range.offset
+        self._lengths[index] = data_range.length
+
+
 @dataclass(frozen=True)
 class AssociatedImageEntry:
     kind: str
@@ -81,7 +110,7 @@ class DmetrixSlide:
     metadata: SlideMetadata
     tile_size: int
     levels: tuple[PyramidLevel, ...]
-    level_tiles: tuple[tuple[ByteRange, ...], ...]
+    level_tiles: tuple[PackedTileRanges, ...]
     associated_images: tuple[AssociatedImageEntry, ...]
 
 
@@ -191,8 +220,9 @@ class DmetrixParser:
     MACRO_ID = 0xFFFE
     ASSOCIATED_COUNT = 2
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, progress_callback: Callable[[str], None] | None = None):
         self.path = path
+        self.progress_callback = progress_callback
 
     def parse(self) -> DmetrixSlide:
         file_size = self.path.stat().st_size
@@ -208,13 +238,14 @@ class DmetrixParser:
             descriptors = self._read_descriptors(fh)
             associated = self._read_associated(fh, descriptors[0].index_offset, file_size)
             raw_tiles = self._read_tile_indexes(fh, descriptors, file_size)
-            tile_size = self._discover_tile_size(fh, descriptors[-1], raw_tiles)
+            tile_size = self._discover_tile_size(fh, raw_tiles[-1])
 
             output_levels: list[PyramidLevel] = []
-            output_tiles: list[tuple[ByteRange, ...]] = []
-            for index, descriptor in enumerate(reversed(descriptors)):
-                tiles_by_coordinate = raw_tiles[descriptor.source_id]
-                edge = tiles_by_coordinate[(descriptor.max_x, descriptor.max_y)]
+            output_tiles: list[PackedTileRanges] = []
+            for index, (descriptor, tiles_by_coordinate) in enumerate(
+                zip(reversed(descriptors), reversed(raw_tiles))
+            ):
+                edge = tiles_by_coordinate[descriptor.max_y * descriptor.tile_cols + descriptor.max_x]
                 edge_width, edge_height = _image_size(fh, edge)
                 if not (1 <= edge_width <= tile_size and 1 <= edge_height <= tile_size):
                     raise ValueError(
@@ -233,13 +264,7 @@ class DmetrixParser:
                         tile_rows=descriptor.tile_rows,
                     )
                 )
-                output_tiles.append(
-                    tuple(
-                        tiles_by_coordinate[(x, y)]
-                        for y in range(descriptor.tile_rows)
-                        for x in range(descriptor.tile_cols)
-                    )
-                )
+                output_tiles.append(tiles_by_coordinate)
 
             first_tile = output_tiles[0][0]
             fh.seek(first_tile.offset)
@@ -311,12 +336,17 @@ class DmetrixParser:
 
     def _read_tile_indexes(
         self, fh, descriptors: tuple[_LevelDescriptor, ...], file_size: int
-    ) -> dict[int, dict[tuple[int, int], ByteRange]]:
-        result: dict[int, dict[tuple[int, int], ByteRange]] = {}
+    ) -> tuple[PackedTileRanges, ...]:
+        result: list[PackedTileRanges] = []
         for descriptor in descriptors:
             fh.seek(descriptor.index_offset)
-            coordinates: dict[tuple[int, int], ByteRange] = {}
-            for _ in range(descriptor.tile_cols * descriptor.tile_rows):
+            expected = descriptor.tile_cols * descriptor.tile_rows
+            coordinates = PackedTileRanges(expected)
+            seen = bytearray(expected)
+            self._report_progress(
+                f"level {descriptor.source_id}: parsing 0/{expected} tile indexes"
+            )
+            for record_index in range(expected):
                 source_id, x, y, offset, length = self.TILE_RECORD.unpack(
                     _read_exact(fh, self.TILE_RECORD.size, "tile record")
                 )
@@ -324,22 +354,36 @@ class DmetrixParser:
                     raise ValueError(
                         f"Unexpected DMetrix level id {source_id} in level {descriptor.source_id}"
                     )
-                if x > descriptor.max_x or y > descriptor.max_y or (x, y) in coordinates:
+                if x > descriptor.max_x or y > descriptor.max_y:
                     raise ValueError(
                         f"Invalid or duplicate tile coordinate ({x}, {y}) "
                         f"at DMetrix level {source_id}"
                     )
                 data_range = ByteRange(offset, length)
                 self._validate_range(data_range, file_size, f"level {source_id} tile")
-                coordinates[(x, y)] = data_range
-            expected = descriptor.tile_cols * descriptor.tile_rows
-            if len(coordinates) != expected:
+                slot = y * descriptor.tile_cols + x
+                if seen[slot]:
+                    raise ValueError(
+                        f"Invalid or duplicate tile coordinate ({x}, {y}) "
+                        f"at DMetrix level {source_id}"
+                    )
+                seen[slot] = 1
+                coordinates.set(slot, data_range)
+                if record_index == expected - 1 or (record_index + 1) % 100_000 == 0:
+                    self._report_progress(
+                        f"level {descriptor.source_id}: parsed {record_index + 1}/{expected} tile indexes"
+                    )
+            if not all(seen):
                 raise ValueError(
                     f"Tile count mismatch at DMetrix level {descriptor.source_id}: "
-                    f"expected {expected}, got {len(coordinates)}"
+                    f"expected {expected}, got {sum(seen)}"
                 )
-            result[descriptor.source_id] = coordinates
-        return result
+            result.append(coordinates)
+        return tuple(result)
+
+    def _report_progress(self, message: str) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(message)
 
     @staticmethod
     def _validate_range(data_range: ByteRange, file_size: int, context: str) -> None:
@@ -353,10 +397,9 @@ class DmetrixParser:
     @staticmethod
     def _discover_tile_size(
         fh,
-        descriptor: _LevelDescriptor,
-        raw_tiles: dict[int, dict[tuple[int, int], ByteRange]],
+        tile_ranges: PackedTileRanges,
     ) -> int:
-        width, height = _image_size(fh, raw_tiles[descriptor.source_id][(0, 0)])
+        width, height = _image_size(fh, tile_ranges[0])
         if width != height or width < 16 or width > 4096:
             raise ValueError(f"Unsupported DMetrix tile size: {width}x{height}")
         return width
@@ -573,7 +616,10 @@ def convert_one(
         print(f"Skip  : {input_path} -> {output_path} (already exists)")
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    slide = DmetrixParser(input_path).parse()
+    slide = DmetrixParser(
+        input_path,
+        progress_callback=lambda message: print(f"Index : {message}"),
+    ).parse()
     source_jpeg_quality = slide.metadata.jpeg_quality
     slide = replace(
         slide,

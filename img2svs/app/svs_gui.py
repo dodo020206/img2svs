@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -12,7 +13,7 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 from img2svs.app.svs_gui_service import (
     GUI_SUPPORTED_SUFFIXES,
     GuiConversionOptions,
-    execute_jobs,
+    execute_jobs_subprocess,
     plan_jobs,
 )
 
@@ -52,7 +53,11 @@ QUALITY_OPTIONS = ("原始/推荐", "60", "70", "80", "90", "95")
 def run_headless_smoke_test() -> int:
     """在无显示环境下运行一次 GUI 后端自检，供打包验证使用。"""
 
-    from img2svs.app.svs_gui_service import GuiConversionOptions, execute_jobs, plan_jobs
+    from img2svs.app.svs_gui_service import (
+        GuiConversionOptions,
+        execute_jobs_subprocess,
+        plan_jobs,
+    )
 
     output_dir = Path(
         os.environ.get("SVS_GUI_SMOKE_OUTPUT_DIR", "/tmp/svs_gui_binary_smoke")
@@ -78,7 +83,7 @@ def run_headless_smoke_test() -> int:
         overwrite=True,
     )
     jobs = plan_jobs(options)
-    summary = execute_jobs(jobs)
+    summary = execute_jobs_subprocess(jobs, options)
     return 0 if summary.failed == 0 and not summary.cancelled else 1
 
 
@@ -833,7 +838,7 @@ class SvsConverterApp(tk.Tk):
 
         self.worker_thread = threading.Thread(
             target=self.run_jobs_worker,
-            args=(jobs,),
+            args=(jobs, options),
             daemon=True,
         )
         self.worker_thread.start()
@@ -846,8 +851,8 @@ class SvsConverterApp(tk.Tk):
             self.status_var.set("已请求停止。当前文件完成后，剩余任务将不再继续。")
             self.append_log("收到停止请求：将在当前文件处理完成后停止剩余任务。")
 
-    def run_jobs_worker(self, jobs) -> None:
-        """后台线程：执行任务并把事件投递回主线程。"""
+    def run_jobs_worker(self, jobs, options: GuiConversionOptions) -> None:
+        """后台线程：启动独立 worker 并把事件投递回主线程。"""
 
         def log_callback(message: str) -> None:
             self.event_queue.put(("log", message))
@@ -856,8 +861,9 @@ class SvsConverterApp(tk.Tk):
             self.event_queue.put(("progress", completed, total, job.input_path.name, phase))
 
         try:
-            summary = execute_jobs(
+            summary = execute_jobs_subprocess(
                 jobs,
+                options,
                 log_callback=log_callback,
                 progress_callback=progress_callback,
                 stop_event=self.stop_event,
@@ -958,6 +964,10 @@ class SvsConverterApp(tk.Tk):
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--worker":
+        from img2svs.app.svs_worker import main as worker_main
+
+        raise SystemExit(worker_main(sys.argv[2:]))
     if os.environ.get("SVS_GUI_SMOKE_TEST") == "1":
         raise SystemExit(run_headless_smoke_test())
     app = SvsConverterApp()

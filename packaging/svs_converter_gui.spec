@@ -28,6 +28,7 @@ hiddenimports = (
         "tkinter.filedialog",
         "tkinter.messagebox",
         "tkinter.font",
+        "img2svs.app.svs_worker",
     ]
     + collect_submodules("imagecodecs")
 )
