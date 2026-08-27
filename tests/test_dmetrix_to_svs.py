@@ -11,6 +11,11 @@ import tifffile
 from PIL import Image
 
 from img2svs.app import convert_to_svs
+from img2svs.app.svs_gui_service import (
+    GuiConversionOptions,
+    execute_jobs_subprocess,
+    plan_jobs,
+)
 from img2svs.converters.dmetrix_to_svs import DmetrixParser, convert_one
 
 
@@ -145,6 +150,24 @@ class DmetrixConversionTests(unittest.TestCase):
             self.assertGreater(image[2, 2, 0], image[2, 2, 1])
             self.assertGreater(image[2, 18, 2], image[2, 18, 0])
             self.assertGreater(image[18, 2, 1], image[18, 2, 0])
+
+    def test_gui_worker_subprocess_converts_without_in_process_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            source = root / "slide.dmetrix"
+            output_dir = root / "out"
+            make_dmetrix(source)
+            options = GuiConversionOptions(
+                inputs=(source,), output_dir=output_dir, overwrite=True
+            )
+            jobs = plan_jobs(options)
+            logs: list[str] = []
+            summary = execute_jobs_subprocess(jobs, options, log_callback=logs.append)
+
+            self.assertEqual(summary.succeeded, 1)
+            self.assertFalse(summary.failed)
+            self.assertTrue((output_dir / "slide.svs").exists())
+            self.assertTrue(any("Conversion completed." in message for message in logs))
 
 
 if __name__ == "__main__":

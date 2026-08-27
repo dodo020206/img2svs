@@ -119,6 +119,7 @@ dist\PathologySVSConverter.exe
 ## 说明
 
 - GUI 和命令行入口统一调度 `img2svs\converters` 中的各格式转换器。
+- GUI 会把每个文件交给独立 worker 进程处理，避免大切片解析占用界面线程；DMetrix 索引使用紧凑数组保存，降低内存峰值。
 - `NDPI/MRXS` 当前通过 `pyvips + libvips` 读取 OpenSlide 暴露的切片内容并生成金字塔 TIFF，以 `.svs` 扩展名输出。
 - `CSP/DMETRIX/KFB/MDSX/MSDX/MRXS/SDPC/DYQX/NDPI` 现在都支持指定输出 JPEG 质量，能够直接影响生成的 `SVS` 体积。帝麦克斯文件保持“原始/推荐”时会直通复制 JPEG 瓦片，转换更快且避免重复压缩。
 - “停止队列”会在当前文件完成后停止剩余任务，不会强制中断正在写入的文件。
