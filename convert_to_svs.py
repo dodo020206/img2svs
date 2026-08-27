@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Sequence
 
 import csp_to_svs
+import dmetrix_to_svs
 import kfb_to_svs
 import mdsx_to_svs
 import mrxs_to_svs
@@ -25,8 +26,8 @@ from svs_common import (
 
 ALL_SUPPORTED_SUFFIXES = (
     csp_to_svs.SUPPORTED_SUFFIXES
-    |
-    kfb_to_svs.SUPPORTED_SUFFIXES
+    | dmetrix_to_svs.SUPPORTED_SUFFIXES
+    | kfb_to_svs.SUPPORTED_SUFFIXES
     | mdsx_to_svs.SUPPORTED_SUFFIXES
     | mrxs_to_svs.SUPPORTED_SUFFIXES
     | ndpi_to_svs.SUPPORTED_SUFFIXES
@@ -48,14 +49,14 @@ def parse_args(argv: Sequence[str] | None = None) -> CliOptions:
     parser = argparse.ArgumentParser(
         description=(
             "Convert supported whole-slide formats "
-            "(.csp, .kfb, .mdsx, .msdx, .mrxs, .ndpi, .sdpc, .dyqx) to SVS."
+            "(.csp, .dmetrix, .kfb, .mdsx, .msdx, .mrxs, .ndpi, .sdpc, .dyqx) to SVS."
         )
     )
     add_batch_arguments(parser, "Path to an input slide file or directory.")
     add_jpeg_quality_argument(parser)
     parser.add_argument(
         "--format",
-        choices=("auto", "csp", "kfb", "mdsx", "mrxs", "ndpi", "sdpc"),
+        choices=("auto", "csp", "dmetrix", "kfb", "mdsx", "mrxs", "ndpi", "sdpc"),
         default="auto",
         help="Input format. Default: auto-detect by file suffix",
     )
@@ -83,6 +84,8 @@ def format_suffixes_for_selection(input_format: str) -> tuple[set[str], str]:
 
     if input_format == "csp":
         return csp_to_svs.SUPPORTED_SUFFIXES, ".csp"
+    if input_format == "dmetrix":
+        return dmetrix_to_svs.SUPPORTED_SUFFIXES, ".dmetrix"
     if input_format == "kfb":
         return kfb_to_svs.SUPPORTED_SUFFIXES, ".kfb"
     if input_format == "mdsx":
@@ -104,6 +107,10 @@ def detect_backend(input_path: Path, input_format: str) -> str:
         if suffix not in csp_to_svs.SUPPORTED_SUFFIXES:
             raise ValueError(f"Input file is not a .csp slide: {input_path}")
         return "csp"
+    if input_format == "dmetrix":
+        if suffix not in dmetrix_to_svs.SUPPORTED_SUFFIXES:
+            raise ValueError(f"Input file is not a .dmetrix slide: {input_path}")
+        return "dmetrix"
     if input_format == "kfb":
         if suffix not in kfb_to_svs.SUPPORTED_SUFFIXES:
             raise ValueError(f"Input file is not a .kfb slide: {input_path}")
@@ -126,6 +133,8 @@ def detect_backend(input_path: Path, input_format: str) -> str:
         return "sdpc"
     if suffix in csp_to_svs.SUPPORTED_SUFFIXES:
         return "csp"
+    if suffix in dmetrix_to_svs.SUPPORTED_SUFFIXES:
+        return "dmetrix"
     if suffix in kfb_to_svs.SUPPORTED_SUFFIXES:
         return "kfb"
     if suffix in mdsx_to_svs.SUPPORTED_SUFFIXES:
@@ -168,6 +177,16 @@ def build_jobs(options: CliOptions) -> list[ConversionJob]:
                     input_path=slide,
                     output_path=output_path,
                     runner=lambda slide=slide, output_path=output_path: run_csp_job(
+                        slide, output_path, options
+                    ),
+                )
+            )
+        elif backend == "dmetrix":
+            jobs.append(
+                ConversionJob(
+                    input_path=slide,
+                    output_path=output_path,
+                    runner=lambda slide=slide, output_path=output_path: run_dmetrix_job(
                         slide, output_path, options
                     ),
                 )
@@ -243,6 +262,19 @@ def run_csp_job(input_path: Path, output_path: Path, options: CliOptions) -> Non
 
     print("Format: csp")
     csp_to_svs.convert_one(
+        input_path=input_path,
+        output_path=output_path,
+        jpeg_quality=options.jpeg_quality,
+        skip_associated=options.skip_associated,
+        overwrite=options.overwrite,
+    )
+
+
+def run_dmetrix_job(input_path: Path, output_path: Path, options: CliOptions) -> None:
+    """Execute one DMetrix conversion job."""
+
+    print("Format: dmetrix")
+    dmetrix_to_svs.convert_one(
         input_path=input_path,
         output_path=output_path,
         jpeg_quality=options.jpeg_quality,

@@ -22,6 +22,7 @@ MUTED_COLOR = "#5b6472"
 FORMAT_LABELS = {
     "自动识别（推荐）": "auto",
     "仅 CSP": "csp",
+    "仅 帝麦克斯 DMETRIX": "dmetrix",
     "仅 KFB": "kfb",
     "仅 MDSX / MSDX": "mdsx",
     "仅 MRXS": "mrxs",
@@ -30,8 +31,9 @@ FORMAT_LABELS = {
 }
 
 FILE_TYPES = [
-    ("病理切片文件", "*.csp *.sdpc *.dyqx *.kfb *.mdsx *.msdx *.mrxs *.ndpi"),
+    ("病理切片文件", "*.csp *.dmetrix *.sdpc *.dyqx *.kfb *.mdsx *.msdx *.mrxs *.ndpi"),
     ("CSP", "*.csp"),
+    ("帝麦克斯 DMETRIX", "*.dmetrix"),
     ("SDPC / DYQX", "*.sdpc *.dyqx"),
     ("KFB", "*.kfb"),
     ("MDSX / MSDX", "*.mdsx *.msdx"),
@@ -432,7 +434,7 @@ class SvsConverterApp(tk.Tk):
         subtitle = ttk.Label(
             header,
             text=(
-                "支持 SDPC/DYQX、KFB、MDSX/MSDX、MRXS、NDPI。"
+                "支持帝麦克斯 DMETRIX、SDPC/DYQX、KFB、MDSX/MSDX、MRXS、NDPI。"
             ),
             style="Subtitle.TLabel",
         )

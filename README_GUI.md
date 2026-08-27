@@ -5,6 +5,7 @@
 支持的输入格式：
 
 - `CSP`
+- `DMETRIX`（帝麦克斯）
 - `SDPC`
 - `DYQX`
 - `KFB`
@@ -40,6 +41,8 @@
 5. 点击“开始转换”。
 
 ## 打包为 Windows 可执行文件
+
+项目的 Windows EXE 固定使用 `Python 3.11` 构建；`build_windows_exe.bat` 会检查版本，不接受其他 Python 主次版本。
 
 先在 Windows 环境准备依赖：
 
@@ -92,7 +95,7 @@ dist\PathologySVSConverter.exe
 
 ## 说明
 
-- GUI 通过现有的 `csp_to_svs.py`、`sdpc_to_svs.py`、`kfb_to_svs.py`、`mdsx_to_svs.py`、`mrxs_to_svs.py`、`ndpi_to_svs.py` 统一调度。
+- GUI 通过现有的 `csp_to_svs.py`、`dmetrix_to_svs.py`、`sdpc_to_svs.py`、`kfb_to_svs.py`、`mdsx_to_svs.py`、`mrxs_to_svs.py`、`ndpi_to_svs.py` 统一调度。
 - `NDPI/MRXS` 当前通过 `pyvips + libvips` 读取 OpenSlide 暴露的切片内容并生成金字塔 TIFF，以 `.svs` 扩展名输出。
-- `CSP/KFB/MDSX/MSDX/MRXS/SDPC/DYQX/NDPI` 现在都支持指定输出 JPEG 质量，能够直接影响生成的 `SVS` 体积。
+- `CSP/DMETRIX/KFB/MDSX/MSDX/MRXS/SDPC/DYQX/NDPI` 现在都支持指定输出 JPEG 质量，能够直接影响生成的 `SVS` 体积。帝麦克斯文件保持“原始/推荐”时会直通复制 JPEG 瓦片，转换更快且避免重复压缩。
 - “停止队列”会在当前文件完成后停止剩余任务，不会强制中断正在写入的文件。

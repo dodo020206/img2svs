@@ -10,6 +10,7 @@ from typing import Callable, Sequence
 
 import csp_to_svs
 import convert_to_svs
+import dmetrix_to_svs
 import kfb_to_svs
 import mdsx_to_svs
 import mrxs_to_svs
@@ -19,8 +20,8 @@ from svs_common import ConversionJob, collect_inputs, format_elapsed, resolve_ou
 
 GUI_SUPPORTED_SUFFIXES = (
     csp_to_svs.SUPPORTED_SUFFIXES
-    |
-    kfb_to_svs.SUPPORTED_SUFFIXES
+    | dmetrix_to_svs.SUPPORTED_SUFFIXES
+    | kfb_to_svs.SUPPORTED_SUFFIXES
     | mdsx_to_svs.SUPPORTED_SUFFIXES
     | mrxs_to_svs.SUPPORTED_SUFFIXES
     | ndpi_to_svs.SUPPORTED_SUFFIXES
@@ -114,6 +115,14 @@ def make_job_runner(
 
     if backend == "csp":
         return lambda: csp_to_svs.convert_one(
+            input_path=input_path,
+            output_path=output_path,
+            jpeg_quality=options.jpeg_quality,
+            skip_associated=options.skip_associated,
+            overwrite=options.overwrite,
+        )
+    if backend == "dmetrix":
+        return lambda: dmetrix_to_svs.convert_one(
             input_path=input_path,
             output_path=output_path,
             jpeg_quality=options.jpeg_quality,

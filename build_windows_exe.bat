@@ -26,6 +26,12 @@ if not defined PYTHON_EXE (
     exit /b 1
 )
 
+"%PYTHON_EXE%" -c "import sys; print('[INFO] Python runtime:', sys.version.split()[0]); raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)"
+if errorlevel 1 (
+    echo [ERROR] Windows EXE packaging requires Python 3.11.
+    exit /b 1
+)
+
 if not defined VIPS_HOME if exist "%cd%\vips" set "VIPS_HOME=%cd%\vips"
 if not defined VIPS_HOME if exist "%cd%\third_party\vips" set "VIPS_HOME=%cd%\third_party\vips"
 if not defined VIPS_HOME if exist "C:\vips" set "VIPS_HOME=C:\vips"
