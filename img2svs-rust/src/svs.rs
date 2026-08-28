@@ -1,14 +1,16 @@
 use crate::hevc::Decoder as HevcDecoder;
 use crate::jpeg::{
-    decode_image, decode_rgb, encode_jpeg, thumbnail as make_thumbnail, white_image,
+    decode_image, decode_rgb, encode_jpeg, encode_jpeg_with_capacity, thumbnail as make_thumbnail,
+    transcode_jpeg_to_420, white_image,
 };
-use crate::model::{Compression, Level, Slide};
+use crate::model::{ByteRange, Compression, Level, Slide};
 use anyhow::{anyhow, bail, Context, Result};
 use image::{Rgb, RgbImage};
+use memmap2::MmapOptions;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 const APERIO_VERSION: &str = "Aperio Image Library v12.4.3";
@@ -810,6 +812,15 @@ fn read_range(input: &mut File, offset: u64, length: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn mapped_range(source: &[u8], range: ByteRange) -> Result<&[u8]> {
+    let start = usize::try_from(range.offset).context("tile offset exceeds this platform")?;
+    let length = usize::try_from(range.length).context("tile length exceeds this platform")?;
+    let end = start.checked_add(length).context("tile range overflow")?;
+    source
+        .get(start..end)
+        .context("tile range exceeds input file")
+}
+
 struct TiffWriter {
     file: File,
     first_ifd_pointer: Option<u64>,
@@ -923,12 +934,17 @@ impl TiffWriter {
                     quality,
                 })
                 .collect();
-            for encoded in tile_pool.encode_batch(&tasks)? {
-                let offset = self.file.stream_position()?;
-                self.file.write_all(&encoded)?;
+            let encoded_tiles = tile_pool.encode_batch(&tasks)?;
+            let batch_offset = self.file.stream_position()?;
+            let batch_bytes = encoded_tiles.iter().map(Vec::len).sum();
+            let mut batch = Vec::with_capacity(batch_bytes);
+            for encoded in encoded_tiles {
+                let offset = batch_offset + batch.len() as u64;
                 offsets.push(u32::try_from(offset).context("TIFF exceeds classic 4 GiB offsets")?);
                 counts.push(u32::try_from(encoded.len()).context("JPEG tile is too large")?);
+                batch.extend_from_slice(&encoded);
             }
+            self.file.write_all(&batch)?;
         }
         let description = aperio_description(slide, level, tile_width, tile_height, quality);
         let resolution =
@@ -1012,7 +1028,7 @@ struct TileResult {
 }
 
 struct TilePool {
-    tasks: Option<Vec<mpsc::Sender<TileTask>>>,
+    tasks: Option<mpsc::Sender<TileTask>>,
     results: mpsc::Receiver<TileResult>,
     workers: Vec<JoinHandle<()>>,
     batch_size: usize,
@@ -1023,11 +1039,16 @@ impl TilePool {
         let available = thread::available_parallelism()
             .map(|count| count.get())
             .unwrap_or(1);
+        let default_workers = if slide.compression == Compression::Jpeg {
+            available.saturating_mul(2).min(32)
+        } else {
+            available.saturating_sub(1).max(1)
+        };
         let worker_count = std::env::var("IMG2SVS_THREADS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|count| *count > 0)
-            .unwrap_or_else(|| available.saturating_sub(1).max(1))
+            .unwrap_or(default_workers)
             .min(32);
         Self::with_worker_count(slide, worker_count)
     }
@@ -1035,30 +1056,36 @@ impl TilePool {
     fn with_worker_count(slide: &Slide, worker_count: usize) -> Result<Self> {
         let worker_count = worker_count.clamp(1, 32);
         let (result_sender, result_receiver) = mpsc::channel::<TileResult>();
+        let (task_sender, task_receiver) = mpsc::channel::<TileTask>();
+        let task_receiver = Arc::new(Mutex::new(task_receiver));
         let slide = Arc::new(slide.clone());
+        let source_file = File::open(&slide.path)
+            .with_context(|| format!("open input {}", slide.path.display()))?;
+        // SAFETY: the converter opens the source read-only and never mutates it
+        // while this mapping is alive.
+        let source = Arc::new(unsafe { MmapOptions::new().map(&source_file)? });
         let mut workers = Vec::with_capacity(worker_count);
-        let mut task_senders = Vec::with_capacity(worker_count);
 
         for index in 0..worker_count {
-            let (task_sender, task_receiver) = mpsc::channel::<TileTask>();
-            let input = File::open(&slide.path)
-                .with_context(|| format!("open input {}", slide.path.display()))?;
             let worker_slide = Arc::clone(&slide);
+            let worker_source = Arc::clone(&source);
+            let worker_tasks = Arc::clone(&task_receiver);
             let worker_results = result_sender.clone();
-            task_senders.push(task_sender);
             workers.push(
                 thread::Builder::new()
                     .name(format!("svs-tile-{index}"))
-                    .spawn(move || tile_worker(worker_slide, input, task_receiver, worker_results))
+                    .spawn(move || {
+                        tile_worker(worker_slide, worker_source, worker_tasks, worker_results)
+                    })
                     .context("start tile worker")?,
             );
         }
         drop(result_sender);
         Ok(Self {
-            tasks: Some(task_senders),
+            tasks: Some(task_sender),
             results: result_receiver,
             workers,
-            batch_size: worker_count * 2,
+            batch_size: worker_count * 64,
         })
     }
 
@@ -1067,11 +1094,9 @@ impl TilePool {
     }
 
     fn encode_batch(&self, tasks: &[TileTask]) -> Result<Vec<Vec<u8>>> {
-        let senders = self.tasks.as_ref().context("tile workers are closed")?;
+        let sender = self.tasks.as_ref().context("tile workers are closed")?;
         for task in tasks {
-            senders[task.slot % senders.len()]
-                .send(*task)
-                .context("send tile task")?;
+            sender.send(*task).context("send tile task")?;
         }
         let mut ordered: Vec<Option<Vec<u8>>> = (0..tasks.len()).map(|_| None).collect();
         let mut first_error = None;
@@ -1105,8 +1130,8 @@ impl Drop for TilePool {
 
 fn tile_worker(
     slide: Arc<Slide>,
-    mut input: File,
-    tasks: mpsc::Receiver<TileTask>,
+    source: Arc<memmap2::Mmap>,
+    tasks: Arc<Mutex<mpsc::Receiver<TileTask>>>,
     results: mpsc::Sender<TileResult>,
 ) {
     let (mut hevc, hevc_error) = if slide.compression == Compression::Hevc {
@@ -1121,12 +1146,19 @@ fn tile_worker(
     } else {
         (None, None)
     };
-    while let Ok(task) = tasks.recv() {
+    loop {
+        let task = match tasks.lock() {
+            Ok(receiver) => match receiver.recv() {
+                Ok(task) => task,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
         let encoded = if let Some(message) = &hevc_error {
             Err(anyhow!(message.clone()))
         } else {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                encode_output_tile(&slide, &mut input, task, hevc.as_mut())
+                encode_output_tile(&slide, &source, task, hevc.as_mut())
             }))
             .unwrap_or_else(|_| Err(anyhow!("tile worker panicked")))
         };
@@ -1144,7 +1176,7 @@ fn tile_worker(
 
 fn encode_output_tile(
     slide: &Slide,
-    input: &mut File,
+    source: &[u8],
     task: TileTask,
     hevc: Option<&mut HevcDecoder>,
 ) -> Result<Vec<u8>> {
@@ -1164,12 +1196,12 @@ fn encode_output_tile(
             .tiles
             .get((task.output_row * level.tile_cols + task.output_col) as usize)
             .context("invalid source tile index")?;
-        let bytes = read_range(input, range.offset, range.length)?;
+        let bytes = mapped_range(source, range)?;
         if bytes.is_empty() {
             return encode_jpeg(
                 &compose_tile(
                     slide,
-                    input,
+                    source,
                     level,
                     task.output_row,
                     task.output_col,
@@ -1182,14 +1214,16 @@ fn encode_output_tile(
                 task.quality,
             );
         }
-        if !jpeg_is_420(&bytes) {
-            return encode_jpeg(&decode_rgb(&bytes)?, task.quality);
+        if !jpeg_is_420(bytes) {
+            return transcode_jpeg_to_420(bytes, task.quality).or_else(|_| {
+                encode_jpeg_with_capacity(&decode_rgb(bytes)?, task.quality, bytes.len())
+            });
         }
-        return Ok(bytes);
+        return Ok(bytes.to_vec());
     }
     let image = compose_tile(
         slide,
-        input,
+        source,
         level,
         task.output_row,
         task.output_col,
@@ -1775,7 +1809,7 @@ struct Extra {
 
 fn compose_tile(
     slide: &Slide,
-    input: &mut File,
+    source: &[u8],
     level: &Level,
     output_row: u32,
     output_col: u32,
@@ -1808,8 +1842,8 @@ fn compose_tile(
             if !range.present() || position.x >= limit_x || position.y >= limit_y {
                 continue;
             }
-            let bytes = read_range(input, range.offset, range.length)?;
-            let image = decode_tile(slide, &bytes, hevc.as_deref_mut())?;
+            let bytes = mapped_range(source, range)?;
+            let image = decode_tile(slide, bytes, hevc.as_deref_mut())?;
             let source_width = position.width.min(image.width());
             let source_height = position.height.min(image.height());
             let right = (position.x + source_width).min(limit_x);
@@ -1848,8 +1882,8 @@ fn compose_tile(
             if !range.present() {
                 continue;
             }
-            let data = read_range(input, range.offset, range.length)?;
-            let image = decode_tile(slide, &data, hevc.as_deref_mut())?;
+            let data = mapped_range(source, range)?;
+            let image = decode_tile(slide, data, hevc.as_deref_mut())?;
             copy_clipped(
                 &mut output,
                 &image,

@@ -50,18 +50,21 @@ OpenSlide/libvips runtime: set `VIPS_HOME`, or place the runtime at
 ## Performance
 
 Native JPEG and HEVC tile decode/encode work runs in a bounded worker pool.
-The default is one fewer than the available logical CPU count, capped at 32,
-so the GUI keeps one logical CPU available. Set `IMG2SVS_THREADS` before
-launching the CLI or GUI to override it, for example:
+JPEG conversion defaults to twice the available logical CPU count, while HEVC
+keeps one logical CPU available; both are capped at 32 workers. Set
+`IMG2SVS_THREADS` before launching the CLI or GUI to override it, for example:
 
 ```powershell
 $env:IMG2SVS_THREADS = '8'
 .\target\release\img2svs-rust.exe input.csp -o output.svs --overwrite
 ```
 
-Encoded tiles are buffered only in small batches and written in source order,
-so parallel conversion does not load the complete slide into memory or change
-the TIFF tile-offset order.
+JPEG tiles use the Rust encoder's SIMD path. Non-4:2:0 JPEG tiles are decoded
+directly to YCbCr before 4:2:0 encoding, avoiding an unnecessary RGB color
+conversion. Source tiles are read through a shared read-only memory map;
+encoded tiles are buffered only in bounded batches and written in source
+order, so parallel conversion does not load the complete slide into memory or
+change the TIFF tile-offset order.
 
 ## Build and smoke test
 
