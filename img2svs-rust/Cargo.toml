@@ -1,0 +1,20 @@
+[package]
+name = "img2svs-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust whole-slide image to Aperio SVS converter"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
+jpeg-encoder = "0.7.1"
+eframe = { version = "0.32", default-features = true }
+rfd = "0.15"
+base64 = "0.22"
+quick-xml = "0.38"
+libloading = "0.8"
+[profile.release]
+lto = false
+codegen-units = 1
