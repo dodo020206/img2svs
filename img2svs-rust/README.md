@@ -47,6 +47,22 @@ the bundled `av.libs` directory next to the executable. NDPI/MRXS require the
 OpenSlide/libvips runtime: set `VIPS_HOME`, or place the runtime at
 `vips\bin` next to the executable.
 
+## Performance
+
+Native JPEG and HEVC tile decode/encode work runs in a bounded worker pool.
+The default is one fewer than the available logical CPU count, capped at 32,
+so the GUI keeps one logical CPU available. Set `IMG2SVS_THREADS` before
+launching the CLI or GUI to override it, for example:
+
+```powershell
+$env:IMG2SVS_THREADS = '8'
+.\target\release\img2svs-rust.exe input.csp -o output.svs --overwrite
+```
+
+Encoded tiles are buffered only in small batches and written in source order,
+so parallel conversion does not load the complete slide into memory or change
+the TIFF tile-offset order.
+
 ## Build and smoke test
 
 On a normal Rust Windows installation:
