@@ -573,11 +573,9 @@ impl SvsGui {
             (self.completed + self.failed) as f32 / total as f32
         };
         ui.add_space(14.0);
-        ui.add(egui::ProgressBar::new(fraction).fill(PRIMARY).text(format!(
-            "{} / {}",
-            self.completed + self.failed,
-            total
-        )));
+        ui.add(egui::ProgressBar::new(fraction).fill(PRIMARY).text(
+            RichText::new(format!("{} / {}", self.completed + self.failed, total)).color(TEXT),
+        ));
         ui.add_space(2.0);
     }
 
