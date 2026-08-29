@@ -14,8 +14,8 @@ Run the executable without arguments, or pass `--gui`:
 The GUI supports multi-file selection, recursive folder scanning, Windows drag
 and drop, output-folder selection, JPEG quality, overwrite/associated-image
 options, a queued background worker, progress, per-file status, logs and
-cooperative cancellation. Shortcuts are `Ctrl+O` (files), `Ctrl+Shift+O`
-(folder), `Delete` (remove selected), `F5` (start) and `Esc` (stop).
+cooperative cancellation. Each row has its own `移除` button. Shortcuts are
+`Ctrl+O` (files), `Ctrl+Shift+O` (folder), `F5` (start) and `Esc` (stop).
 
 The native backends are:
 
