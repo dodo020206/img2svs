@@ -9,12 +9,16 @@ license = "MIT"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
-jpeg-encoder = "0.7.1"
+jpeg-encoder = { version = "0.7.1", features = ["simd"] }
 eframe = { version = "0.32", default-features = true }
 rfd = "0.15"
 base64 = "0.22"
 quick-xml = "0.38"
 libloading = "0.8"
+memmap2 = "0.9"
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
+
 [profile.release]
 lto = false
 codegen-units = 1

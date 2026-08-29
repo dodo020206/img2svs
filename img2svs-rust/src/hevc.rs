@@ -311,9 +311,6 @@ fn locate_ffmpeg_dir() -> Option<PathBuf> {
             roots.push(parent.join("av.libs"));
         }
     }
-    roots.push(PathBuf::from(
-        r"D:\projects\img2svs\img2svs-python\.venv-package\Lib\site-packages\av.libs",
-    ));
     roots.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
     roots.into_iter().find(|root| {
         find_dll(root, "avcodec").is_ok()

@@ -46,6 +46,30 @@ GUI/CLI. HEVC requires the FFmpeg native runtime: set `FFMPEG_HOME`, or place
 the bundled `av.libs` directory next to the executable. NDPI/MRXS require the
 OpenSlide/libvips runtime: set `VIPS_HOME`, or place the runtime at
 `vips\bin` next to the executable.
+Runtime discovery is relative to the executable or environment variables and
+does not depend on a development-machine path. NDPI/MRXS conversion keeps
+libvips' hardware-aware concurrency default; `VIPS_CONCURRENCY` can be used as
+an advanced override after benchmarking the target machine.
+
+## Performance
+
+Native JPEG and HEVC tile decode/encode work runs in a bounded worker pool.
+JPEG conversion defaults to the logical CPU count reported by the operating
+system (up to 64 workers). HEVC keeps one logical CPU available and is capped
+at 32 workers because each worker owns a decoder. Set `IMG2SVS_THREADS` before
+launching the CLI or GUI to override the detected value, for example:
+
+```powershell
+$env:IMG2SVS_THREADS = '8'
+.\target\release\img2svs-rust.exe input.csp -o output.svs --overwrite
+```
+
+JPEG tiles use the Rust encoder's SIMD path. Non-4:2:0 JPEG tiles are decoded
+directly to YCbCr before 4:2:0 encoding, avoiding an unnecessary RGB color
+conversion. Source tiles are read through a shared read-only memory map;
+encoded tiles are buffered only in bounded batches and written in source
+order, so parallel conversion does not load the complete slide into memory or
+change the TIFF tile-offset order.
 
 ## Build and smoke test
 
@@ -58,8 +82,9 @@ cargo build --release
 ```
 
 For the repository's Windows development runtime, `build_windows.ps1` also
-copies `../img2svs-python/vips` beside the executable when that directory is
-present.
+copies `../img2svs-python/vips` and the FFmpeg DLLs beside the executable when
+those directories are present. Distribute the complete release directory,
+including `vips` and `av.libs`, rather than the executable alone.
 
 `--smoke-test` initializes the native window and closes after the first frame;
 it is useful for CI or packaging checks without leaving a GUI process running.

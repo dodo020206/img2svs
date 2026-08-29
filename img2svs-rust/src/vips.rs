@@ -3,12 +3,13 @@
 
 use crate::jpeg::decode_image;
 use crate::svs;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use image::RgbImage;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 
 pub fn convert(
     input: &Path,
@@ -32,30 +33,48 @@ pub fn convert(
     }
     let temporary = temporary_path(output);
     let result = (|| {
-        let mpp = read_field(&bin, input, "openslide.mpp-x").unwrap_or(0.25);
-        let app_mag = read_field(&bin, input, "aperio.AppMag").unwrap_or(0.0);
-        run_vips(
-            &bin,
-            "tiffsave",
-            &[input, &temporary],
-            &[
-                "--pyramid=true",
-                "--tile=true",
-                "--tile-width=256",
-                "--tile-height=256",
-                "--compression=jpeg",
-                &format!("--Q={quality}"),
-                &format!("--xres={}", 10000.0 / mpp.max(0.000001)),
-                &format!("--yres={}", 10000.0 / mpp.max(0.000001)),
-                "--resunit=cm",
-            ],
-        )?;
-        let thumbnail = load_thumbnail(&bin, input, &temporary)?;
-        if !skip_associated {
-            let images = load_associated_images(&bin, input, quality, &temporary);
-            if !images.is_empty() {
-                svs::append_associated_images(&temporary, &images, mpp, quality)?;
-            }
+        let (mpp, app_mag) = thread::scope(|scope| {
+            let mpp = scope.spawn(|| read_field(&bin, input, "openslide.mpp-x"));
+            let app_mag = scope.spawn(|| read_field(&bin, input, "openslide.objective-power"));
+            (
+                mpp.join().ok().flatten().unwrap_or(0.25),
+                app_mag.join().ok().flatten().unwrap_or(0.0),
+            )
+        });
+        let (thumbnail, images) = thread::scope(|scope| {
+            let thumbnail = scope.spawn(|| load_thumbnail(&bin, input, &temporary));
+            let associated = scope.spawn(|| {
+                if skip_associated {
+                    Vec::new()
+                } else {
+                    load_associated_images(&bin, input, quality, &temporary)
+                }
+            });
+            let pyramid = run_vips(
+                &bin,
+                "tiffsave",
+                &[input, &temporary],
+                &[
+                    "--pyramid=true",
+                    "--tile=true",
+                    "--tile-width=256",
+                    "--tile-height=256",
+                    "--compression=jpeg",
+                    &format!("--Q={quality}"),
+                    &format!("--xres={}", 10000.0 / mpp.max(0.000001)),
+                    &format!("--yres={}", 10000.0 / mpp.max(0.000001)),
+                    "--resunit=cm",
+                ],
+            );
+            let thumbnail = thumbnail
+                .join()
+                .map_err(|_| anyhow!("thumbnail worker panicked"))??;
+            let associated = associated.join().unwrap_or_default();
+            pyramid?;
+            Ok::<_, anyhow::Error>((thumbnail, associated))
+        })?;
+        if !images.is_empty() {
+            svs::append_associated_images(&temporary, &images, mpp, quality)?;
         }
         svs::prepend_compatible_pages(&temporary, &thumbnail, mpp, app_mag, quality)?;
         if output.exists() {
@@ -91,33 +110,34 @@ fn load_associated_images(
     quality: u8,
     temporary: &Path,
 ) -> Vec<(String, RgbImage)> {
-    ["label", "macro"]
-        .into_iter()
-        .filter_map(|kind| {
-            let stem = temporary.file_name()?.to_string_lossy();
-            let image_path = temporary.with_file_name(format!(".{stem}.{kind}.v"));
-            let jpeg_path = temporary.with_file_name(format!(".{stem}.{kind}.jpg"));
-            let result = (|| {
-                run_vips(
-                    bin,
-                    "openslideload",
-                    &[input, &image_path],
-                    &[&format!("--associated={kind}")],
-                )?;
-                run_vips(
-                    bin,
-                    "jpegsave",
-                    &[&image_path, &jpeg_path],
-                    &[&format!("--Q={quality}")],
-                )?;
-                let image = decode_image(&fs::read(&jpeg_path)?)?;
-                Ok::<RgbImage, anyhow::Error>(image)
-            })();
-            let _ = fs::remove_file(&image_path);
-            let _ = fs::remove_file(&jpeg_path);
-            result.ok().map(|image| (kind.to_owned(), image))
-        })
-        .collect()
+    thread::scope(|scope| {
+        ["label", "macro"]
+            .into_iter()
+            .map(|kind| {
+                scope.spawn(move || {
+                    let stem = temporary.file_name()?.to_string_lossy();
+                    let jpeg_path = temporary.with_file_name(format!(".{stem}.{kind}.jpg"));
+                    let mut output = jpeg_path.as_os_str().to_os_string();
+                    output.push(format!("[Q={quality}]"));
+                    let output = PathBuf::from(output);
+                    let result = (|| {
+                        run_vips(
+                            bin,
+                            "openslideload",
+                            &[input, &output],
+                            &[&format!("--associated={kind}")],
+                        )?;
+                        decode_image(&fs::read(&jpeg_path)?)
+                    })();
+                    let _ = fs::remove_file(&jpeg_path);
+                    result.ok().map(|image| (kind.to_owned(), image))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|worker| worker.join().ok().flatten())
+            .collect()
+    })
 }
 
 pub fn print_info(input: &Path) -> Result<()> {
@@ -207,12 +227,9 @@ fn locate_vips_bin() -> Option<PathBuf> {
     if let Ok(executable) = env::current_exe() {
         if let Some(parent) = executable.parent() {
             candidates.push(parent.join("vips").join("bin"));
-            candidates.push(parent.join(r"..\vips\bin"));
+            candidates.push(parent.join("..").join("vips").join("bin"));
         }
     }
-    candidates.push(PathBuf::from(
-        r"D:\projects\img2svs\img2svs-python\vips\bin",
-    ));
     for path in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
         candidates.push(path);
     }
