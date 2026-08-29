@@ -295,10 +295,12 @@ impl SvsGui {
             .items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| (item.state == ItemState::Waiting).then_some(index))
+            .filter_map(|(index, item)| {
+                matches!(item.state, ItemState::Waiting | ItemState::Cancelled).then_some(index)
+            })
             .collect();
         if pending_indices.is_empty() {
-            self.log("没有新添加的切片需要转换。".to_owned());
+            self.log("没有待转换的切片。".to_owned());
             return;
         }
         let quality = match self.options.jpeg_quality.as_str() {
