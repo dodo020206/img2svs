@@ -1039,22 +1039,27 @@ impl TilePool {
         let available = thread::available_parallelism()
             .map(|count| count.get())
             .unwrap_or(1);
-        let default_workers = if slide.compression == Compression::Jpeg {
-            available.saturating_mul(2).min(32)
+        let worker_limit = if slide.compression == Compression::Jpeg {
+            64
         } else {
-            available.saturating_sub(1).max(1)
+            32
+        };
+        let default_workers = if slide.compression == Compression::Jpeg {
+            available.min(worker_limit)
+        } else {
+            available.saturating_sub(1).max(1).min(worker_limit)
         };
         let worker_count = std::env::var("IMG2SVS_THREADS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|count| *count > 0)
             .unwrap_or(default_workers)
-            .min(32);
+            .min(worker_limit);
         Self::with_worker_count(slide, worker_count)
     }
 
     fn with_worker_count(slide: &Slide, worker_count: usize) -> Result<Self> {
-        let worker_count = worker_count.clamp(1, 32);
+        let worker_count = worker_count.clamp(1, 64);
         let (result_sender, result_receiver) = mpsc::channel::<TileResult>();
         let (task_sender, task_receiver) = mpsc::channel::<TileTask>();
         let task_receiver = Arc::new(Mutex::new(task_receiver));
