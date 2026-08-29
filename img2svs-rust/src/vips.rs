@@ -17,13 +17,7 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-pub fn convert(
-    input: &Path,
-    output: &Path,
-    quality: u8,
-    skip_associated: bool,
-    overwrite: bool,
-) -> Result<()> {
+pub fn convert(input: &Path, output: &Path, quality: u8, overwrite: bool) -> Result<()> {
     if output.exists() && !overwrite {
         println!(
             "Skip  : {} -> {} (already exists)",
@@ -49,13 +43,8 @@ pub fn convert(
         });
         let (thumbnail, images) = thread::scope(|scope| {
             let thumbnail = scope.spawn(|| load_thumbnail(&bin, input, &temporary));
-            let associated = scope.spawn(|| {
-                if skip_associated {
-                    Vec::new()
-                } else {
-                    load_associated_images(&bin, input, quality, &temporary)
-                }
-            });
+            let associated =
+                scope.spawn(|| load_associated_images(&bin, input, quality, &temporary));
             let pyramid = run_vips(
                 &bin,
                 "tiffsave",

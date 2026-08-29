@@ -86,7 +86,6 @@ impl ItemState {
 struct GuiOptions {
     output_dir: String,
     jpeg_quality: String,
-    skip_associated: bool,
     overwrite: bool,
 }
 
@@ -148,7 +147,7 @@ impl SvsGui {
         style.visuals.widgets.hovered.bg_fill = PRIMARY_LIGHT;
         style.visuals.widgets.hovered.fg_stroke.color = TEXT;
         style.visuals.selection.bg_fill = PRIMARY;
-        style.visuals.selection.stroke.color = PRIMARY;
+        style.visuals.selection.stroke.color = Color32::WHITE;
         cc.egui_ctx.set_style(style);
         install_windows_font(&cc.egui_ctx);
         Self {
@@ -156,7 +155,6 @@ impl SvsGui {
             options: GuiOptions {
                 output_dir: String::new(),
                 jpeg_quality: "原始".to_owned(),
-                skip_associated: false,
                 overwrite: false,
             },
             logs: vec!["就绪：可拖入切片文件或目录。".to_owned()],
@@ -297,10 +295,12 @@ impl SvsGui {
             .items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| (item.state == ItemState::Waiting).then_some(index))
+            .filter_map(|(index, item)| {
+                matches!(item.state, ItemState::Waiting | ItemState::Cancelled).then_some(index)
+            })
             .collect();
         if pending_indices.is_empty() {
-            self.log("没有新添加的切片需要转换。".to_owned());
+            self.log("没有待转换的切片。".to_owned());
             return;
         }
         let quality = match self.options.jpeg_quality.as_str() {
@@ -322,21 +322,11 @@ impl SvsGui {
             output_dir.as_deref(),
         );
         let batch_total = jobs.len();
-        let skip_associated = self.options.skip_associated;
         let overwrite = self.options.overwrite;
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
-        thread::spawn(move || {
-            run_jobs(
-                jobs,
-                quality,
-                skip_associated,
-                overwrite,
-                sender,
-                worker_cancel,
-            )
-        });
+        thread::spawn(move || run_jobs(jobs, quality, overwrite, sender, worker_cancel));
         self.receiver = Some(receiver);
         self.cancel = Some(cancel);
         self.running = true;
@@ -416,18 +406,30 @@ impl SvsGui {
 
 fn install_windows_font(ctx: &egui::Context) {
     #[cfg(target_os = "windows")]
-    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\simhei.ttf") {
-        let mut fonts = FontDefinitions::default();
-        fonts
-            .font_data
-            .insert("simhei".to_owned(), Arc::new(FontData::from_owned(bytes)));
-        if let Some(proportional) = fonts.families.get_mut(&FontFamily::Proportional) {
-            proportional.insert(0, "simhei".to_owned());
+    {
+        for (font_name, font_path) in [
+            ("microsoft-yahei", r"C:\Windows\Fonts\msyh.ttc"),
+            ("microsoft-yahei", r"C:\Windows\Fonts\msyh.ttf"),
+            ("simhei", r"C:\Windows\Fonts\simhei.ttf"),
+        ] {
+            let Ok(bytes) = std::fs::read(font_path) else {
+                continue;
+            };
+            let mut font_data = FontData::from_owned(bytes);
+            font_data.index = 0;
+            let mut fonts = FontDefinitions::default();
+            fonts
+                .font_data
+                .insert(font_name.to_owned(), Arc::new(font_data));
+            if let Some(proportional) = fonts.families.get_mut(&FontFamily::Proportional) {
+                proportional.insert(0, font_name.to_owned());
+            }
+            if let Some(monospace) = fonts.families.get_mut(&FontFamily::Monospace) {
+                monospace.insert(0, font_name.to_owned());
+            }
+            ctx.set_fonts(fonts);
+            break;
         }
-        if let Some(monospace) = fonts.families.get_mut(&FontFamily::Monospace) {
-            monospace.insert(0, "simhei".to_owned());
-        }
-        ctx.set_fonts(fonts);
     }
 }
 
@@ -571,11 +573,9 @@ impl SvsGui {
             (self.completed + self.failed) as f32 / total as f32
         };
         ui.add_space(14.0);
-        ui.add(egui::ProgressBar::new(fraction).fill(PRIMARY).text(format!(
-            "{} / {}",
-            self.completed + self.failed,
-            total
-        )));
+        ui.add(egui::ProgressBar::new(fraction).fill(PRIMARY).text(
+            RichText::new(format!("{} / {}", self.completed + self.failed, total)).color(TEXT),
+        ));
         ui.add_space(2.0);
     }
 
@@ -782,10 +782,6 @@ impl SvsGui {
                 .color(MUTED_TEXT),
         );
         ui.checkbox(&mut self.options.overwrite, "覆盖已存在的 SVS");
-        ui.checkbox(
-            &mut self.options.skip_associated,
-            "跳过 label / macro 关联图",
-        );
     }
 
     fn logs_panel(&mut self, ui: &mut egui::Ui) {
@@ -841,7 +837,6 @@ impl SvsGui {
 fn run_jobs(
     jobs: Vec<Job>,
     quality: Option<u8>,
-    skip_associated: bool,
     overwrite: bool,
     sender: Sender<WorkerEvent>,
     cancel: Arc<AtomicBool>,
@@ -853,7 +848,7 @@ fn run_jobs(
         }
         let _ = sender.send(WorkerEvent::Started { index });
         let started = Instant::now();
-        let result = convert_one(&job.input, &job.output, quality, skip_associated, overwrite);
+        let result = convert_one(&job.input, &job.output, quality, overwrite);
         match result {
             Ok(output) => {
                 let _ = sender.send(WorkerEvent::Log(format!("输出：{}", output.display())));
@@ -879,7 +874,6 @@ fn convert_one(
     input: &Path,
     output: &Path,
     quality: Option<u8>,
-    skip_associated: bool,
     overwrite: bool,
 ) -> Result<PathBuf> {
     let input = input
@@ -896,7 +890,7 @@ fn convert_one(
         "csp" | "kfb" | "mdsx" | "msdx" => indexed::parse(&input)?,
         "ndpi" | "mrxs" => {
             let selected_quality = quality.unwrap_or(75);
-            vips::convert(&input, output, selected_quality, skip_associated, overwrite)?;
+            vips::convert(&input, output, selected_quality, overwrite)?;
             return Ok(output.to_path_buf());
         }
         other => bail!("unsupported input extension .{other}"),
@@ -907,7 +901,6 @@ fn convert_one(
         output,
         &svs::WriteOptions {
             jpeg_quality: selected_quality,
-            skip_associated,
             overwrite,
         },
     )?;

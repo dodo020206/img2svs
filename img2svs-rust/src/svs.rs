@@ -17,7 +17,6 @@ const APERIO_VERSION: &str = "Aperio Image Library v12.4.3";
 
 pub struct WriteOptions {
     pub jpeg_quality: u8,
-    pub skip_associated: bool,
     pub overwrite: bool,
 }
 
@@ -729,21 +728,19 @@ fn write_slide_inner(slide: &Slide, output: &Path, options: &WriteOptions) -> Re
         writer.write_tiled_page(slide, level, options.jpeg_quality, true, &tile_pool)?;
     }
 
-    if !options.skip_associated {
-        for associated in &slide.associated_images {
-            let bytes = read_range(&mut input, associated.data.offset, associated.data.length)?;
-            if bytes.is_empty() {
-                continue;
-            }
-            let image = decode_image(&bytes)
-                .with_context(|| format!("decode associated image {}", associated.kind))?;
-            writer.write_strip_page(
-                &image,
-                options.jpeg_quality,
-                10000.0 / slide.metadata.mpp,
-                Some(&format!("{}\r", associated.kind)),
-            )?;
+    for associated in &slide.associated_images {
+        let bytes = read_range(&mut input, associated.data.offset, associated.data.length)?;
+        if bytes.is_empty() {
+            continue;
         }
+        let image = decode_image(&bytes)
+            .with_context(|| format!("decode associated image {}", associated.kind))?;
+        writer.write_strip_page(
+            &image,
+            options.jpeg_quality,
+            10000.0 / slide.metadata.mpp,
+            Some(&format!("{}\r", associated.kind)),
+        )?;
     }
     writer.finish()
 }

@@ -32,9 +32,6 @@ struct Args {
     /// Output JPEG quality (1-100).
     #[arg(long)]
     jpeg_quality: Option<u8>,
-    /// Do not write label/macro associated images.
-    #[arg(long)]
-    skip_associated: bool,
     /// Replace an existing output file.
     #[arg(long)]
     overwrite: bool,
@@ -88,13 +85,7 @@ fn run() -> Result<()> {
             if args.info {
                 return vips::print_info(&input);
             }
-            vips::convert(
-                &input,
-                &output,
-                quality,
-                args.skip_associated,
-                args.overwrite,
-            )?;
+            vips::convert(&input, &output, quality, args.overwrite)?;
             println!("Output: {}", output.display());
             return Ok(());
         }
@@ -115,7 +106,6 @@ fn run() -> Result<()> {
         &output,
         &svs::WriteOptions {
             jpeg_quality: quality,
-            skip_associated: args.skip_associated,
             overwrite: args.overwrite,
         },
     )?;
