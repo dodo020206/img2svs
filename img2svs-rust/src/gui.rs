@@ -1,6 +1,8 @@
 use crate::{dmetrix, indexed, sdpc, svs, vips};
 use anyhow::{bail, Context, Result};
-use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, RichText, Vec2};
+use eframe::egui::{
+    self, Color32, FontData, FontDefinitions, FontFamily, FontId, RichText, TextStyle, Vec2,
+};
 use eframe::{App, CreationContext, Frame, NativeOptions};
 use rfd::FileDialog;
 use std::collections::HashSet;
@@ -15,6 +17,15 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     "csp", "dmetrix", "kfb", "mdsx", "msdx", "mrxs", "ndpi", "sdpc", "dyqx",
 ];
 
+const PAGE_BACKGROUND: Color32 = Color32::from_rgb(242, 246, 249);
+const CARD_BACKGROUND: Color32 = Color32::from_rgb(255, 255, 255);
+const HEADER_BACKGROUND: Color32 = Color32::from_rgb(17, 52, 79);
+const PRIMARY: Color32 = Color32::from_rgb(13, 151, 143);
+const PRIMARY_LIGHT: Color32 = Color32::from_rgb(225, 249, 247);
+const BORDER: Color32 = Color32::from_rgb(210, 220, 228);
+const TEXT: Color32 = Color32::from_rgb(22, 52, 77);
+const MUTED_TEXT: Color32 = Color32::from_rgb(84, 119, 145);
+
 pub struct LaunchOptions {
     pub smoke_test: bool,
 }
@@ -23,8 +34,8 @@ pub fn run(options: LaunchOptions) -> Result<()> {
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Pathology SVS Converter")
-            .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([860.0, 560.0]),
+            .with_inner_size([1280.0, 840.0])
+            .with_min_inner_size([980.0, 680.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -79,6 +90,11 @@ struct GuiOptions {
     overwrite: bool,
 }
 
+struct Job {
+    input: PathBuf,
+    output: PathBuf,
+}
+
 enum WorkerEvent {
     Started { index: usize },
     Log(String),
@@ -90,7 +106,6 @@ enum WorkerEvent {
 
 struct SvsGui {
     items: Vec<InputItem>,
-    selected: HashSet<usize>,
     options: GuiOptions,
     logs: Vec<String>,
     receiver: Option<Receiver<WorkerEvent>>,
@@ -98,24 +113,46 @@ struct SvsGui {
     running: bool,
     completed: usize,
     failed: usize,
+    batch_total: usize,
+    active_indices: Vec<usize>,
     smoke_test: bool,
     last_message: String,
+    logs_collapsed: bool,
 }
 
 impl SvsGui {
     fn new(cc: &CreationContext<'_>, smoke_test: bool) -> Self {
         let mut style = (*cc.egui_ctx.style()).clone();
-        style.spacing.item_spacing = Vec2::new(8.0, 7.0);
-        style.visuals = egui::Visuals::dark();
-        style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(29, 38, 51);
-        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(42, 54, 70);
-        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(51, 83, 111);
-        style.visuals.selection.bg_fill = Color32::from_rgb(34, 123, 197);
+        style.spacing.item_spacing = Vec2::new(10.0, 10.0);
+        style.spacing.button_padding = Vec2::new(13.0, 9.0);
+        style.spacing.interact_size = Vec2::new(44.0, 38.0);
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::proportional(17.0));
+        style
+            .text_styles
+            .insert(TextStyle::Button, FontId::proportional(16.0));
+        style
+            .text_styles
+            .insert(TextStyle::Small, FontId::proportional(14.0));
+        style
+            .text_styles
+            .insert(TextStyle::Heading, FontId::proportional(25.0));
+        style.visuals = egui::Visuals::light();
+        style.visuals.panel_fill = PAGE_BACKGROUND;
+        style.visuals.window_fill = CARD_BACKGROUND;
+        style.visuals.widgets.noninteractive.bg_fill = CARD_BACKGROUND;
+        style.visuals.widgets.noninteractive.fg_stroke.color = TEXT;
+        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(232, 241, 246);
+        style.visuals.widgets.inactive.fg_stroke.color = TEXT;
+        style.visuals.widgets.hovered.bg_fill = PRIMARY_LIGHT;
+        style.visuals.widgets.hovered.fg_stroke.color = TEXT;
+        style.visuals.selection.bg_fill = PRIMARY;
+        style.visuals.selection.stroke.color = PRIMARY;
         cc.egui_ctx.set_style(style);
         install_windows_font(&cc.egui_ctx);
         Self {
             items: Vec::new(),
-            selected: HashSet::new(),
             options: GuiOptions {
                 output_dir: String::new(),
                 jpeg_quality: "原始".to_owned(),
@@ -128,8 +165,11 @@ impl SvsGui {
             running: false,
             completed: 0,
             failed: 0,
+            batch_total: 0,
+            active_indices: Vec::new(),
             smoke_test,
             last_message: "等待添加切片".to_owned(),
+            logs_collapsed: true,
         }
     }
 
@@ -139,6 +179,7 @@ impl SvsGui {
             return;
         }
         let mut added = 0;
+        let mut refreshed = 0;
         let mut ignored = 0;
         let mut duplicate = 0;
         let mut candidates = Vec::new();
@@ -161,17 +202,42 @@ impl SvsGui {
                 continue;
             }
             let key = normalize_path(&path);
-            if !seen.insert(key) {
-                duplicate += 1;
+            if seen.contains(&key) {
+                if let Some(item) = self
+                    .items
+                    .iter_mut()
+                    .find(|item| normalize_path(&item.path) == key)
+                {
+                    if item.state != ItemState::Waiting {
+                        item.state = ItemState::Waiting;
+                        refreshed += 1;
+                    } else {
+                        duplicate += 1;
+                    }
+                } else {
+                    duplicate += 1;
+                }
                 continue;
             }
+            seen.insert(key);
             self.items.push(InputItem {
                 path,
                 state: ItemState::Waiting,
             });
             added += 1;
         }
-        self.last_message = format!("新增 {added} 项，重复 {duplicate} 项，忽略 {ignored} 项");
+        self.last_message = format!(
+            "新增 {added} 项，重新加入 {refreshed} 项，重复 {duplicate} 项，忽略 {ignored} 项"
+        );
+        if added > 0 || refreshed > 0 {
+            self.completed = 0;
+            self.failed = 0;
+            self.batch_total = self
+                .items
+                .iter()
+                .filter(|item| item.state == ItemState::Waiting)
+                .count();
+        }
         self.log(format!("{}。", self.last_message));
     }
 
@@ -203,25 +269,38 @@ impl SvsGui {
         }
     }
 
-    fn remove_selected(&mut self) {
+    fn remove_at(&mut self, index: usize) {
         if self.running {
             return;
         }
-        let selected = &self.selected;
-        self.items = self
-            .items
-            .drain(..)
-            .enumerate()
-            .filter_map(|(index, item)| (!selected.contains(&index)).then_some(item))
-            .collect();
-        self.selected.clear();
+        if index < self.items.len() {
+            self.items.remove(index);
+            self.batch_total = self
+                .items
+                .iter()
+                .filter(|item| item.state == ItemState::Waiting)
+                .count();
+        }
     }
 
     fn start(&mut self) {
-        if self.running || self.items.is_empty() {
+        if self.running {
+            return;
+        }
+        if self.items.is_empty() {
             if self.items.is_empty() {
                 self.last_message = "请先添加切片文件".to_owned();
             }
+            return;
+        }
+        let pending_indices: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| (item.state == ItemState::Waiting).then_some(index))
+            .collect();
+        if pending_indices.is_empty() {
+            self.log("没有新添加的切片需要转换。".to_owned());
             return;
         }
         let quality = match self.options.jpeg_quality.as_str() {
@@ -234,9 +313,15 @@ impl SvsGui {
                 }
             },
         };
-        let jobs: Vec<PathBuf> = self.items.iter().map(|item| item.path.clone()).collect();
         let output_dir = (!self.options.output_dir.trim().is_empty())
             .then(|| PathBuf::from(self.options.output_dir.trim()));
+        let jobs = plan_jobs(
+            pending_indices
+                .iter()
+                .map(|&index| self.items[index].path.clone()),
+            output_dir.as_deref(),
+        );
+        let batch_total = jobs.len();
         let skip_associated = self.options.skip_associated;
         let overwrite = self.options.overwrite;
         let (sender, receiver) = mpsc::channel();
@@ -245,7 +330,6 @@ impl SvsGui {
         thread::spawn(move || {
             run_jobs(
                 jobs,
-                output_dir,
                 quality,
                 skip_associated,
                 overwrite,
@@ -258,9 +342,8 @@ impl SvsGui {
         self.running = true;
         self.completed = 0;
         self.failed = 0;
-        self.items
-            .iter_mut()
-            .for_each(|item| item.state = ItemState::Waiting);
+        self.batch_total = batch_total;
+        self.active_indices = pending_indices;
         self.log("开始转换队列。".to_owned());
     }
 
@@ -281,34 +364,34 @@ impl SvsGui {
         for event in events {
             match event {
                 WorkerEvent::Started { index } => {
-                    if let Some(item) = self.items.get_mut(index) {
-                        item.state = ItemState::Running;
+                    if let Some(item_index) = self.active_indices.get(index).copied() {
+                        if let Some(item) = self.items.get_mut(item_index) {
+                            item.state = ItemState::Running;
+                        }
                     }
                 }
                 WorkerEvent::Log(message) => self.log(message),
                 WorkerEvent::Finished { index, elapsed } => {
-                    if let Some(item) = self.items.get_mut(index) {
-                        item.state = ItemState::Done;
+                    if let Some(item_index) = self.active_indices.get(index).copied() {
+                        let path = self.items[item_index].path.display().to_string();
+                        self.items[item_index].state = ItemState::Done;
+                        self.completed += 1;
+                        self.log(format!("完成：{path}（{elapsed:.1}s）"));
                     }
-                    self.completed += 1;
-                    self.log(format!(
-                        "完成：{}（{elapsed:.1}s）",
-                        self.items[index].path.display()
-                    ));
                 }
                 WorkerEvent::Failed { index, message } => {
-                    if let Some(item) = self.items.get_mut(index) {
-                        item.state = ItemState::Failed;
+                    if let Some(item_index) = self.active_indices.get(index).copied() {
+                        let path = self.items[item_index].path.display().to_string();
+                        self.items[item_index].state = ItemState::Failed;
+                        self.failed += 1;
+                        self.log(format!("失败：{path}：{message}"));
                     }
-                    self.failed += 1;
-                    self.log(format!(
-                        "失败：{}：{message}",
-                        self.items[index].path.display()
-                    ));
                 }
                 WorkerEvent::Cancelled { index } => {
-                    if let Some(item) = self.items.get_mut(index) {
-                        item.state = ItemState::Cancelled;
+                    if let Some(item_index) = self.active_indices.get(index).copied() {
+                        if let Some(item) = self.items.get_mut(item_index) {
+                            item.state = ItemState::Cancelled;
+                        }
                     }
                 }
                 WorkerEvent::Complete { cancelled } => {
@@ -324,21 +407,9 @@ impl SvsGui {
                         format!("完成：{} 项，失败 {} 项", self.completed, self.failed)
                     };
                     self.log(self.last_message.clone());
+                    self.active_indices.clear();
                 }
             }
-        }
-    }
-
-    fn output_path(&self, input: &Path) -> PathBuf {
-        let mut name = input
-            .file_stem()
-            .map(|value| value.to_os_string())
-            .unwrap_or_else(|| "output".into());
-        name.push(".svs");
-        if self.options.output_dir.trim().is_empty() {
-            input.with_file_name(name)
-        } else {
-            PathBuf::from(self.options.output_dir.trim()).join(name)
         }
     }
 }
@@ -371,26 +442,49 @@ impl App for SvsGui {
         self.handle_dropped_files(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| self.header(ui));
-        egui::SidePanel::right("settings")
-            .resizable(true)
-            .default_width(310.0)
-            .show(ctx, |ui| self.settings(ui));
-        egui::CentralPanel::default().show(ctx, |ui| self.sources(ui));
+        egui::TopBottomPanel::top("header")
+            .frame(
+                egui::Frame::new()
+                    .fill(HEADER_BACKGROUND)
+                    .inner_margin(18.0),
+            )
+            .show(ctx, |ui| self.header(ui));
         egui::TopBottomPanel::bottom("logs")
             .resizable(true)
-            .default_height(145.0)
+            .default_height(if self.logs_collapsed { 54.0 } else { 220.0 })
+            .frame(egui::Frame::new().fill(PAGE_BACKGROUND).inner_margin(18.0))
             .show(ctx, |ui| self.logs_panel(ui));
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(PAGE_BACKGROUND).inner_margin(18.0))
+            .show(ctx, |ui| {
+                ui.columns(2, |columns| {
+                    egui::Frame::new()
+                        .fill(CARD_BACKGROUND)
+                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                        .inner_margin(18.0)
+                        .show(&mut columns[0], |ui| self.sources(ui));
+                    egui::Frame::new()
+                        .fill(CARD_BACKGROUND)
+                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                        .inner_margin(18.0)
+                        .show(&mut columns[1], |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("settings_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| self.settings(ui));
+                        });
+                });
+            });
     }
 }
 
 impl SvsGui {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (f5, escape, delete, ctrl_o, ctrl_shift_o) = ctx.input(|input| {
+        let (f5, escape, ctrl_o, ctrl_shift_o) = ctx.input(|input| {
             (
                 input.key_pressed(egui::Key::F5),
                 input.key_pressed(egui::Key::Escape),
-                input.key_pressed(egui::Key::Delete),
                 input.modifiers.command && input.key_pressed(egui::Key::O),
                 input.modifiers.command && input.modifiers.shift && input.key_pressed(egui::Key::O),
             )
@@ -400,9 +494,6 @@ impl SvsGui {
         }
         if escape {
             self.stop();
-        }
-        if delete {
-            self.remove_selected();
         }
         if ctrl_shift_o {
             self.choose_folder();
@@ -426,68 +517,97 @@ impl SvsGui {
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.add_space(10.0);
-            ui.label(
-                RichText::new("SVS")
-                    .strong()
-                    .size(18.0)
-                    .color(Color32::WHITE),
-            );
+            egui::Frame::new()
+                .fill(PRIMARY)
+                .inner_margin(14.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("SVS")
+                            .strong()
+                            .size(20.0)
+                            .color(Color32::WHITE),
+                    );
+                });
+            ui.add_space(6.0);
             ui.vertical(|ui| {
-                ui.label(RichText::new("病理图像转 SVS").strong().size(20.0));
-                ui.label(RichText::new("Rust 原生桌面版 · 批量转换 Aperio SVS").weak());
+                ui.label(
+                    RichText::new("病理图像转 SVS 工具")
+                        .strong()
+                        .size(25.0)
+                        .color(Color32::WHITE),
+                );
+                ui.label(
+                    RichText::new("把常见数字病理切片批量转换为兼容性更好的 SVS")
+                        .size(15.0)
+                        .color(Color32::from_rgb(184, 216, 235)),
+                );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let stop = ui.add_enabled(self.running, egui::Button::new("停止  Esc"));
+                let stop = ui.add_enabled(
+                    self.running,
+                    egui::Button::new(RichText::new("停止").size(17.0))
+                        .fill(Color32::from_rgb(239, 245, 248))
+                        .min_size(Vec2::new(112.0, 44.0)),
+                );
                 if stop.clicked() {
                     self.stop();
                 }
-                let start = ui.add_enabled(!self.running, egui::Button::new("开始转换  F5"));
+                let start = ui.add_enabled(
+                    !self.running,
+                    egui::Button::new(RichText::new("开始转换  F5").size(17.0))
+                        .fill(PRIMARY)
+                        .min_size(Vec2::new(158.0, 44.0)),
+                );
                 if start.clicked() {
                     self.start();
                 }
             });
         });
-        let total = self.items.len();
+        let total = self.batch_total;
         let fraction = if total == 0 {
             0.0
         } else {
             (self.completed + self.failed) as f32 / total as f32
         };
-        ui.add(egui::ProgressBar::new(fraction).text(format!(
+        ui.add_space(14.0);
+        ui.add(egui::ProgressBar::new(fraction).fill(PRIMARY).text(format!(
             "{} / {}",
             self.completed + self.failed,
             total
         )));
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&self.last_message).color(if self.failed > 0 {
-                Color32::LIGHT_RED
-            } else {
-                Color32::LIGHT_BLUE
-            }));
-            ui.label(RichText::new(format!("队列 {} 项 · 失败 {} 项", total, self.failed)).weak());
-        });
-        ui.add_space(8.0);
+        ui.add_space(2.0);
     }
 
     fn sources(&mut self, ui: &mut egui::Ui) {
         ui.heading("1  选择切片");
-        ui.label(RichText::new("支持多选、目录添加，也可以直接拖拽到下方列表").weak());
+        ui.label(
+            RichText::new("支持多文件、目录添加，也可以直接拖拽到下方列表")
+                .size(15.0)
+                .color(MUTED_TEXT),
+        );
         ui.horizontal(|ui| {
-            if ui.button("＋ 添加文件").clicked() {
+            if ui
+                .add_sized([132.0, 40.0], egui::Button::new("＋ 添加文件"))
+                .clicked()
+            {
                 self.choose_files();
             }
-            if ui.button("添加目录").clicked() {
+            if ui
+                .add_sized([112.0, 40.0], egui::Button::new("添加目录"))
+                .clicked()
+            {
                 self.choose_folder();
             }
-            if ui.button("移除选中").clicked() {
-                self.remove_selected();
-            }
-            if ui.button("清空").clicked() && !self.running {
+            if ui
+                .add_sized([88.0, 40.0], egui::Button::new("清空"))
+                .clicked()
+                && !self.running
+            {
                 self.items.clear();
-                self.selected.clear();
+                self.completed = 0;
+                self.failed = 0;
+                self.batch_total = 0;
             }
         });
         ui.label(
@@ -501,158 +621,239 @@ impl SvsGui {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let action_width = 78.0;
+                let column_spacing = ui.spacing().item_spacing.x;
+                let path_width = (ui.available_width() - action_width - column_spacing).max(120.0);
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(232, 239, 244))
+                    .inner_margin(egui::Margin::symmetric(0, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (path_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(path_width, 24.0),
+                                egui::Sense::hover(),
+                            );
+                            let (action_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(action_width, 24.0),
+                                egui::Sense::hover(),
+                            );
+                            let painter = ui.painter();
+                            painter.text(
+                                path_rect.left_center(),
+                                egui::Align2::LEFT_CENTER,
+                                "文件或目录",
+                                FontId::proportional(17.0),
+                                TEXT,
+                            );
+                            painter.text(
+                                action_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "操作",
+                                FontId::proportional(17.0),
+                                TEXT,
+                            );
+                        });
+                    });
+                let mut remove_index = None;
                 for index in 0..self.items.len() {
                     let item = &self.items[index];
-                    let selected = self.selected.contains(&index);
                     let path = item.path.display().to_string();
-                    let label = format!("{}  ·  {}", format_kind(&item.path), item.state.label());
-                    let response = ui.selectable_label(
-                        selected,
-                        RichText::new(format!("{label}\n{path}")).color(item.state.color()),
-                    );
-                    if response.clicked() {
-                        if ui.input(|input| input.modifiers.command) {
-                            if !self.selected.insert(index) {
-                                self.selected.remove(&index);
-                            }
-                        } else {
-                            self.selected.clear();
-                            self.selected.insert(index);
+                    let label = item.state.label();
+                    ui.horizontal(|ui| {
+                        let (path_rect, _) = ui
+                            .allocate_exact_size(Vec2::new(path_width, 44.0), egui::Sense::hover());
+                        let painter = ui.painter().with_clip_rect(path_rect);
+                        painter.text(
+                            path_rect.left_center() + Vec2::new(0.0, -9.0),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            FontId::proportional(15.0),
+                            item.state.color(),
+                        );
+                        painter.text(
+                            path_rect.left_center() + Vec2::new(0.0, 9.0),
+                            egui::Align2::LEFT_CENTER,
+                            &path,
+                            FontId::proportional(15.0),
+                            item.state.color(),
+                        );
+                        if ui
+                            .add_enabled(
+                                !self.running,
+                                egui::Button::new("移除").min_size(Vec2::new(action_width, 38.0)),
+                            )
+                            .clicked()
+                        {
+                            remove_index = Some(index);
                         }
-                    }
+                    });
                     ui.separator();
                 }
+                if let Some(index) = remove_index {
+                    self.remove_at(index);
+                }
                 if self.items.is_empty() {
-                    ui.add_space(80.0);
+                    ui.add_space(28.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
                             RichText::new("将切片文件或文件夹拖到这里")
                                 .size(18.0)
                                 .weak(),
                         );
-                        ui.label(RichText::new("支持一次拖入多个项目").weak());
+                        ui.label(RichText::new("支持一次拖入多个项目").size(15.0).weak());
                     });
                 }
             });
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("2  输出设置");
-        ui.label(RichText::new("统一输出目录（留空则写入源文件目录）").weak());
+        ui.heading("2  转换设置");
+        ui.label(
+            RichText::new("默认选项适合大多数切片")
+                .size(15.0)
+                .color(MUTED_TEXT),
+        );
+        ui.add_space(8.0);
+        ui.label(RichText::new("输出位置").strong().color(TEXT));
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.options.output_dir).desired_width(190.0));
-            if ui.button("选择").clicked() {
+            let input_width = (ui.available_width() - 92.0).max(120.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgb(250, 252, 253))
+                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                .inner_margin(0.0)
+                .show(ui, |ui| {
+                    ui.add_sized(
+                        [input_width, 40.0],
+                        egui::TextEdit::singleline(&mut self.options.output_dir)
+                            .frame(false)
+                            .background_color(Color32::from_rgb(250, 252, 253))
+                            .vertical_align(egui::Align::Center)
+                            .desired_rows(1),
+                    );
+                });
+            if ui
+                .add_sized([82.0, 40.0], egui::Button::new("浏览..."))
+                .clicked()
+            {
                 self.choose_output();
             }
         });
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("留空即保存到源文件同目录")
+                    .size(14.0)
+                    .color(MUTED_TEXT),
+            );
+            if ui
+                .button(RichText::new("恢复为源目录输出").size(14.0))
+                .clicked()
+            {
+                self.options.output_dir.clear();
+            }
+        });
+        ui.separator();
         ui.add_space(10.0);
-        ui.label("SVS JPEG 保存质量");
-        egui::ComboBox::from_id_salt("quality")
-            .selected_text(&self.options.jpeg_quality)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut self.options.jpeg_quality,
-                    "原始".to_owned(),
-                    "原始 / 推荐",
-                );
-                for quality in [95, 90, 85, 80, 70, 60] {
-                    ui.selectable_value(
-                        &mut self.options.jpeg_quality,
-                        quality.to_string(),
-                        quality.to_string(),
-                    );
-                }
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("SVS 保存质量").strong().color(TEXT));
+                egui::ComboBox::from_id_salt("quality")
+                    .selected_text(&self.options.jpeg_quality)
+                    .width(180.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.options.jpeg_quality,
+                            "原始".to_owned(),
+                            "原始 / 推荐",
+                        );
+                        for quality in [95, 90, 85, 80, 70, 60] {
+                            ui.selectable_value(
+                                &mut self.options.jpeg_quality,
+                                quality.to_string(),
+                                quality.to_string(),
+                            );
+                        }
+                    });
             });
+        });
+        ui.label(
+            RichText::new("“原始/推荐”会尽量沿用源图质量，降低数值可减小文件体积。")
+                .size(14.0)
+                .color(MUTED_TEXT),
+        );
         ui.checkbox(&mut self.options.overwrite, "覆盖已存在的 SVS");
         ui.checkbox(
             &mut self.options.skip_associated,
             "跳过 label / macro 关联图",
         );
-        ui.separator();
-        ui.heading("3  任务控制");
-        if ui
-            .add_enabled(!self.running, egui::Button::new("开始转换  F5"))
-            .clicked()
-        {
-            self.start();
-        }
-        if ui
-            .add_enabled(self.running, egui::Button::new("请求停止  Esc"))
-            .clicked()
-        {
-            self.stop();
-        }
-        if let Some(first) = self.items.first() {
-            ui.add_space(8.0);
-            ui.label("示例输出路径");
-            ui.label(
-                RichText::new(self.output_path(&first.path).display().to_string())
-                    .small()
-                    .weak(),
-            );
-        }
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new(
-                "提示：NDPI / MRXS 使用 OpenSlide + libvips；HEVC SDPC 需要 FFmpeg 运行库。",
-            )
-            .color(Color32::from_rgb(220, 170, 90)),
-        );
     }
 
     fn logs_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("运行日志");
+            ui.heading("3  运行日志");
+            ui.label(
+                RichText::new("需要排查失败原因时再展开")
+                    .size(14.0)
+                    .color(MUTED_TEXT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(if self.logs_collapsed {
+                        "展开"
+                    } else {
+                        "收起"
+                    })
+                    .clicked()
+                {
+                    self.logs_collapsed = !self.logs_collapsed;
+                }
+            });
+        });
+        if self.logs_collapsed {
+            return;
+        }
+        ui.horizontal(|ui| {
             if ui.button("清空日志").clicked() {
                 self.logs.clear();
             }
-            if ui.button("打开输出目录").clicked() {
-                let path = if self.options.output_dir.trim().is_empty() {
-                    self.items
-                        .first()
-                        .and_then(|item| item.path.parent())
-                        .map(Path::to_path_buf)
-                } else {
-                    Some(PathBuf::from(self.options.output_dir.trim()))
-                };
-                if let Some(path) = path {
-                    open_folder(&path);
-                }
-            }
         });
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(true)
+        let log_width = ui.available_width();
+        egui::Frame::new()
+            .fill(CARD_BACKGROUND)
+            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+            .inner_margin(8.0)
             .show(ui, |ui| {
-                for line in &self.logs {
-                    ui.label(RichText::new(line).monospace().small());
-                }
+                ui.set_min_width((log_width - 16.0).max(0.0));
+                egui::ScrollArea::vertical()
+                    .id_salt("logs_scroll")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        for line in &self.logs {
+                            ui.label(RichText::new(line).monospace().small());
+                        }
+                    });
             });
     }
 }
 
 fn run_jobs(
-    jobs: Vec<PathBuf>,
-    output_dir: Option<PathBuf>,
+    jobs: Vec<Job>,
     quality: Option<u8>,
     skip_associated: bool,
     overwrite: bool,
     sender: Sender<WorkerEvent>,
     cancel: Arc<AtomicBool>,
 ) {
-    for (index, input) in jobs.iter().enumerate() {
+    for (index, job) in jobs.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             let _ = sender.send(WorkerEvent::Cancelled { index });
             continue;
         }
         let _ = sender.send(WorkerEvent::Started { index });
         let started = Instant::now();
-        let result = convert_one(
-            input,
-            output_dir.as_deref(),
-            quality,
-            skip_associated,
-            overwrite,
-        );
+        let result = convert_one(&job.input, &job.output, quality, skip_associated, overwrite);
         match result {
             Ok(output) => {
                 let _ = sender.send(WorkerEvent::Log(format!("输出：{}", output.display())));
@@ -676,7 +877,7 @@ fn run_jobs(
 
 fn convert_one(
     input: &Path,
-    output_dir: Option<&Path>,
+    output: &Path,
     quality: Option<u8>,
     skip_associated: bool,
     overwrite: bool,
@@ -694,43 +895,70 @@ fn convert_one(
         "sdpc" | "dyqx" => sdpc::parse(&input)?,
         "csp" | "kfb" | "mdsx" | "msdx" => indexed::parse(&input)?,
         "ndpi" | "mrxs" => {
-            let output = output_dir
-                .map(|directory| {
-                    directory
-                        .join(input.file_stem().unwrap_or_default())
-                        .with_extension("svs")
-                })
-                .unwrap_or_else(|| input.with_extension("svs"));
             let selected_quality = quality.unwrap_or(75);
-            vips::convert(
-                &input,
-                &output,
-                selected_quality,
-                skip_associated,
-                overwrite,
-            )?;
-            return Ok(output);
+            vips::convert(&input, output, selected_quality, skip_associated, overwrite)?;
+            return Ok(output.to_path_buf());
         }
         other => bail!("unsupported input extension .{other}"),
     };
-    let output = output_dir
-        .map(|directory| {
-            directory
-                .join(input.file_stem().unwrap_or_default())
-                .with_extension("svs")
-        })
-        .unwrap_or_else(|| input.with_extension("svs"));
     let selected_quality = quality.unwrap_or(slide.metadata.jpeg_quality);
     svs::write_slide(
         &slide,
-        &output,
+        output,
         &svs::WriteOptions {
             jpeg_quality: selected_quality,
             skip_associated,
             overwrite,
         },
     )?;
-    Ok(output)
+    Ok(output.to_path_buf())
+}
+
+fn plan_jobs(inputs: impl IntoIterator<Item = PathBuf>, output_dir: Option<&Path>) -> Vec<Job> {
+    let mut reserved = HashSet::new();
+    inputs
+        .into_iter()
+        .map(|input| {
+            let base = output_path_for(&input, output_dir);
+            let output = unique_output_path(base, &mut reserved);
+            Job { input, output }
+        })
+        .collect()
+}
+
+fn output_path_for(input: &Path, output_dir: Option<&Path>) -> PathBuf {
+    let mut name = input
+        .file_stem()
+        .map(|value| value.to_os_string())
+        .unwrap_or_else(|| "output".into());
+    name.push(".svs");
+    output_dir
+        .map(|directory| directory.join(&name))
+        .unwrap_or_else(|| input.with_file_name(name))
+}
+
+fn unique_output_path(base: PathBuf, reserved: &mut HashSet<String>) -> PathBuf {
+    if reserved.insert(normalize_path(&base)) {
+        return base;
+    }
+    let stem = base
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_owned());
+    let extension = base
+        .extension()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "svs".to_owned());
+    for suffix in 2.. {
+        let candidate = base
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{stem}_{suffix}.{extension}"));
+        if reserved.insert(normalize_path(&candidate)) {
+            return candidate;
+        }
+    }
+    unreachable!("output suffix range exhausted")
 }
 
 fn collect_supported_files(directory: &Path, output: &mut Vec<PathBuf>) {
@@ -758,13 +986,6 @@ fn is_supported(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn format_kind(path: &Path) -> String {
-    path.extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("?")
-        .to_ascii_uppercase()
-}
-
 fn normalize_path(path: &Path) -> String {
     path.canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
@@ -773,13 +994,38 @@ fn normalize_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-fn open_folder(path: &Path) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("explorer").arg(path).spawn();
+#[cfg(test)]
+mod tests {
+    use super::{output_path_for, plan_jobs};
+    use std::path::Path;
+
+    #[test]
+    fn duplicate_names_in_one_output_directory_get_unique_paths() {
+        let output_dir = Path::new(r"C:\converted");
+        let jobs = plan_jobs(
+            [
+                r"C:\slides\one\sample.kfb".into(),
+                r"C:\slides\two\sample.kfb".into(),
+                r"C:\slides\three\sample_2.kfb".into(),
+            ],
+            Some(output_dir),
+        );
+
+        let outputs: Vec<_> = jobs
+            .iter()
+            .map(|job| job.output.to_string_lossy().to_lowercase())
+            .collect();
+        assert_eq!(outputs[0], r"c:\converted\sample.svs");
+        assert_eq!(outputs[1], r"c:\converted\sample_2.svs");
+        assert_eq!(outputs[2], r"c:\converted\sample_2_2.svs");
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+
+    #[test]
+    fn empty_output_directory_keeps_source_directory() {
+        let input = Path::new(r"C:\slides\nested\sample.sdpc");
+        assert_eq!(
+            output_path_for(input, None),
+            Path::new(r"C:\slides\nested\sample.svs")
+        );
     }
 }

@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 pub fn convert(
     input: &Path,
     output: &Path,
@@ -150,7 +156,9 @@ pub fn print_info(input: &Path) -> Result<()> {
     });
     let path = env::var_os("PATH").unwrap_or_default();
     let joined = env::join_paths(std::iter::once(bin).chain(env::split_paths(&path)))?;
-    let output = Command::new(&executable)
+    let mut command = Command::new(&executable);
+    hide_console_window(&mut command);
+    let output = command
         .arg("-a")
         .arg(input)
         .env("PATH", joined)
@@ -169,6 +177,7 @@ pub fn print_info(input: &Path) -> Result<()> {
 fn run_vips(bin: &Path, operation: &str, positional: &[&Path], options: &[&str]) -> Result<()> {
     let executable = bin.join(if cfg!(windows) { "vips.exe" } else { "vips" });
     let mut command = Command::new(&executable);
+    hide_console_window(&mut command);
     command.arg(operation);
     for argument in positional {
         command.arg(argument);
@@ -207,7 +216,9 @@ fn read_field(bin: &Path, input: &Path, field: &str) -> Option<f64> {
     let path = env::var_os("PATH").unwrap_or_default();
     let joined =
         env::join_paths(std::iter::once(bin.to_path_buf()).chain(env::split_paths(&path))).ok()?;
-    let output = Command::new(executable)
+    let mut command = Command::new(executable);
+    hide_console_window(&mut command);
+    let output = command
         .arg("-f")
         .arg(field)
         .arg(input)
@@ -215,6 +226,11 @@ fn read_field(bin: &Path, input: &Path, field: &str) -> Option<f64> {
         .output()
         .ok()?;
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+fn hide_console_window(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 fn locate_vips_bin() -> Option<PathBuf> {
