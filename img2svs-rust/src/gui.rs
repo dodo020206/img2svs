@@ -406,18 +406,30 @@ impl SvsGui {
 
 fn install_windows_font(ctx: &egui::Context) {
     #[cfg(target_os = "windows")]
-    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\simhei.ttf") {
-        let mut fonts = FontDefinitions::default();
-        fonts
-            .font_data
-            .insert("simhei".to_owned(), Arc::new(FontData::from_owned(bytes)));
-        if let Some(proportional) = fonts.families.get_mut(&FontFamily::Proportional) {
-            proportional.insert(0, "simhei".to_owned());
+    {
+        for (font_name, font_path) in [
+            ("microsoft-yahei", r"C:\Windows\Fonts\msyh.ttc"),
+            ("microsoft-yahei", r"C:\Windows\Fonts\msyh.ttf"),
+            ("simhei", r"C:\Windows\Fonts\simhei.ttf"),
+        ] {
+            let Ok(bytes) = std::fs::read(font_path) else {
+                continue;
+            };
+            let mut font_data = FontData::from_owned(bytes);
+            font_data.index = 0;
+            let mut fonts = FontDefinitions::default();
+            fonts
+                .font_data
+                .insert(font_name.to_owned(), Arc::new(font_data));
+            if let Some(proportional) = fonts.families.get_mut(&FontFamily::Proportional) {
+                proportional.insert(0, font_name.to_owned());
+            }
+            if let Some(monospace) = fonts.families.get_mut(&FontFamily::Monospace) {
+                monospace.insert(0, font_name.to_owned());
+            }
+            ctx.set_fonts(fonts);
+            break;
         }
-        if let Some(monospace) = fonts.families.get_mut(&FontFamily::Monospace) {
-            monospace.insert(0, "simhei".to_owned());
-        }
-        ctx.set_fonts(fonts);
     }
 }
 
