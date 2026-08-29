@@ -147,7 +147,7 @@ impl SvsGui {
         style.visuals.widgets.hovered.bg_fill = PRIMARY_LIGHT;
         style.visuals.widgets.hovered.fg_stroke.color = TEXT;
         style.visuals.selection.bg_fill = PRIMARY;
-        style.visuals.selection.stroke.color = PRIMARY;
+        style.visuals.selection.stroke.color = Color32::WHITE;
         cc.egui_ctx.set_style(style);
         install_windows_font(&cc.egui_ctx);
         Self {
