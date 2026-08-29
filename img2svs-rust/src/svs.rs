@@ -195,6 +195,7 @@ struct SourcePage {
     next_ifd: u64,
     tile_offsets: Vec<u64>,
     tile_byte_counts: Vec<u64>,
+    jpeg_tables: Vec<u8>,
 }
 
 impl SourcePage {
@@ -263,6 +264,15 @@ fn read_source_page(file: &mut File, ifd: u64, big: bool) -> Result<SourcePage> 
     let bits_values = array_tag(file, tag(258)?, big)?;
     let tile_offsets = array_tag(file, tag(324)?, big)?;
     let tile_byte_counts = array_tag(file, tag(325)?, big)?;
+    let jpeg_tables = tags
+        .iter()
+        .find(|(code, _)| *code == 347)
+        .map(|(_, value)| array_tag(file, *value, big))
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| u8::try_from(value).context("invalid JPEG table byte"))
+        .collect::<Result<Vec<_>>>()?;
     Ok(SourcePage {
         width,
         height,
@@ -280,6 +290,7 @@ fn read_source_page(file: &mut File, ifd: u64, big: bool) -> Result<SourcePage> 
         next_ifd,
         tile_offsets,
         tile_byte_counts,
+        jpeg_tables,
     })
 }
 
@@ -336,7 +347,8 @@ fn write_compatible_classic_main(
 ) -> Result<(u64, u64)> {
     let ifd = align(file.stream_position()?, 2);
     pad_to(file, ifd)?;
-    let count = 19u16;
+    let ycbcr = source.photometric == 6 && source.samples == 3;
+    let count = 19u16 + u16::from(!source.jpeg_tables.is_empty()) + 2 * u16::from(ycbcr);
     let start = ifd + 2 + count as u64 * 12 + 4;
     let bits = align(start, 2);
     let offsets = align(bits + 6, 4);
@@ -345,6 +357,8 @@ fn write_compatible_classic_main(
     let software = desc + description.len() as u64 + 1;
     let xres = align(software + 13, 2);
     let sample_format = xres + 16;
+    let jpeg_tables = sample_format + 6;
+    let reference_bw = align(jpeg_tables + source.jpeg_tables.len() as u64, 4);
     let mut entries = vec![
         long(254, 0),
         long(256, source.width),
@@ -366,6 +380,13 @@ fn write_compatible_classic_main(
         ascii_at(305, software, 13)?,
         short_array_at(339, sample_format),
     ];
+    if !source.jpeg_tables.is_empty() {
+        entries.push(undefined_at(347, source.jpeg_tables.len(), jpeg_tables)?);
+    }
+    if ycbcr {
+        entries.push(short_pair(530, 2, 2));
+        entries.push(rational_array_at(532, reference_bw, 6)?);
+    }
     entries.sort_by_key(|entry| entry.tag);
     file.write_all(&count.to_le_bytes())?;
     for entry in &entries {
@@ -396,6 +417,11 @@ fn write_compatible_classic_main(
     file.write_all(&1u16.to_le_bytes())?;
     file.write_all(&1u16.to_le_bytes())?;
     file.write_all(&1u16.to_le_bytes())?;
+    file.write_all(&source.jpeg_tables)?;
+    if ycbcr {
+        pad_to(file, reference_bw)?;
+        write_reference_black_white(file)?;
+    }
     Ok((ifd, next_pointer))
 }
 
@@ -459,7 +485,8 @@ fn write_compatible_big_main(
 ) -> Result<(u64, u64)> {
     let ifd = align(file.stream_position()?, 8);
     pad_to(file, ifd)?;
-    let count = 19u64;
+    let ycbcr = source.photometric == 6 && source.samples == 3;
+    let count = 19u64 + u64::from(!source.jpeg_tables.is_empty()) + 2 * u64::from(ycbcr);
     let start = ifd + 8 + count * 20 + 8;
     let bits = align(start, 8);
     let offsets = align(bits + 6, 8);
@@ -468,6 +495,8 @@ fn write_compatible_big_main(
     let software = desc + description.len() as u64 + 1;
     let xres = align(software + 13, 8);
     let sample_format = xres + 16;
+    let jpeg_tables = sample_format + 6;
+    let reference_bw = align(jpeg_tables + source.jpeg_tables.len() as u64, 8);
     let mut entries = vec![
         big_long(254, 0),
         big_long(256, source.width),
@@ -489,6 +518,13 @@ fn write_compatible_big_main(
         big_ascii_at(305, software, 13)?,
         big_short_array(339, sample_format),
     ];
+    if !source.jpeg_tables.is_empty() {
+        entries.push(big_undefined(347, source.jpeg_tables.len(), jpeg_tables)?);
+    }
+    if ycbcr {
+        entries.push(big_short_pair(530, 2, 2));
+        entries.push(big_rational_array(532, reference_bw, 6));
+    }
     entries.sort_by_key(|entry| entry.tag);
     file.write_all(&count.to_le_bytes())?;
     for entry in &entries {
@@ -519,6 +555,11 @@ fn write_compatible_big_main(
     file.write_all(&1u16.to_le_bytes())?;
     file.write_all(&1u16.to_le_bytes())?;
     file.write_all(&1u16.to_le_bytes())?;
+    file.write_all(&source.jpeg_tables)?;
+    if ycbcr {
+        pad_to(file, reference_bw)?;
+        write_reference_black_white(file)?;
+    }
     Ok((ifd, next_pointer))
 }
 
@@ -1554,6 +1595,15 @@ fn big_rational_array(tag: u16, offset: u64, count: u64) -> BigEntry {
     }
 }
 
+fn big_undefined(tag: u16, count: usize, offset: u64) -> Result<BigEntry> {
+    Ok(BigEntry {
+        tag,
+        kind: 7,
+        count: u64::try_from(count)?,
+        value: offset,
+    })
+}
+
 fn big_ascii_inline(value: &str) -> u64 {
     let mut bytes = [0u8; 8];
     let source = value.as_bytes();
@@ -2064,6 +2114,14 @@ fn rational_array_at(tag: u16, offset: u64, count: u32) -> Result<Entry> {
         value: u32::try_from(offset).context("TIFF rational array offset overflow")?,
     })
 }
+fn undefined_at(tag: u16, count: usize, offset: u64) -> Result<Entry> {
+    Ok(Entry {
+        tag,
+        kind: 7,
+        count: u32::try_from(count)?,
+        value: u32::try_from(offset).context("TIFF undefined data offset overflow")?,
+    })
+}
 fn array_at(tag: u16, count: usize, offset: u64) -> Result<Entry> {
     Ok(Entry {
         tag,
@@ -2151,6 +2209,50 @@ mod tests {
         }
         let jpeg = entries[&273].value as usize;
         assert_eq!(&bytes[jpeg..jpeg + 2], &[0xff, 0xd8]);
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_main_preserves_shared_jpeg_tables() -> Result<()> {
+        let path = temporary_tiff("compatible-jpeg-tables");
+        let mut file = File::create(&path)?;
+        file.write_all(b"II\x2a\x00\x00\x00\x00\x00")?;
+        file.write_all(&[0xff, 0xd8, 0xff, 0xd9])?;
+        let tables = vec![0xff, 0xd8, 0xff, 0xdb, 0x00, 0x04, 0xff, 0xd9];
+        let source = SourcePage {
+            width: 256,
+            height: 256,
+            tile_width: 256,
+            tile_height: 256,
+            bits: [8, 8, 8],
+            compression: 7,
+            photometric: 6,
+            samples: 3,
+            planar: 1,
+            next_ifd: 0,
+            tile_offsets: vec![8],
+            tile_byte_counts: vec![4],
+            jpeg_tables: tables.clone(),
+        };
+        let (ifd, _) = write_compatible_classic_main(
+            &mut file,
+            &source,
+            "Aperio Image Library test",
+            40_000.0,
+        )?;
+        patch_u32_file(&mut file, 4, u32::try_from(ifd)?)?;
+        drop(file);
+
+        let bytes = fs::read(&path)?;
+        fs::remove_file(&path)?;
+        let entries = classic_entries(&bytes);
+        let jpeg_tables = entries[&347];
+        assert_eq!(jpeg_tables.kind, 7);
+        assert_eq!(jpeg_tables.count as usize, tables.len());
+        let offset = jpeg_tables.value as usize;
+        assert_eq!(&bytes[offset..offset + tables.len()], tables);
+        assert_eq!(entries[&530].value, 0x0002_0002);
+        assert_eq!(entries[&532].count, 6);
         Ok(())
     }
 
