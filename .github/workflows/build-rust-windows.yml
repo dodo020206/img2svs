@@ -1,0 +1,157 @@
+name: Build Rust Windows package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - "img2svs-rust/**"
+      - ".github/workflows/build-rust-windows.yml"
+  pull_request:
+    paths:
+      - "img2svs-rust/**"
+      - ".github/workflows/build-rust-windows.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rust-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      LIBVIPS_VERSION: "8.18.1"
+      PYAV_VERSION: "18.1.0"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        working-directory: img2svs-rust
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        working-directory: img2svs-rust
+        run: cargo test --locked
+
+      - name: Build release executable
+        working-directory: img2svs-rust
+        run: cargo build --release --locked
+
+      - name: Assemble portable runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $packageRoot = Join-Path $env:GITHUB_WORKSPACE "dist\PathologySVSConverter-rust"
+          $vipsArchive = Join-Path $env:RUNNER_TEMP "vips.zip"
+          $vipsExtract = Join-Path $env:RUNNER_TEMP "vips"
+          $pyavTarget = Join-Path $env:RUNNER_TEMP "pyav"
+          New-Item -ItemType Directory -Force -Path $packageRoot, $vipsExtract, $pyavTarget | Out-Null
+
+          Copy-Item -LiteralPath "img2svs-rust\target\release\img2svs-rust.exe" -Destination $packageRoot
+          Copy-Item -LiteralPath "img2svs-rust\README.md" -Destination $packageRoot
+
+          $vipsUrl = "https://github.com/libvips/build-win64-mxe/releases/download/v$env:LIBVIPS_VERSION/vips-dev-w64-all-$env:LIBVIPS_VERSION.zip"
+          Invoke-WebRequest -Uri $vipsUrl -OutFile $vipsArchive
+          Expand-Archive -LiteralPath $vipsArchive -DestinationPath $vipsExtract
+          $vipsExe = Get-ChildItem -LiteralPath $vipsExtract -Recurse -File -Filter "vips.exe" |
+            Where-Object { $_.Directory.Name -eq "bin" } |
+            Select-Object -First 1
+          if (-not $vipsExe) {
+            throw "Downloaded libvips archive does not contain bin\vips.exe"
+          }
+          $vipsRoot = Split-Path -Parent $vipsExe.Directory.FullName
+          Copy-Item -LiteralPath $vipsRoot -Destination (Join-Path $packageRoot "vips") -Recurse
+
+          python -m pip install --disable-pip-version-check --only-binary=:all: --target $pyavTarget "av==$env:PYAV_VERSION"
+          if ($LASTEXITCODE -ne 0) {
+            throw "PyAV runtime installation failed with exit code $LASTEXITCODE"
+          }
+          $avLibs = Get-ChildItem -LiteralPath $pyavTarget -Directory -Filter "av.libs" | Select-Object -First 1
+          if (-not $avLibs) {
+            throw "PyAV wheel does not contain av.libs"
+          }
+          Copy-Item -LiteralPath $avLibs.FullName -Destination (Join-Path $packageRoot "av.libs") -Recurse
+
+      - name: Smoke-test portable package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $packageRoot = Join-Path $env:GITHUB_WORKSPACE "dist\PathologySVSConverter-rust"
+          $executable = Join-Path $packageRoot "img2svs-rust.exe"
+          $smoke = Start-Process -FilePath $executable -ArgumentList "--smoke-test" -Wait -PassThru
+          if ($smoke.ExitCode -ne 0) {
+            throw "GUI smoke test failed with exit code $($smoke.ExitCode)"
+          }
+
+          $smokeTiff = Join-Path $env:RUNNER_TEMP "img2svs-smoke.tif"
+          $smokeSvs = Join-Path $env:RUNNER_TEMP "img2svs-smoke.svs"
+          $vips = Join-Path $packageRoot "vips\bin\vips.exe"
+          $vipsHeader = Join-Path $packageRoot "vips\bin\vipsheader.exe"
+          & $vips black $smokeTiff 512 384 --bands 3
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not create the TIFF smoke fixture"
+          }
+          $convert = Start-Process -FilePath $executable -ArgumentList @($smokeTiff, "-o", $smokeSvs, "--overwrite") -Wait -PassThru
+          if ($convert.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $smokeSvs)) {
+            throw "TIFF-to-SVS smoke conversion failed"
+          }
+          $levels = & $vipsHeader -f "openslide.level-count" $smokeSvs
+          if ($LASTEXITCODE -ne 0 -or [int]$levels -lt 1) {
+            throw "Generated SVS did not pass the OpenSlide/libvips metadata check"
+          }
+          Write-Host "TIFF-to-SVS smoke test passed with $levels pyramid levels"
+
+      - name: Create ZIP and checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $distRoot = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $packageRoot = Join-Path $distRoot "PathologySVSConverter-rust"
+          $zipPath = Join-Path $distRoot "PathologySVSConverter-rust.zip"
+          Compress-Archive -LiteralPath $packageRoot -DestinationPath $zipPath -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+          "$hash  PathologySVSConverter-rust.zip" | Set-Content -LiteralPath "$zipPath.sha256" -Encoding ascii
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PathologySVSConverter-rust-windows
+          path: |
+            dist/PathologySVSConverter-rust.zip
+            dist/PathologySVSConverter-rust.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish tagged GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE "dist\PathologySVSConverter-rust.zip"
+          $checksumPath = "$zipPath.sha256"
+          gh release view "$env:GITHUB_REF_NAME" --repo "$env:GITHUB_REPOSITORY" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "$env:GITHUB_REF_NAME" $zipPath $checksumPath --clobber --repo "$env:GITHUB_REPOSITORY"
+          } else {
+            gh release create "$env:GITHUB_REF_NAME" $zipPath $checksumPath --generate-notes --title "$env:GITHUB_REF_NAME" --repo "$env:GITHUB_REPOSITORY"
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub release publication failed with exit code $LASTEXITCODE"
+          }
+

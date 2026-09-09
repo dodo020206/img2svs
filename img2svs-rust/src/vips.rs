@@ -1,5 +1,5 @@
-//! OpenSlide/libvips adapter for formats whose vendor decoder is already
-//! provided by the bundled libvips runtime (NDPI and MRXS).
+//! libvips adapter for TIFF and formats whose vendor decoder is provided by
+//! the bundled OpenSlide runtime (NDPI and MRXS).
 
 use crate::jpeg::decode_image;
 use crate::svs;
@@ -26,16 +26,16 @@ pub fn convert(input: &Path, output: &Path, quality: u8, overwrite: bool) -> Res
         );
         return Ok(());
     }
-    let bin =
-        locate_vips_bin().context("NDPI/MRXS requires the bundled OpenSlide/libvips runtime")?;
+    let bin = locate_vips_bin()
+        .context("TIFF/NDPI/MRXS requires the bundled OpenSlide/libvips runtime")?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
     let temporary = temporary_path(output);
     let result = (|| {
         let (mpp, app_mag) = thread::scope(|scope| {
-            let mpp = scope.spawn(|| read_field(&bin, input, "openslide.mpp-x"));
-            let app_mag = scope.spawn(|| read_field(&bin, input, "openslide.objective-power"));
+            let mpp = scope.spawn(|| read_mpp(&bin, input));
+            let app_mag = scope.spawn(|| read_app_mag(&bin, input));
             (
                 mpp.join().ok().flatten().unwrap_or(0.25),
                 app_mag.join().ok().flatten().unwrap_or(0.0),
@@ -56,8 +56,8 @@ pub fn convert(input: &Path, output: &Path, quality: u8, overwrite: bool) -> Res
                     "--tile-height=256",
                     "--compression=jpeg",
                     &format!("--Q={quality}"),
-                    &format!("--xres={}", 10000.0 / mpp.max(0.000001)),
-                    &format!("--yres={}", 10000.0 / mpp.max(0.000001)),
+                    &format!("--xres={}", vips_resolution(mpp)),
+                    &format!("--yres={}", vips_resolution(mpp)),
                     "--resunit=cm",
                 ],
             );
@@ -136,8 +136,8 @@ fn load_associated_images(
 }
 
 pub fn print_info(input: &Path) -> Result<()> {
-    let bin =
-        locate_vips_bin().context("NDPI/MRXS requires the bundled OpenSlide/libvips runtime")?;
+    let bin = locate_vips_bin()
+        .context("TIFF/NDPI/MRXS requires the bundled OpenSlide/libvips runtime")?;
     let executable = bin.join(if cfg!(windows) {
         "vipsheader.exe"
     } else {
@@ -197,6 +197,10 @@ fn run_vips(bin: &Path, operation: &str, positional: &[&Path], options: &[&str])
 }
 
 fn read_field(bin: &Path, input: &Path, field: &str) -> Option<f64> {
+    read_text_field(bin, input, field)?.parse().ok()
+}
+
+fn read_text_field(bin: &Path, input: &Path, field: &str) -> Option<String> {
     let executable = bin.join(if cfg!(windows) {
         "vipsheader.exe"
     } else {
@@ -214,7 +218,61 @@ fn read_field(bin: &Path, input: &Path, field: &str) -> Option<f64> {
         .env("PATH", joined)
         .output()
         .ok()?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn read_mpp(bin: &Path, input: &Path) -> Option<f64> {
+    if let Some(mpp) = read_field(bin, input, "openslide.mpp-x").filter(|value| *value > 0.0) {
+        return Some(mpp);
+    }
+    let pixels_per_millimeter =
+        read_field(bin, input, "xres").or_else(|| read_field(bin, input, "yres"))?;
+    if !pixels_per_millimeter.is_finite() || pixels_per_millimeter <= 0.0 {
+        return None;
+    }
+    let unit = read_text_field(bin, input, "resolution-unit")?.to_ascii_lowercase();
+    if !unit.contains("cm") && !unit.contains("centimeter") && !unit.contains("in") {
+        return None;
+    }
+    Some(1_000.0 / pixels_per_millimeter)
+}
+
+fn vips_resolution(mpp: f64) -> f64 {
+    1_000.0 / mpp.max(0.000001)
+}
+
+fn read_app_mag(bin: &Path, input: &Path) -> Option<f64> {
+    read_field(bin, input, "openslide.objective-power")
+        .filter(|value| *value > 0.0)
+        .or_else(|| {
+            let description = read_text_field(bin, input, "image-description")?;
+            parse_labeled_number(&description, &["objective power", "appmag"])
+        })
+}
+
+fn parse_labeled_number(text: &str, labels: &[&str]) -> Option<f64> {
+    let lowercase = text.to_ascii_lowercase();
+    labels.iter().find_map(|label| {
+        let index = lowercase.find(label)? + label.len();
+        let remainder = lowercase[index..].trim_start_matches(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, '=' | ':' | '|')
+        });
+        let length = remainder
+            .char_indices()
+            .take_while(|(_, character)| {
+                character.is_ascii_digit() || matches!(character, '.' | '+' | '-')
+            })
+            .map(|(index, character)| index + character.len_utf8())
+            .last()?;
+        remainder[..length]
+            .parse::<f64>()
+            .ok()
+            .filter(|value| *value > 0.0)
+    })
 }
 
 fn hide_console_window(command: &mut Command) {
@@ -248,3 +306,33 @@ fn temporary_path(output: &Path) -> PathBuf {
     let file_name = output.file_name().unwrap_or_default().to_string_lossy();
     output.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_labeled_number, vips_resolution};
+
+    #[test]
+    fn parses_tiff_objective_power() {
+        assert_eq!(
+            parse_labeled_number("Objective Power=20", &["objective power", "appmag"]),
+            Some(20.0)
+        );
+    }
+
+    #[test]
+    fn parses_aperio_app_mag() {
+        assert_eq!(
+            parse_labeled_number(
+                "Aperio Image Library|AppMag = 40.000000|MPP = 0.250000",
+                &["objective power", "appmag"]
+            ),
+            Some(40.0)
+        );
+    }
+
+    #[test]
+    fn converts_mpp_to_vips_pixels_per_millimeter() {
+        assert_eq!(vips_resolution(0.25), 4_000.0);
+    }
+}
+
