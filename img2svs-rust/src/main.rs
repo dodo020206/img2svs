@@ -119,4 +119,3 @@ fn with_extension(path: &Path, extension: &str) -> PathBuf {
     result.set_extension(extension);
     result
 }
-

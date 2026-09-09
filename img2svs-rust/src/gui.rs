@@ -1028,4 +1028,3 @@ mod tests {
         assert!(is_supported(Path::new(r"C:\slides\sample.TIFF")));
     }
 }
-

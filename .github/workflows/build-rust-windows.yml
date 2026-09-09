@@ -154,4 +154,3 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "GitHub release publication failed with exit code $LASTEXITCODE"
           }
-
