@@ -335,4 +335,3 @@ mod tests {
         assert_eq!(vips_resolution(0.25), 4_000.0);
     }
 }
-

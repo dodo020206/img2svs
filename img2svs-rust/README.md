@@ -102,4 +102,3 @@ updates, and it can also be started manually.
 
 Pushing a tag whose name starts with `v` additionally creates or updates a
 GitHub Release containing the same ZIP and checksum.
-
