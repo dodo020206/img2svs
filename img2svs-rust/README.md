@@ -33,6 +33,8 @@ The native backends are:
   JPEG SVS output (classic TIFF when possible, BigTIFF only when required),
   including the Aperio description and thumbnail pages; the Rust adapter does
   not materialize the whole slide as an uncompressed intermediate image.
+- `.tif` / `.tiff`: tiled or scanline TIFF input through libvips, with TIFF
+  resolution and objective-power metadata carried into a pyramidal JPEG SVS.
 
 The CLI and output layout are intentionally close to the working Python version:
 
@@ -44,7 +46,7 @@ cargo run --release -- test_data/2605551-jpeg.sdpc -o test_output-rust/2605551.s
 JPEG/HEVC SDPC/DYQX and all formats listed above are supported by the Rust
 GUI/CLI. HEVC requires the FFmpeg native runtime: set `FFMPEG_HOME`, or place
 the bundled `av.libs` directory next to the executable. NDPI/MRXS require the
-OpenSlide/libvips runtime: set `VIPS_HOME`, or place the runtime at
+TIFF/NDPI/MRXS require the OpenSlide/libvips runtime: set `VIPS_HOME`, or place the runtime at
 `vips\bin` next to the executable.
 Runtime discovery is relative to the executable or environment variables and
 does not depend on a development-machine path. NDPI/MRXS conversion keeps
@@ -88,3 +90,16 @@ including `vips` and `av.libs`, rather than the executable alone.
 
 `--smoke-test` initializes the native window and closes after the first frame;
 it is useful for CI or packaging checks without leaving a GUI process running.
+
+## GitHub Actions Windows package
+
+The [`build-rust-windows.yml`](../.github/workflows/build-rust-windows.yml)
+workflow builds and tests the Rust converter on GitHub's Windows runner. It
+downloads the pinned libvips and PyAV runtimes, performs both GUI and
+TIFF-to-SVS smoke tests, and uploads a portable ZIP plus its SHA256 checksum as
+an Actions artifact. The workflow runs for relevant pull requests and `main`
+updates, and it can also be started manually.
+
+Pushing a tag whose name starts with `v` additionally creates or updates a
+GitHub Release containing the same ZIP and checksum.
+
