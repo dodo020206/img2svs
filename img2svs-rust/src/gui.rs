@@ -342,7 +342,8 @@ impl SvsGui {
             })
             .collect();
         if pending_indices.is_empty() {
-            self.log("没有待转换的切片。".to_owned());
+            self.last_message = "没有待转换的切片".to_owned();
+            self.log(format!("{}。", self.last_message));
             return;
         }
         let quality = match self.options.jpeg_quality.as_str() {
@@ -376,6 +377,9 @@ impl SvsGui {
         self.failed = 0;
         self.batch_total = batch_total;
         self.active_indices = pending_indices;
+        // Without this the status bar keeps showing the previous run's outcome,
+        // e.g. "已停止：..." after stopping a run and starting it again.
+        self.last_message = "正在转换…".to_owned();
         self.log("开始转换队列。".to_owned());
     }
 
@@ -989,6 +993,7 @@ impl SvsGui {
                         self.completed = 0;
                         self.failed = 0;
                         self.batch_total = 0;
+                        self.last_message = "等待添加切片".to_owned();
                     }
                     if ui
                         .add_enabled(
