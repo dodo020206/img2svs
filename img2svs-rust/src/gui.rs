@@ -182,6 +182,8 @@ struct SvsGui {
     smoke_test: bool,
     last_message: String,
     logs_collapsed: bool,
+    /// Screen rect of the output-path field, used to route folder drops.
+    output_field_rect: Option<egui::Rect>,
 }
 
 impl SvsGui {
@@ -206,6 +208,7 @@ impl SvsGui {
             smoke_test,
             last_message: "等待添加切片".to_owned(),
             logs_collapsed: true,
+            output_field_rect: None,
         }
     }
 
@@ -693,17 +696,51 @@ impl SvsGui {
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        let paths: Vec<PathBuf> = ctx.input(|input| {
-            input
-                .raw
-                .dropped_files
-                .iter()
-                .filter_map(|file| file.path.clone())
-                .collect()
+        let (paths, pointer) = ctx.input(|input| {
+            (
+                input
+                    .raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|file| file.path.clone())
+                    .collect::<Vec<PathBuf>>(),
+                input.pointer.latest_pos(),
+            )
         });
-        if !paths.is_empty() {
-            self.add_paths(paths);
+        if paths.is_empty() {
+            return;
         }
+        // A folder dropped on the output field sets the output directory. Files
+        // always go to the queue, so a slide dropped on the field is not
+        // silently turned into a directory choice.
+        let dropped_on_field = pointer.is_some_and(|position| {
+            self.output_field_rect
+                .is_some_and(|rect| rect.contains(position))
+        });
+        if dropped_on_field {
+            if let Some(directory) = paths.iter().find(|path| path.is_dir()) {
+                self.options.output_dir = directory.display().to_string();
+                self.last_message = format!("输出目录：{}", directory.display());
+                self.log(format!("输出目录已设置为 {}。", directory.display()));
+                return;
+            }
+        }
+        self.add_paths(paths);
+    }
+
+    /// True while a dragged item hovers the output-path field, so the field can
+    /// show that dropping a folder there picks the directory.
+    fn output_field_accepts_drop(&self, ctx: &egui::Context) -> bool {
+        let Some(rect) = self.output_field_rect else {
+            return false;
+        };
+        ctx.input(|input| {
+            !input.raw.hovered_files.is_empty()
+                && input
+                    .pointer
+                    .hover_pos()
+                    .is_some_and(|position| rect.contains(position))
+        })
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
@@ -806,12 +843,7 @@ impl SvsGui {
                     .fill(theme::CANVAS)
                     .inner_margin(theme::RAIL_MARGIN),
             )
-            .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("settings_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.settings(ui));
-            });
+            .show_inside(ui, |ui| self.settings(ui));
 
         egui::CentralPanel::default()
             .frame(
@@ -1120,105 +1152,137 @@ impl SvsGui {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
-        let quality_text = self.options.jpeg_quality.clone();
-
+        // The card fills the rail and scrolls internally, so the settings card
+        // always matches the height of the queue card while resizing.
         card().show(ui, |ui| {
-            ui.label(
-                RichText::new("2  转换设置")
-                    .strong()
-                    .size(16.0)
-                    .color(theme::TEXT_PRIMARY),
-            );
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new("默认选项适合大多数切片。")
-                    .size(13.0)
-                    .color(theme::TEXT_SECONDARY),
-            );
-            ui.add_space(14.0);
+            egui::ScrollArea::vertical()
+                .id_salt("settings_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.settings_content(ui));
+        });
+    }
 
-            ui.label(
-                RichText::new("输出位置")
-                    .strong()
-                    .size(14.0)
-                    .color(theme::TEXT_PRIMARY),
-            );
-            ui.add_space(6.0);
-            let browse_width = 68.0;
-            let item_spacing = ui.spacing().item_spacing.x;
-            let input_width = (ui.available_width() - browse_width - item_spacing).max(120.0);
-            ui.horizontal(|ui| {
-                egui::Frame::new()
-                    .fill(theme::SURFACE)
-                    .stroke(Stroke::new(1.0_f32, theme::BORDER_STRONG))
-                    .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
-                    .inner_margin(Margin {
-                        left: 10,
-                        right: 10,
-                        top: 0,
-                        bottom: 0,
-                    })
-                    .show(ui, |ui| {
-                        ui.add_sized(
-                            [input_width - 20.0, 36.0],
-                            egui::TextEdit::singleline(&mut self.options.output_dir)
-                                .frame(false)
-                                .vertical_align(egui::Align::Center),
-                        );
-                    });
-                if ui
-                    .add_sized([browse_width, 38.0], egui::Button::new("浏览"))
-                    .clicked()
-                {
-                    self.choose_output();
-                }
-            });
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("留空则输出到源文件目录")
-                    .size(12.0)
-                    .color(theme::TEXT_SECONDARY),
-            );
-            ui.add_space(14.0);
-            ui.separator();
-            ui.add_space(14.0);
+    fn settings_content(&mut self, ui: &mut egui::Ui) {
+        let quality_text = self.options.jpeg_quality.clone();
+        let drop_target = self.output_field_accepts_drop(ui.ctx());
 
-            ui.label(
-                RichText::new("SVS 保存质量")
-                    .strong()
-                    .size(14.0)
-                    .color(theme::TEXT_PRIMARY),
-            );
-            ui.add_space(6.0);
-            egui::ComboBox::from_id_salt("quality")
-                .selected_text(quality_text)
-                .width(ui.available_width())
-                .show_ui(ui, |ui| {
+        ui.label(
+            RichText::new("2  转换设置")
+                .strong()
+                .size(16.0)
+                .color(theme::TEXT_PRIMARY),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("默认选项适合大多数切片。")
+                .size(13.0)
+                .color(theme::TEXT_SECONDARY),
+        );
+        ui.add_space(14.0);
+
+        ui.label(
+            RichText::new("输出位置")
+                .strong()
+                .size(14.0)
+                .color(theme::TEXT_PRIMARY),
+        );
+        ui.add_space(6.0);
+        let browse_width = 68.0;
+        let item_spacing = ui.spacing().item_spacing.x;
+        let input_width = (ui.available_width() - browse_width - item_spacing).max(120.0);
+        ui.horizontal(|ui| {
+            let field = egui::Frame::new()
+                .fill(if drop_target {
+                    theme::PRIMARY_SUBTLE
+                } else {
+                    theme::SURFACE
+                })
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if drop_target {
+                        theme::PRIMARY
+                    } else {
+                        theme::BORDER_STRONG
+                    },
+                ))
+                .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+                .inner_margin(Margin {
+                    left: 10,
+                    right: 10,
+                    top: 0,
+                    bottom: 0,
+                })
+                .show(ui, |ui| {
+                    ui.add_sized(
+                        [input_width - 20.0, 36.0],
+                        egui::TextEdit::singleline(&mut self.options.output_dir)
+                            .frame(false)
+                            .vertical_align(egui::Align::Center),
+                    );
+                });
+            // Remembered so `handle_dropped_files` knows where a dropped
+            // folder should land.
+            self.output_field_rect = Some(field.response.rect);
+            if ui
+                .add_sized([browse_width, 38.0], egui::Button::new("浏览"))
+                .clicked()
+            {
+                self.choose_output();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(if drop_target {
+                "松开即可把该文件夹设为输出目录"
+            } else {
+                "留空则输出到源文件目录，也可以把文件夹拖到这里"
+            })
+            .size(12.0)
+            .color(if drop_target {
+                theme::PRIMARY
+            } else {
+                theme::TEXT_SECONDARY
+            }),
+        );
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(14.0);
+
+        ui.label(
+            RichText::new("SVS 保存质量")
+                .strong()
+                .size(14.0)
+                .color(theme::TEXT_PRIMARY),
+        );
+        ui.add_space(6.0);
+        egui::ComboBox::from_id_salt("quality")
+            .selected_text(quality_text)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.options.jpeg_quality,
+                    "原始".to_owned(),
+                    "原始 / 推荐",
+                );
+                for quality in [95, 90, 85, 80, 70, 60] {
                     ui.selectable_value(
                         &mut self.options.jpeg_quality,
-                        "原始".to_owned(),
-                        "原始 / 推荐",
+                        quality.to_string(),
+                        quality.to_string(),
                     );
-                    for quality in [95, 90, 85, 80, 70, 60] {
-                        ui.selectable_value(
-                            &mut self.options.jpeg_quality,
-                            quality.to_string(),
-                            quality.to_string(),
-                        );
-                    }
-                });
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("“原始/推荐”沿用源图质量，数值越低文件越小。")
-                    .size(12.0)
-                    .color(theme::TEXT_SECONDARY),
-            );
-            ui.add_space(14.0);
-            ui.checkbox(
-                &mut self.options.overwrite,
-                RichText::new("覆盖已存在的 SVS").size(14.0),
-            );
-        });
+                }
+            });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("“原始/推荐”沿用源图质量，数值越低文件越小。")
+                .size(12.0)
+                .color(theme::TEXT_SECONDARY),
+        );
+        ui.add_space(14.0);
+        ui.checkbox(
+            &mut self.options.overwrite,
+            RichText::new("覆盖已存在的 SVS").size(14.0),
+        );
     }
 
     fn logs_panel(&mut self, ui: &mut egui::Ui) {
