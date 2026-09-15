@@ -47,6 +47,15 @@ impl Reader {
         Ok(data)
     }
 
+    /// Advances the cursor over `count` bytes that carry no usable data.
+    ///
+    /// Container headers interleave length-reserved fields we ignore; skipping
+    /// them by name keeps the surrounding offsets readable. Reads through the
+    /// buffer on purpose so that a truncated file still fails immediately.
+    pub fn skip(&mut self, count: usize, context: &str) -> Result<()> {
+        self.bytes(count, context).map(|_| ())
+    }
+
     /// Reads `length` bytes located at absolute `offset`.
     ///
     /// Unlike [`Reader::bytes`] this rejects ranges that fall outside the file,
