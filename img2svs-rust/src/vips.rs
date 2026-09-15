@@ -15,7 +15,33 @@ use std::thread;
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Command-line tools of the bundled libvips runtime.
+const VIPS_EXECUTABLE: &str = if cfg!(windows) { "vips.exe" } else { "vips" };
+const VIPSHEADER_EXECUTABLE: &str = if cfg!(windows) {
+    "vipsheader.exe"
+} else {
+    "vipsheader"
+};
+
+/// Micrometres in one millimetre, the scale between MPP and the
+/// pixels-per-millimetre resolution reported by libvips.
+const MICROMETRES_PER_MILLIMETRE: f64 = 1_000.0;
+/// Lower bound applied to MPP before converting, so a missing resolution cannot
+/// turn into a division by zero.
+const MIN_MPP: f64 = 0.000_001;
+
+/// Builds a command for a bundled vips tool with `bin` prepended to `PATH`.
+fn vips_command(bin: &Path, executable: &Path) -> Result<Command> {
+    let path = env::var_os("PATH").unwrap_or_default();
+    let joined =
+        env::join_paths(std::iter::once(bin.to_path_buf()).chain(env::split_paths(&path)))?;
+    let mut command = Command::new(executable);
+    hide_console_window(&mut command);
+    command.env("PATH", joined);
+    Ok(command)
+}
 
 pub fn convert(input: &Path, output: &Path, quality: u8, overwrite: bool) -> Result<()> {
     if output.exists() && !overwrite {
@@ -138,19 +164,10 @@ fn load_associated_images(
 pub fn print_info(input: &Path) -> Result<()> {
     let bin = locate_vips_bin()
         .context("TIFF/NDPI/MRXS requires the bundled OpenSlide/libvips runtime")?;
-    let executable = bin.join(if cfg!(windows) {
-        "vipsheader.exe"
-    } else {
-        "vipsheader"
-    });
-    let path = env::var_os("PATH").unwrap_or_default();
-    let joined = env::join_paths(std::iter::once(bin).chain(env::split_paths(&path)))?;
-    let mut command = Command::new(&executable);
-    hide_console_window(&mut command);
-    let output = command
+    let executable = bin.join(VIPSHEADER_EXECUTABLE);
+    let output = vips_command(&bin, &executable)?
         .arg("-a")
         .arg(input)
-        .env("PATH", joined)
         .output()
         .with_context(|| format!("run {}", executable.display()))?;
     if !output.status.success() {
@@ -164,21 +181,11 @@ pub fn print_info(input: &Path) -> Result<()> {
 }
 
 fn run_vips(bin: &Path, operation: &str, positional: &[&Path], options: &[&str]) -> Result<()> {
-    let executable = bin.join(if cfg!(windows) { "vips.exe" } else { "vips" });
-    let mut command = Command::new(&executable);
-    hide_console_window(&mut command);
-    command.arg(operation);
-    for argument in positional {
-        command.arg(argument);
-    }
-    for option in options {
-        command.arg(option);
-    }
-    let path = env::var_os("PATH").unwrap_or_default();
-    let joined =
-        env::join_paths(std::iter::once(bin.to_path_buf()).chain(env::split_paths(&path)))?;
-    let output = command
-        .env("PATH", joined)
+    let executable = bin.join(VIPS_EXECUTABLE);
+    let output = vips_command(bin, &executable)?
+        .arg(operation)
+        .args(positional)
+        .args(options)
         .output()
         .with_context(|| format!("run {}", executable.display()))?;
     if !output.status.success() {
@@ -201,21 +208,12 @@ fn read_field(bin: &Path, input: &Path, field: &str) -> Option<f64> {
 }
 
 fn read_text_field(bin: &Path, input: &Path, field: &str) -> Option<String> {
-    let executable = bin.join(if cfg!(windows) {
-        "vipsheader.exe"
-    } else {
-        "vipsheader"
-    });
-    let path = env::var_os("PATH").unwrap_or_default();
-    let joined =
-        env::join_paths(std::iter::once(bin.to_path_buf()).chain(env::split_paths(&path))).ok()?;
-    let mut command = Command::new(executable);
-    hide_console_window(&mut command);
-    let output = command
+    let executable = bin.join(VIPSHEADER_EXECUTABLE);
+    let output = vips_command(bin, &executable)
+        .ok()?
         .arg("-f")
         .arg(field)
         .arg(input)
-        .env("PATH", joined)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -238,11 +236,11 @@ fn read_mpp(bin: &Path, input: &Path) -> Option<f64> {
     if !unit.contains("cm") && !unit.contains("centimeter") && !unit.contains("in") {
         return None;
     }
-    Some(1_000.0 / pixels_per_millimeter)
+    Some(MICROMETRES_PER_MILLIMETRE / pixels_per_millimeter)
 }
 
 fn vips_resolution(mpp: f64) -> f64 {
-    1_000.0 / mpp.max(0.000001)
+    MICROMETRES_PER_MILLIMETRE / mpp.max(MIN_MPP)
 }
 
 fn read_app_mag(bin: &Path, input: &Path) -> Option<f64> {
@@ -296,10 +294,9 @@ fn locate_vips_bin() -> Option<PathBuf> {
     for path in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
         candidates.push(path);
     }
-    candidates.into_iter().find(|path| {
-        path.join(if cfg!(windows) { "vips.exe" } else { "vips" })
-            .is_file()
-    })
+    candidates
+        .into_iter()
+        .find(|path| path.join(VIPS_EXECUTABLE).is_file())
 }
 
 fn temporary_path(output: &Path) -> PathBuf {
