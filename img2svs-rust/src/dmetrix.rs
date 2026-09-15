@@ -139,7 +139,7 @@ fn read_associated(
         let offset = reader.u64()?;
         let length = reader.u32()? as u64;
         let data = ByteRange { offset, length };
-        validate_range(data, file_size, "associated image")?;
+        data.validate(file_size, "DMetrix associated image")?;
         if id == 0xffff {
             found[0] = Some(data);
         }
@@ -169,13 +169,7 @@ fn read_tile_indexes(
         let count = (descriptor.max_x + 1)
             .checked_mul(descriptor.max_y + 1)
             .context("DMetrix tile count overflow")?;
-        let mut tiles = vec![
-            ByteRange {
-                offset: 0,
-                length: 0
-            };
-            count as usize
-        ];
+        let mut tiles = vec![ByteRange::EMPTY; count as usize];
         let mut seen = vec![false; count as usize];
         for _ in 0..count {
             let source_id = reader.u16()?;
@@ -191,7 +185,7 @@ fn read_tile_indexes(
                     descriptor.source_id
                 );
             }
-            validate_range(data, file_size, "level tile")?;
+            data.validate(file_size, "DMetrix level tile")?;
             let slot = (y * (descriptor.max_x + 1) + x) as usize;
             if seen[slot] {
                 bail!("duplicate DMetrix tile coordinate ({x}, {y})");
@@ -229,13 +223,6 @@ fn estimate_quality(reader: &mut Reader, range: ByteRange) -> Option<u8> {
     // The working Python implementation estimates from quantization tables. Keep
     // the safe default here; encoding quality is explicitly configurable by CLI.
     Some(75)
-}
-
-fn validate_range(data: ByteRange, file_size: u64, context: &str) -> Result<()> {
-    if !data.present() || data.offset >= file_size || data.length > file_size - data.offset {
-        bail!("invalid byte range for DMetrix {context}");
-    }
-    Ok(())
 }
 
 fn read_u32_at(reader: &mut Reader, offset: u64) -> Result<u32> {

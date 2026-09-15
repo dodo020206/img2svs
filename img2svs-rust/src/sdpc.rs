@@ -42,7 +42,7 @@ pub fn parse(path: &Path) -> Result<Slide> {
             offset: current + 123,
             length: encoded_size,
         };
-        validate_range(data, reader.len(), "macrograph")?;
+        data.validate(reader.len(), "SDPC macrograph")?;
         associated.push(AssociatedImage {
             kind: if index == 0 {
                 "label"
@@ -101,7 +101,7 @@ pub fn parse(path: &Path) -> Result<Slide> {
         let mut tiles = Vec::with_capacity(count);
         for length in lengths {
             let data = ByteRange { offset, length };
-            validate_range(data, reader.len(), "level tile")?;
+            data.validate(reader.len(), "SDPC level tile")?;
             tiles.push(data);
             offset += length;
         }
@@ -255,13 +255,6 @@ fn downsample_from_scale(scale: f32) -> Result<u32> {
         bail!("unsupported non-integral SDPC level scale: {scale}");
     }
     Ok(value)
-}
-
-fn validate_range(data: ByteRange, file_size: u64, context: &str) -> Result<()> {
-    if !data.present() || data.offset >= file_size || data.length > file_size - data.offset {
-        bail!("invalid SDPC byte range for {context}");
-    }
-    Ok(())
 }
 
 pub fn print_info(slide: &Slide) {
