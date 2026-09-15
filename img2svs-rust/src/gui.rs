@@ -1,7 +1,8 @@
 use crate::{dmetrix, indexed, sdpc, svs, vips};
 use anyhow::{bail, Context, Result};
 use eframe::egui::{
-    self, Color32, FontData, FontDefinitions, FontFamily, FontId, RichText, TextStyle, Vec2,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, RichText,
+    Shadow, Stroke, TextStyle, Vec2,
 };
 use eframe::{App, CreationContext, Frame, NativeOptions};
 use rfd::FileDialog;
@@ -17,14 +18,57 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     "csp", "dmetrix", "kfb", "mdsx", "msdx", "mrxs", "ndpi", "tif", "tiff", "sdpc", "dyqx",
 ];
 
-const PAGE_BACKGROUND: Color32 = Color32::from_rgb(242, 246, 249);
-const CARD_BACKGROUND: Color32 = Color32::from_rgb(255, 255, 255);
-const HEADER_BACKGROUND: Color32 = Color32::from_rgb(17, 52, 79);
-const PRIMARY: Color32 = Color32::from_rgb(13, 151, 143);
-const PRIMARY_LIGHT: Color32 = Color32::from_rgb(225, 249, 247);
-const BORDER: Color32 = Color32::from_rgb(210, 220, 228);
-const TEXT: Color32 = Color32::from_rgb(22, 52, 77);
-const MUTED_TEXT: Color32 = Color32::from_rgb(84, 119, 145);
+/// Display names for the format strip in the header.
+const FORMAT_LABELS: &[&str] = &[
+    "CSP", "DMETRIX", "KFB", "MDSX", "MSDX", "MRXS", "NDPI", "TIF/TIFF", "SDPC", "DYQX",
+];
+
+/// Design tokens for the view layer.
+///
+/// Every colour, radius, margin and size used by the GUI lives here so the
+/// whole palette can be re-themed (or a dark theme added) in a single place.
+mod theme {
+    use eframe::egui::{Color32, Margin};
+
+    pub const CANVAS: Color32 = Color32::from_rgb(244, 246, 249);
+    pub const SURFACE: Color32 = Color32::from_rgb(255, 255, 255);
+    pub const SUNKEN: Color32 = Color32::from_rgb(238, 242, 247);
+
+    pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(227, 233, 240);
+    pub const BORDER_STRONG: Color32 = Color32::from_rgb(203, 214, 226);
+
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(27, 43, 58);
+    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(91, 110, 128);
+    pub const TEXT_DISABLED: Color32 = Color32::from_rgb(154, 170, 186);
+
+    pub const PRIMARY: Color32 = Color32::from_rgb(14, 147, 132);
+    pub const PRIMARY_HOVER: Color32 = Color32::from_rgb(11, 124, 112);
+    pub const PRIMARY_SUBTLE: Color32 = Color32::from_rgb(230, 245, 243);
+
+    pub const INFO: Color32 = Color32::from_rgb(46, 118, 199);
+    pub const SUCCESS: Color32 = Color32::from_rgb(31, 146, 84);
+    pub const SUCCESS_BG: Color32 = Color32::from_rgb(232, 246, 238);
+    pub const WARNING: Color32 = Color32::from_rgb(183, 121, 31);
+    pub const WARNING_BG: Color32 = Color32::from_rgb(252, 243, 227);
+    pub const DANGER: Color32 = Color32::from_rgb(199, 68, 59);
+    pub const DANGER_BG: Color32 = Color32::from_rgb(252, 237, 235);
+    pub const NEUTRAL: Color32 = Color32::from_rgb(112, 128, 144);
+
+    pub const RADIUS_CONTROL: u8 = 8;
+    pub const RADIUS_CARD: u8 = 14;
+
+    /// Page padding of the queue column (left/right/top/bottom).
+    pub const QUEUE_MARGIN: Margin = Margin::symmetric(20, 18);
+    /// Padding of the fixed settings rail; no left margin so the gutter is 20px.
+    pub const RAIL_MARGIN: Margin = Margin {
+        left: 0,
+        right: 20,
+        top: 18,
+        bottom: 18,
+    };
+    pub const CARD_MARGIN: Margin = Margin::symmetric(18, 16);
+    pub const RAIL_WIDTH: f32 = 340.0;
+}
 
 pub struct LaunchOptions {
     pub smoke_test: bool,
@@ -72,13 +116,34 @@ impl ItemState {
         }
     }
 
+    /// Non-colour cue, so a state stays readable without relying on hue.
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Waiting => "●",
+            Self::Running => "◐",
+            Self::Done => "✓",
+            Self::Failed => "✕",
+            Self::Cancelled => "○",
+        }
+    }
+
     fn color(self) -> Color32 {
         match self {
-            Self::Waiting => Color32::from_rgb(112, 128, 144),
-            Self::Running => Color32::from_rgb(34, 123, 197),
-            Self::Done => Color32::from_rgb(42, 140, 92),
-            Self::Failed => Color32::from_rgb(198, 67, 67),
-            Self::Cancelled => Color32::from_rgb(180, 126, 45),
+            Self::Waiting => theme::NEUTRAL,
+            Self::Running => theme::INFO,
+            Self::Done => theme::SUCCESS,
+            Self::Failed => theme::DANGER,
+            Self::Cancelled => theme::WARNING,
+        }
+    }
+
+    fn badge_background(self) -> Color32 {
+        match self {
+            Self::Waiting => theme::SUNKEN,
+            Self::Running => theme::PRIMARY_SUBTLE,
+            Self::Done => theme::SUCCESS_BG,
+            Self::Failed => theme::DANGER_BG,
+            Self::Cancelled => theme::WARNING_BG,
         }
     }
 }
@@ -117,38 +182,13 @@ struct SvsGui {
     smoke_test: bool,
     last_message: String,
     logs_collapsed: bool,
+    /// Screen rect of the output-path field, used to route folder drops.
+    output_field_rect: Option<egui::Rect>,
 }
 
 impl SvsGui {
     fn new(cc: &CreationContext<'_>, smoke_test: bool) -> Self {
-        let mut style = (*cc.egui_ctx.style()).clone();
-        style.spacing.item_spacing = Vec2::new(10.0, 10.0);
-        style.spacing.button_padding = Vec2::new(13.0, 9.0);
-        style.spacing.interact_size = Vec2::new(44.0, 38.0);
-        style
-            .text_styles
-            .insert(TextStyle::Body, FontId::proportional(17.0));
-        style
-            .text_styles
-            .insert(TextStyle::Button, FontId::proportional(16.0));
-        style
-            .text_styles
-            .insert(TextStyle::Small, FontId::proportional(14.0));
-        style
-            .text_styles
-            .insert(TextStyle::Heading, FontId::proportional(25.0));
-        style.visuals = egui::Visuals::light();
-        style.visuals.panel_fill = PAGE_BACKGROUND;
-        style.visuals.window_fill = CARD_BACKGROUND;
-        style.visuals.widgets.noninteractive.bg_fill = CARD_BACKGROUND;
-        style.visuals.widgets.noninteractive.fg_stroke.color = TEXT;
-        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(232, 241, 246);
-        style.visuals.widgets.inactive.fg_stroke.color = TEXT;
-        style.visuals.widgets.hovered.bg_fill = PRIMARY_LIGHT;
-        style.visuals.widgets.hovered.fg_stroke.color = TEXT;
-        style.visuals.selection.bg_fill = PRIMARY;
-        style.visuals.selection.stroke.color = Color32::WHITE;
-        cc.egui_ctx.set_style(style);
+        apply_style(&cc.egui_ctx);
         install_windows_font(&cc.egui_ctx);
         Self {
             items: Vec::new(),
@@ -168,6 +208,7 @@ impl SvsGui {
             smoke_test,
             last_message: "等待添加切片".to_owned(),
             logs_collapsed: true,
+            output_field_rect: None,
         }
     }
 
@@ -246,23 +287,24 @@ impl SvsGui {
         }
     }
 
-    fn choose_files(&mut self) {
+    fn choose_files(&mut self, parent: &Frame) {
         if let Some(paths) = FileDialog::new()
             .add_filter("Whole-slide files", SUPPORTED_EXTENSIONS)
+            .set_parent(parent)
             .pick_files()
         {
             self.add_paths(paths);
         }
     }
 
-    fn choose_folder(&mut self) {
-        if let Some(path) = FileDialog::new().pick_folder() {
+    fn choose_folder(&mut self, parent: &Frame) {
+        if let Some(path) = FileDialog::new().set_parent(parent).pick_folder() {
             self.add_paths([path]);
         }
     }
 
-    fn choose_output(&mut self) {
-        if let Some(path) = FileDialog::new().pick_folder() {
+    fn choose_output(&mut self, parent: &Frame) {
+        if let Some(path) = FileDialog::new().set_parent(parent).pick_folder() {
             self.options.output_dir = path.display().to_string();
         }
     }
@@ -300,7 +342,8 @@ impl SvsGui {
             })
             .collect();
         if pending_indices.is_empty() {
-            self.log("没有待转换的切片。".to_owned());
+            self.last_message = "没有待转换的切片".to_owned();
+            self.log(format!("{}。", self.last_message));
             return;
         }
         let quality = match self.options.jpeg_quality.as_str() {
@@ -334,6 +377,9 @@ impl SvsGui {
         self.failed = 0;
         self.batch_total = batch_total;
         self.active_indices = pending_indices;
+        // Without this the status bar keeps showing the previous run's outcome,
+        // e.g. "已停止：..." after stopping a run and starting it again.
+        self.last_message = "正在转换…".to_owned();
         self.log("开始转换队列。".to_owned());
     }
 
@@ -404,6 +450,167 @@ impl SvsGui {
     }
 }
 
+/// Applies the shared widget style: spacing, type scale, radii and widget colours.
+fn apply_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+
+    style.spacing.item_spacing = Vec2::new(10.0, 10.0);
+    style.spacing.button_padding = Vec2::new(14.0, 9.0);
+    style.spacing.interact_size = Vec2::new(44.0, 38.0);
+
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::proportional(15.0));
+    style
+        .text_styles
+        .insert(TextStyle::Button, FontId::proportional(15.0));
+    style
+        .text_styles
+        .insert(TextStyle::Small, FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(TextStyle::Heading, FontId::proportional(17.0));
+    style
+        .text_styles
+        .insert(TextStyle::Monospace, FontId::monospace(13.0));
+
+    let radius = CornerRadius::same(theme::RADIUS_CONTROL);
+    let mut visuals = egui::Visuals::light();
+    visuals.panel_fill = theme::CANVAS;
+    visuals.window_fill = theme::SURFACE;
+    visuals.window_stroke = Stroke::new(1.0_f32, theme::BORDER_SUBTLE);
+    visuals.window_corner_radius = CornerRadius::same(theme::RADIUS_CARD);
+    visuals.window_shadow = Shadow {
+        offset: [0, 6],
+        blur: 18,
+        spread: 0,
+        color: Color32::from_black_alpha(30),
+    };
+    visuals.extreme_bg_color = theme::SURFACE;
+    visuals.faint_bg_color = theme::SUNKEN;
+    visuals.selection.bg_fill = theme::PRIMARY;
+    visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
+
+    visuals.widgets.noninteractive.bg_fill = theme::SURFACE;
+    visuals.widgets.noninteractive.weak_bg_fill = theme::SUNKEN;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, theme::BORDER_SUBTLE);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, theme::TEXT_PRIMARY);
+    visuals.widgets.noninteractive.corner_radius = radius;
+
+    visuals.widgets.inactive.bg_fill = theme::SUNKEN;
+    visuals.widgets.inactive.weak_bg_fill = theme::SUNKEN;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, theme::BORDER_STRONG);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, theme::TEXT_PRIMARY);
+    visuals.widgets.inactive.corner_radius = radius;
+
+    visuals.widgets.hovered.bg_fill = theme::PRIMARY_SUBTLE;
+    visuals.widgets.hovered.weak_bg_fill = theme::PRIMARY_SUBTLE;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme::PRIMARY);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, theme::TEXT_PRIMARY);
+    visuals.widgets.hovered.corner_radius = radius;
+
+    visuals.widgets.active.bg_fill = theme::PRIMARY;
+    visuals.widgets.active.weak_bg_fill = theme::PRIMARY;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, theme::PRIMARY_HOVER);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+    visuals.widgets.active.corner_radius = radius;
+
+    visuals.widgets.open.bg_fill = theme::SURFACE;
+    visuals.widgets.open.weak_bg_fill = theme::PRIMARY_SUBTLE;
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, theme::BORDER_STRONG);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, theme::TEXT_PRIMARY);
+    visuals.widgets.open.corner_radius = radius;
+
+    style.visuals = visuals;
+    ctx.set_style(style);
+}
+
+/// The standard elevated white panel used for every card in the layout.
+fn card() -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::SURFACE)
+        .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+        .corner_radius(CornerRadius::same(theme::RADIUS_CARD))
+        .inner_margin(theme::CARD_MARGIN)
+        .shadow(Shadow {
+            offset: [0, 2],
+            blur: 6,
+            spread: 0,
+            color: Color32::from_black_alpha(18),
+        })
+}
+
+/// A small rounded pill, used for counters and format names.
+fn chip(ui: &mut egui::Ui, text: impl Into<String>, fg: Color32, bg: Color32) {
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(CornerRadius::same(9))
+        .inner_margin(Margin::symmetric(9, 3))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text.into()).size(12.0).color(fg));
+        });
+}
+
+/// Placeholder shown while the queue has no items.
+fn empty_state(ui: &mut egui::Ui) {
+    let height = ui.available_height().max(180.0);
+    egui::Frame::new()
+        .fill(theme::SUNKEN)
+        .stroke(Stroke::new(1.0_f32, theme::BORDER_STRONG))
+        .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+        .inner_margin(Margin::symmetric(16, 16))
+        .show(ui, |ui| {
+            let inner_height = (height - 34.0).max(120.0);
+            ui.set_min_height(inner_height);
+            ui.vertical_centered(|ui| {
+                ui.add_space((inner_height / 2.0 - 46.0).max(8.0));
+                ui.label(
+                    RichText::new("将切片文件或文件夹拖到这里")
+                        .size(16.0)
+                        .color(theme::TEXT_SECONDARY),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("支持批量拖入，也可以使用上方的添加按钮")
+                        .size(13.0)
+                        .color(theme::TEXT_DISABLED),
+                );
+            });
+        });
+}
+
+/// Slim progress track.
+///
+/// egui's own `ProgressBar` clamps its fill to at least one corner diameter,
+/// so at 0% it paints a stray rounded blob at the left end. Drawing the track
+/// here keeps the empty state clean and only paints a fill once there is
+/// progress.
+fn progress_bar(ui: &mut egui::Ui, fraction: f32, width: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 8.0), egui::Sense::hover());
+    let radius = CornerRadius::same(4);
+    let fraction = fraction.clamp(0.0, 1.0);
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, theme::SUNKEN);
+    if fraction > 0.0 {
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * fraction, rect.height())),
+            radius,
+            color,
+        );
+    }
+}
+
+/// Clamps a log line so the collapsed drawer header stays on one line.
+fn truncate(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 fn install_windows_font(ctx: &egui::Context) {
     #[cfg(target_os = "windows")]
     {
@@ -434,55 +641,68 @@ fn install_windows_font(ctx: &egui::Context) {
 }
 
 impl App for SvsGui {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut Frame) {
         self.receive_events();
         if self.smoke_test {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        self.handle_shortcuts(ctx);
+        // The native file dialogs need an owner window. Without one Windows
+        // gives them their own taskbar button and they are not modal to us.
+        let window: &Frame = frame;
+        self.handle_shortcuts(window, ctx);
         self.handle_dropped_files(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
+        // The top bar is painted as a card inside this panel, so it gets the
+        // same four rounded corners and page margin as the workspace cards.
         egui::TopBottomPanel::top("header")
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin {
+                left: 20,
+                right: 20,
+                top: 18,
+                bottom: 0,
+            }))
+            .show(ctx, |ui| self.header(ui));
+
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(54.0)
             .frame(
                 egui::Frame::new()
-                    .fill(HEADER_BACKGROUND)
-                    .inner_margin(18.0),
+                    .fill(theme::SURFACE)
+                    .inner_margin(Margin {
+                        left: 20,
+                        right: 20,
+                        top: 0,
+                        bottom: 0,
+                    }),
             )
-            .show(ctx, |ui| self.header(ui));
+            .show(ctx, |ui| self.status_bar(ui));
+
         egui::TopBottomPanel::bottom("logs")
-            .resizable(true)
-            .default_height(if self.logs_collapsed { 54.0 } else { 220.0 })
-            .frame(egui::Frame::new().fill(PAGE_BACKGROUND).inner_margin(18.0))
+            .show_separator_line(false)
+            .exact_height(if self.logs_collapsed { 54.0 } else { 232.0 })
+            .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin {
+                left: 20,
+                right: 20,
+                top: 6,
+                bottom: 6,
+            }))
             .show(ctx, |ui| self.logs_panel(ui));
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(PAGE_BACKGROUND).inner_margin(18.0))
-            .show(ctx, |ui| {
-                ui.columns(2, |columns| {
-                    egui::Frame::new()
-                        .fill(CARD_BACKGROUND)
-                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
-                        .inner_margin(18.0)
-                        .show(&mut columns[0], |ui| self.sources(ui));
-                    egui::Frame::new()
-                        .fill(CARD_BACKGROUND)
-                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
-                        .inner_margin(18.0)
-                        .show(&mut columns[1], |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt("settings_scroll")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| self.settings(ui));
-                        });
-                });
-            });
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::CANVAS)
+                    .inner_margin(Margin::ZERO),
+            )
+            .show(ctx, |ui| self.workspace(window, ui));
     }
 }
 
 impl SvsGui {
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+    fn handle_shortcuts(&mut self, parent: &Frame, ctx: &egui::Context) {
         let (f5, escape, ctrl_o, ctrl_shift_o) = ctx.input(|input| {
             (
                 input.key_pressed(egui::Key::F5),
@@ -498,336 +718,667 @@ impl SvsGui {
             self.stop();
         }
         if ctrl_shift_o {
-            self.choose_folder();
+            self.choose_folder(parent);
         } else if ctrl_o {
-            self.choose_files();
+            self.choose_files(parent);
         }
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        let paths: Vec<PathBuf> = ctx.input(|input| {
-            input
-                .raw
-                .dropped_files
-                .iter()
-                .filter_map(|file| file.path.clone())
-                .collect()
+        let (paths, pointer) = ctx.input(|input| {
+            (
+                input
+                    .raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|file| file.path.clone())
+                    .collect::<Vec<PathBuf>>(),
+                input.pointer.latest_pos(),
+            )
         });
-        if !paths.is_empty() {
-            self.add_paths(paths);
+        if paths.is_empty() {
+            return;
         }
+        // A folder dropped on the output field sets the output directory. Files
+        // always go to the queue, so a slide dropped on the field is not
+        // silently turned into a directory choice.
+        let dropped_on_field = pointer.is_some_and(|position| {
+            self.output_field_rect
+                .is_some_and(|rect| rect.contains(position))
+        });
+        if dropped_on_field {
+            if let Some(directory) = paths.iter().find(|path| path.is_dir()) {
+                self.options.output_dir = directory.display().to_string();
+                self.last_message = format!("输出目录：{}", directory.display());
+                self.log(format!("输出目录已设置为 {}。", directory.display()));
+                return;
+            }
+        }
+        self.add_paths(paths);
+    }
+
+    /// True while a dragged item hovers the output-path field, so the field can
+    /// show that dropping a folder there picks the directory.
+    fn output_field_accepts_drop(&self, ctx: &egui::Context) -> bool {
+        let Some(rect) = self.output_field_rect else {
+            return false;
+        };
+        ctx.input(|input| {
+            !input.raw.hovered_files.is_empty()
+                && input
+                    .pointer
+                    .hover_pos()
+                    .is_some_and(|position| rect.contains(position))
+        })
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            egui::Frame::new()
-                .fill(PRIMARY)
-                .inner_margin(14.0)
-                .show(ui, |ui| {
+        // A card like the workspace panels, so all four corners are rounded
+        // instead of running to the window edges.
+        card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                egui::Frame::new()
+                    .fill(theme::PRIMARY)
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::symmetric(12, 7))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("SVS")
+                                .strong()
+                                .size(17.0)
+                                .color(Color32::WHITE),
+                        );
+                    });
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
                     ui.label(
-                        RichText::new("SVS")
+                        RichText::new("病理图像转 SVS 工具")
                             .strong()
-                            .size(20.0)
-                            .color(Color32::WHITE),
+                            .size(19.0)
+                            .color(theme::TEXT_PRIMARY),
+                    );
+                    ui.label(
+                        RichText::new("把常见数字病理切片批量转换为兼容性更好的 SVS")
+                            .size(13.0)
+                            .color(theme::TEXT_SECONDARY),
                     );
                 });
-            ui.add_space(6.0);
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("病理图像转 SVS 工具")
-                        .strong()
-                        .size(25.0)
-                        .color(Color32::WHITE),
-                );
-                ui.label(
-                    RichText::new("把常见数字病理切片批量转换为兼容性更好的 SVS")
-                        .size(15.0)
-                        .color(Color32::from_rgb(184, 216, 235)),
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let stop_enabled = self.running;
+                    let stop = if stop_enabled {
+                        egui::Button::new(
+                            RichText::new("停止").size(15.0).color(theme::TEXT_PRIMARY),
+                        )
+                        .fill(theme::SURFACE)
+                    } else {
+                        egui::Button::new(
+                            RichText::new("停止").size(15.0).color(theme::TEXT_DISABLED),
+                        )
+                        .fill(theme::SUNKEN)
+                    }
+                    .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+                    .min_size(Vec2::new(96.0, 40.0));
+                    if ui.add_enabled(stop_enabled, stop).clicked() {
+                        self.stop();
+                    }
+
+                    let start_enabled = !self.running;
+                    let start = if start_enabled {
+                        egui::Button::new(
+                            RichText::new("开始转换  F5")
+                                .size(15.0)
+                                .color(Color32::WHITE),
+                        )
+                        .fill(theme::PRIMARY)
+                    } else {
+                        egui::Button::new(
+                            RichText::new("开始转换  F5")
+                                .size(15.0)
+                                .color(theme::TEXT_DISABLED),
+                        )
+                        .fill(theme::SUNKEN)
+                    }
+                    .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+                    .min_size(Vec2::new(150.0, 40.0));
+                    if ui.add_enabled(start_enabled, start).clicked() {
+                        self.start();
+                    }
+                });
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let stop = ui.add_enabled(
-                    self.running,
-                    egui::Button::new(RichText::new("停止").size(17.0))
-                        .fill(Color32::from_rgb(239, 245, 248))
-                        .min_size(Vec2::new(112.0, 44.0)),
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("支持格式")
+                        .size(12.0)
+                        .color(theme::TEXT_SECONDARY),
                 );
-                if stop.clicked() {
-                    self.stop();
-                }
-                let start = ui.add_enabled(
-                    !self.running,
-                    egui::Button::new(RichText::new("开始转换  F5").size(17.0))
-                        .fill(PRIMARY)
-                        .min_size(Vec2::new(158.0, 44.0)),
-                );
-                if start.clicked() {
-                    self.start();
+                ui.add_space(2.0);
+                for label in FORMAT_LABELS {
+                    chip(ui, *label, theme::TEXT_SECONDARY, theme::SUNKEN);
                 }
             });
         });
+    }
+
+    /// Queue on the left (flexible) and the fixed-width settings rail on the right.
+    fn workspace(&mut self, parent: &Frame, ui: &mut egui::Ui) {
+        egui::SidePanel::right("settings_rail")
+            .resizable(false)
+            .show_separator_line(false)
+            .exact_width(theme::RAIL_WIDTH)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::CANVAS)
+                    .inner_margin(theme::RAIL_MARGIN),
+            )
+            .show_inside(ui, |ui| self.settings(parent, ui));
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::CANVAS)
+                    .inner_margin(theme::QUEUE_MARGIN),
+            )
+            .show_inside(ui, |ui| self.sources(parent, ui));
+    }
+
+    /// Slim strip holding the progress bar, live counters and the latest status.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         let total = self.batch_total;
+        let processed = self.completed + self.failed;
         let fraction = if total == 0 {
             0.0
         } else {
-            (self.completed + self.failed) as f32 / total as f32
+            processed as f32 / total as f32
         };
-        ui.add_space(14.0);
-        ui.add(egui::ProgressBar::new(fraction).fill(PRIMARY).text(
-            RichText::new(format!("{} / {}", self.completed + self.failed, total)).color(TEXT),
-        ));
-        ui.add_space(2.0);
-    }
+        let waiting = self
+            .items
+            .iter()
+            .filter(|item| item.state == ItemState::Waiting)
+            .count();
+        let running = self.running;
+        let completed = self.completed;
+        let failed = self.failed;
+        let finished_with_failures = !running && failed > 0;
+        let message = self.last_message.as_str();
 
-    fn sources(&mut self, ui: &mut egui::Ui) {
-        ui.heading("1  选择切片");
-        ui.label(
-            RichText::new("支持多文件、目录添加，也可以直接拖拽到下方列表")
-                .size(15.0)
-                .color(MUTED_TEXT),
-        );
-        ui.horizontal(|ui| {
-            if ui
-                .add_sized([132.0, 40.0], egui::Button::new("＋ 添加文件"))
-                .clicked()
-            {
-                self.choose_files();
+        ui.horizontal_centered(|ui| {
+            if running {
+                ui.add(egui::Spinner::new().size(15.0).color(theme::PRIMARY));
+            } else {
+                ui.add_space(15.0);
             }
-            if ui
-                .add_sized([112.0, 40.0], egui::Button::new("添加目录"))
-                .clicked()
-            {
-                self.choose_folder();
-            }
-            if ui
-                .add_sized([88.0, 40.0], egui::Button::new("清空"))
-                .clicked()
-                && !self.running
-            {
-                self.items.clear();
-                self.completed = 0;
-                self.failed = 0;
-                self.batch_total = 0;
-            }
-        });
-        ui.label(
-            RichText::new(format!(
-                "已添加 {} 项 · 支持：CSP / DMETRIX / KFB / MDSX / MRXS / NDPI / TIFF / SDPC / DYQX",
-                self.items.len()
-            ))
-            .weak(),
-        );
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
-                let action_width = 78.0;
-                let column_spacing = ui.spacing().item_spacing.x;
-                let path_width = (ui.available_width() - action_width - column_spacing).max(120.0);
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(232, 239, 244))
-                    .inner_margin(egui::Margin::symmetric(0, 6))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let (path_rect, _) = ui.allocate_exact_size(
-                                Vec2::new(path_width, 24.0),
-                                egui::Sense::hover(),
-                            );
-                            let (action_rect, _) = ui.allocate_exact_size(
-                                Vec2::new(action_width, 24.0),
-                                egui::Sense::hover(),
-                            );
-                            let painter = ui.painter();
-                            painter.text(
-                                path_rect.left_center(),
-                                egui::Align2::LEFT_CENTER,
-                                "文件或目录",
-                                FontId::proportional(17.0),
-                                TEXT,
-                            );
-                            painter.text(
-                                action_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "操作",
-                                FontId::proportional(17.0),
-                                TEXT,
-                            );
-                        });
-                    });
-                let mut remove_index = None;
-                for index in 0..self.items.len() {
-                    let item = &self.items[index];
-                    let path = item.path.display().to_string();
-                    let label = item.state.label();
-                    ui.horizontal(|ui| {
-                        let (path_rect, _) = ui
-                            .allocate_exact_size(Vec2::new(path_width, 44.0), egui::Sense::hover());
-                        let painter = ui.painter().with_clip_rect(path_rect);
-                        painter.text(
-                            path_rect.left_center() + Vec2::new(0.0, -9.0),
-                            egui::Align2::LEFT_CENTER,
-                            label,
-                            FontId::proportional(15.0),
-                            item.state.color(),
-                        );
-                        painter.text(
-                            path_rect.left_center() + Vec2::new(0.0, 9.0),
-                            egui::Align2::LEFT_CENTER,
-                            &path,
-                            FontId::proportional(15.0),
-                            item.state.color(),
-                        );
-                        if ui
-                            .add_enabled(
-                                !self.running,
-                                egui::Button::new("移除").min_size(Vec2::new(action_width, 38.0)),
-                            )
-                            .clicked()
-                        {
-                            remove_index = Some(index);
-                        }
-                    });
-                    ui.separator();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(message)
+                    .size(14.0)
+                    .color(theme::TEXT_SECONDARY),
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if failed > 0 {
+                    chip(
+                        ui,
+                        format!("✕ 失败 {failed}"),
+                        theme::DANGER,
+                        theme::DANGER_BG,
+                    );
                 }
-                if let Some(index) = remove_index {
-                    self.remove_at(index);
+                if completed > 0 {
+                    chip(
+                        ui,
+                        format!("✓ 完成 {completed}"),
+                        theme::SUCCESS,
+                        theme::SUCCESS_BG,
+                    );
                 }
-                if self.items.is_empty() {
-                    ui.add_space(28.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new("将切片文件或文件夹拖到这里")
-                                .size(18.0)
-                                .weak(),
-                        );
-                        ui.label(RichText::new("支持一次拖入多个项目").size(15.0).weak());
-                    });
+                if waiting > 0 {
+                    chip(
+                        ui,
+                        format!("● 等待 {waiting}"),
+                        theme::NEUTRAL,
+                        theme::SUNKEN,
+                    );
                 }
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(format!("{processed} / {total}"))
+                        .size(13.0)
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.add_space(10.0);
+                progress_bar(
+                    ui,
+                    fraction,
+                    200.0,
+                    if finished_with_failures {
+                        theme::WARNING
+                    } else {
+                        theme::PRIMARY
+                    },
+                );
             });
+        });
     }
 
-    fn settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("2  转换设置");
-        ui.label(
-            RichText::new("默认选项适合大多数切片")
-                .size(15.0)
-                .color(MUTED_TEXT),
-        );
-        ui.add_space(8.0);
-        ui.label(RichText::new("输出位置").strong().color(TEXT));
-        ui.horizontal(|ui| {
-            let input_width = (ui.available_width() - 92.0).max(120.0);
+    fn sources(&mut self, parent: &Frame, ui: &mut egui::Ui) {
+        let item_count = self.items.len();
+        let can_modify = !self.running;
+        let can_clear = can_modify && item_count > 0;
+
+        card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("1  切片队列")
+                        .strong()
+                        .size(16.0)
+                        .color(theme::TEXT_PRIMARY),
+                );
+                chip(
+                    ui,
+                    format!("{item_count} 项"),
+                    theme::TEXT_SECONDARY,
+                    theme::SUNKEN,
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            can_clear,
+                            egui::Button::new("清空").min_size(Vec2::new(72.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.items.clear();
+                        self.completed = 0;
+                        self.failed = 0;
+                        self.batch_total = 0;
+                        self.last_message = "等待添加切片".to_owned();
+                    }
+                    if ui
+                        .add_enabled(
+                            can_modify,
+                            egui::Button::new("添加目录").min_size(Vec2::new(96.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.choose_folder(parent);
+                    }
+                    if ui
+                        .add_enabled(
+                            can_modify,
+                            egui::Button::new(RichText::new("＋ 添加文件").color(Color32::WHITE))
+                                .fill(theme::PRIMARY)
+                                .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+                                .min_size(Vec2::new(118.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.choose_files(parent);
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new("支持多文件与目录批量添加，也可以把切片直接拖拽到下方列表。")
+                    .size(13.0)
+                    .color(theme::TEXT_SECONDARY),
+            );
+            ui.add_space(12.0);
+
+            if self.items.is_empty() {
+                empty_state(ui);
+                return;
+            }
+
             egui::Frame::new()
-                .fill(Color32::from_rgb(250, 252, 253))
-                .stroke(egui::Stroke::new(1.0_f32, BORDER))
-                .inner_margin(0.0)
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+                .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+                .inner_margin(Margin::ZERO)
+                .show(ui, |ui| {
+                    let action_width = 72.0;
+                    let status_width = 92.0;
+                    let row_padding = 14.0;
+                    let spacing = ui.spacing().item_spacing.x;
+                    // Leading inset + status + path + action, plus the item
+                    // spacing egui inserts between them, plus a 12px right inset.
+                    let path_width = (ui.available_width()
+                        - row_padding
+                        - status_width
+                        - action_width
+                        - spacing * 3.0
+                        - 12.0)
+                        .max(120.0);
+
+                    // Header band. It repeats the exact allocation sequence of a
+                    // row so that the three columns line up pixel for pixel.
+                    egui::Frame::new()
+                        .fill(theme::SUNKEN)
+                        .corner_radius(CornerRadius {
+                            nw: theme::RADIUS_CONTROL,
+                            ne: theme::RADIUS_CONTROL,
+                            sw: 0,
+                            se: 0,
+                        })
+                        .inner_margin(Margin {
+                            left: 0,
+                            right: 0,
+                            top: 7,
+                            bottom: 7,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let _ = ui.allocate_exact_size(
+                                    Vec2::new(row_padding, 20.0),
+                                    egui::Sense::hover(),
+                                );
+                                let (status_rect, _) = ui.allocate_exact_size(
+                                    Vec2::new(status_width, 20.0),
+                                    egui::Sense::hover(),
+                                );
+                                let (path_rect, _) = ui.allocate_exact_size(
+                                    Vec2::new(path_width, 20.0),
+                                    egui::Sense::hover(),
+                                );
+                                let action_center = egui::pos2(
+                                    path_rect.right() + spacing + action_width / 2.0,
+                                    status_rect.center().y,
+                                );
+                                let painter = ui.painter();
+                                painter.text(
+                                    status_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "状态",
+                                    FontId::proportional(13.0),
+                                    theme::TEXT_SECONDARY,
+                                );
+                                painter.text(
+                                    path_rect.left_center(),
+                                    egui::Align2::LEFT_CENTER,
+                                    "文件或目录",
+                                    FontId::proportional(13.0),
+                                    theme::TEXT_SECONDARY,
+                                );
+                                painter.text(
+                                    action_center,
+                                    egui::Align2::CENTER_CENTER,
+                                    "操作",
+                                    FontId::proportional(13.0),
+                                    theme::TEXT_SECONDARY,
+                                );
+                            });
+                        });
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("queue_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let mut remove_index = None;
+                            for index in 0..self.items.len() {
+                                let item = &self.items[index];
+                                let path = item.path.display().to_string();
+                                let status_text =
+                                    format!("{} {}", item.state.icon(), item.state.label());
+                                let status_color = item.state.color();
+                                let status_background = item.state.badge_background();
+                                ui.horizontal(|ui| {
+                                    let _ = ui.allocate_exact_size(
+                                        Vec2::new(row_padding, 26.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let (status_rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(status_width, 26.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let painter = ui.painter();
+                                    painter.rect_filled(
+                                        status_rect,
+                                        CornerRadius::same(9),
+                                        status_background,
+                                    );
+                                    painter.text(
+                                        status_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        &status_text,
+                                        FontId::proportional(12.0),
+                                        status_color,
+                                    );
+                                    let (path_rect, response) = ui.allocate_exact_size(
+                                        Vec2::new(path_width, 46.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let painter = ui.painter().with_clip_rect(path_rect);
+                                    painter.text(
+                                        path_rect.left_center(),
+                                        egui::Align2::LEFT_CENTER,
+                                        &path,
+                                        FontId::proportional(14.0),
+                                        theme::TEXT_PRIMARY,
+                                    );
+                                    let _ = response.on_hover_text(path.clone());
+                                    if ui
+                                        .add_enabled(
+                                            !self.running,
+                                            egui::Button::new("移除")
+                                                .min_size(Vec2::new(action_width, 32.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        remove_index = Some(index);
+                                    }
+                                });
+                                ui.separator();
+                            }
+                            if let Some(index) = remove_index {
+                                self.remove_at(index);
+                            }
+                        });
+                });
+        });
+    }
+
+    fn settings(&mut self, parent: &Frame, ui: &mut egui::Ui) {
+        // The card fills the rail and scrolls internally, so the settings card
+        // always matches the height of the queue card while resizing.
+        card().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("settings_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.settings_content(parent, ui));
+        });
+    }
+
+    fn settings_content(&mut self, parent: &Frame, ui: &mut egui::Ui) {
+        let quality_text = self.options.jpeg_quality.clone();
+        let drop_target = self.output_field_accepts_drop(ui.ctx());
+
+        ui.label(
+            RichText::new("2  转换设置")
+                .strong()
+                .size(16.0)
+                .color(theme::TEXT_PRIMARY),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("默认选项适合大多数切片。")
+                .size(13.0)
+                .color(theme::TEXT_SECONDARY),
+        );
+        ui.add_space(14.0);
+
+        ui.label(
+            RichText::new("输出位置")
+                .strong()
+                .size(14.0)
+                .color(theme::TEXT_PRIMARY),
+        );
+        ui.add_space(6.0);
+        let browse_width = 68.0;
+        let item_spacing = ui.spacing().item_spacing.x;
+        let input_width = (ui.available_width() - browse_width - item_spacing).max(120.0);
+        ui.horizontal(|ui| {
+            let field = egui::Frame::new()
+                .fill(if drop_target {
+                    theme::PRIMARY_SUBTLE
+                } else {
+                    theme::SURFACE
+                })
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if drop_target {
+                        theme::PRIMARY
+                    } else {
+                        theme::BORDER_STRONG
+                    },
+                ))
+                .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+                .inner_margin(Margin {
+                    left: 10,
+                    right: 10,
+                    top: 0,
+                    bottom: 0,
+                })
                 .show(ui, |ui| {
                     ui.add_sized(
-                        [input_width, 40.0],
+                        [input_width - 20.0, 36.0],
                         egui::TextEdit::singleline(&mut self.options.output_dir)
                             .frame(false)
-                            .background_color(Color32::from_rgb(250, 252, 253))
-                            .vertical_align(egui::Align::Center)
-                            .desired_rows(1),
+                            .vertical_align(egui::Align::Center),
                     );
                 });
+            // Remembered so `handle_dropped_files` knows where a dropped
+            // folder should land.
+            self.output_field_rect = Some(field.response.rect);
             if ui
-                .add_sized([82.0, 40.0], egui::Button::new("浏览..."))
+                .add_sized([browse_width, 38.0], egui::Button::new("浏览"))
                 .clicked()
             {
-                self.choose_output();
+                self.choose_output(parent);
             }
         });
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("留空即保存到源文件同目录")
-                    .size(14.0)
-                    .color(MUTED_TEXT),
-            );
-            if ui
-                .button(RichText::new("恢复为源目录输出").size(14.0))
-                .clicked()
-            {
-                self.options.output_dir.clear();
-            }
-        });
-        ui.separator();
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new("SVS 保存质量").strong().color(TEXT));
-                egui::ComboBox::from_id_salt("quality")
-                    .selected_text(&self.options.jpeg_quality)
-                    .width(180.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.options.jpeg_quality,
-                            "原始".to_owned(),
-                            "原始 / 推荐",
-                        );
-                        for quality in [95, 90, 85, 80, 70, 60] {
-                            ui.selectable_value(
-                                &mut self.options.jpeg_quality,
-                                quality.to_string(),
-                                quality.to_string(),
-                            );
-                        }
-                    });
-            });
-        });
+        ui.add_space(4.0);
         ui.label(
-            RichText::new("“原始/推荐”会尽量沿用源图质量，降低数值可减小文件体积。")
-                .size(14.0)
-                .color(MUTED_TEXT),
+            RichText::new(if drop_target {
+                "松开即可把该文件夹设为输出目录"
+            } else {
+                "留空则输出到源文件目录，也可以把文件夹拖到这里"
+            })
+            .size(12.0)
+            .color(if drop_target {
+                theme::PRIMARY
+            } else {
+                theme::TEXT_SECONDARY
+            }),
         );
-        ui.checkbox(&mut self.options.overwrite, "覆盖已存在的 SVS");
+        ui.add_space(12.0);
+
+        ui.label(
+            RichText::new("SVS 保存质量")
+                .strong()
+                .size(14.0)
+                .color(theme::TEXT_PRIMARY),
+        );
+        ui.add_space(6.0);
+        egui::ComboBox::from_id_salt("quality")
+            .selected_text(quality_text)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.options.jpeg_quality,
+                    "原始".to_owned(),
+                    "原始 / 推荐",
+                );
+                for quality in [95, 90, 85, 80, 70, 60] {
+                    ui.selectable_value(
+                        &mut self.options.jpeg_quality,
+                        quality.to_string(),
+                        quality.to_string(),
+                    );
+                }
+            });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("“原始/推荐”沿用源图质量，数值越低文件越小。")
+                .size(12.0)
+                .color(theme::TEXT_SECONDARY),
+        );
+        ui.add_space(14.0);
+        ui.checkbox(
+            &mut self.options.overwrite,
+            RichText::new("覆盖已存在的 SVS").size(14.0),
+        );
     }
 
     fn logs_panel(&mut self, ui: &mut egui::Ui) {
+        let preview = self
+            .logs
+            .last()
+            .map(|line| truncate(line, 60))
+            .unwrap_or_default();
+        let collapsed = self.logs_collapsed;
+
         ui.horizontal(|ui| {
-            ui.heading("3  运行日志");
             ui.label(
-                RichText::new("需要排查失败原因时再展开")
-                    .size(14.0)
-                    .color(MUTED_TEXT),
+                RichText::new("3  运行日志")
+                    .strong()
+                    .size(15.0)
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.label(
+                RichText::new(preview)
+                    .size(13.0)
+                    .color(theme::TEXT_SECONDARY),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Both toolbar buttons share one size so they read as a pair.
+                let button_size = Vec2::new(96.0, 34.0);
+                let toggle_label = if collapsed { "展开" } else { "收起" };
                 if ui
-                    .button(if self.logs_collapsed {
-                        "展开"
-                    } else {
-                        "收起"
-                    })
+                    .add(egui::Button::new(toggle_label).min_size(button_size))
                     .clicked()
                 {
                     self.logs_collapsed = !self.logs_collapsed;
                 }
+                if !collapsed
+                    && ui
+                        .add(egui::Button::new("清空日志").min_size(button_size))
+                        .clicked()
+                {
+                    self.logs.clear();
+                }
             });
         });
-        if self.logs_collapsed {
+
+        if collapsed {
             return;
         }
-        ui.horizontal(|ui| {
-            if ui.button("清空日志").clicked() {
-                self.logs.clear();
-            }
-        });
-        let log_width = ui.available_width();
+
+        ui.add_space(6.0);
+        let body_height = (ui.available_height() - 6.0).max(80.0);
         egui::Frame::new()
-            .fill(CARD_BACKGROUND)
-            .stroke(egui::Stroke::new(1.0_f32, BORDER))
-            .inner_margin(8.0)
+            .fill(theme::SURFACE)
+            .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+            .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+            .inner_margin(Margin::symmetric(12, 10))
             .show(ui, |ui| {
-                ui.set_min_width((log_width - 16.0).max(0.0));
+                ui.set_width(ui.available_width());
                 egui::ScrollArea::vertical()
                     .id_salt("logs_scroll")
                     .auto_shrink([false, false])
+                    .max_height((body_height - 24.0).max(40.0))
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         for line in &self.logs {
-                            ui.label(RichText::new(line).monospace().small());
+                            ui.label(
+                                RichText::new(line)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(theme::TEXT_SECONDARY),
+                            );
                         }
                     });
             });
