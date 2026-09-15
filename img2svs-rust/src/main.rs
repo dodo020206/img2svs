@@ -79,10 +79,7 @@ fn run() -> Result<()> {
                 .output
                 .clone()
                 .unwrap_or_else(|| with_extension(&input, "svs"));
-            let quality = args.jpeg_quality.unwrap_or(75);
-            if !(1..=100).contains(&quality) {
-                bail!("--jpeg-quality must be between 1 and 100");
-            }
+            let quality = validate_quality(args.jpeg_quality.unwrap_or(75))?;
             if args.info {
                 return vips::print_info(&input);
             }
@@ -97,10 +94,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
     let output = args.output.unwrap_or_else(|| with_extension(&input, "svs"));
-    let quality = args.jpeg_quality.unwrap_or(slide.metadata.jpeg_quality);
-    if !(1..=100).contains(&quality) {
-        bail!("--jpeg-quality must be between 1 and 100");
-    }
+    let quality = validate_quality(args.jpeg_quality.unwrap_or(slide.metadata.jpeg_quality))?;
     let started = Instant::now();
     svs::write_slide(
         &slide,
@@ -113,6 +107,14 @@ fn run() -> Result<()> {
     println!("Output: {}", output.display());
     println!("Time  : {:.2} s", started.elapsed().as_secs_f64());
     Ok(())
+}
+
+/// Rejects a JPEG quality outside the range the encoder accepts.
+fn validate_quality(quality: u8) -> Result<u8> {
+    if !(1..=100).contains(&quality) {
+        bail!("--jpeg-quality must be between 1 and 100");
+    }
+    Ok(quality)
 }
 
 fn with_extension(path: &Path, extension: &str) -> PathBuf {
