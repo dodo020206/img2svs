@@ -1244,9 +1244,7 @@ impl SvsGui {
                 theme::TEXT_SECONDARY
             }),
         );
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(14.0);
+        ui.add_space(12.0);
 
         ui.label(
             RichText::new("SVS 保存质量")
