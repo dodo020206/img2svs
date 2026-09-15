@@ -1,4 +1,9 @@
 /.python-package/
 /output/
 /target-rust/
+/target-rust-pr/
+/target-rust-tif/
+/release/
 /test_data/
+/.verify/
+/.baseline-img2svs-rust.exe
