@@ -7,6 +7,7 @@ mod hevc;
 mod indexed;
 mod jpeg;
 mod model;
+mod report;
 mod sdpc;
 mod svs;
 mod vips;
@@ -91,7 +92,7 @@ fn run() -> Result<()> {
         }
         other => bail!("unsupported input extension .{other}"),
     };
-    indexed::print_info(&slide);
+    report::print_slide(&slide);
     if args.info {
         return Ok(());
     }
