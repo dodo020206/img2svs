@@ -148,6 +148,182 @@ impl ItemState {
     }
 }
 
+/// Fixed geometry of the queue list, shared by the header band and the rows.
+const QUEUE_ROW_INSET: f32 = 14.0;
+const QUEUE_STATUS_WIDTH: f32 = 92.0;
+const QUEUE_ACTION_WIDTH: f32 = 72.0;
+const QUEUE_ROW_HEIGHT: f32 = 26.0;
+const QUEUE_PATH_HEIGHT: f32 = 46.0;
+const QUEUE_HEADER_HEIGHT: f32 = 20.0;
+const QUEUE_HEADER_PADDING: f32 = 7.0;
+const QUEUE_BADGE_RADIUS: u8 = 9;
+const QUEUE_ACTION_HEIGHT: f32 = 32.0;
+/// Right inset and the smallest usable width of the path column.
+const QUEUE_RIGHT_INSET: f32 = 12.0;
+const QUEUE_MIN_PATH_WIDTH: f32 = 120.0;
+
+/// Column widths derived from the width available to the queue list.
+///
+/// The header band and every row share one instance so the three columns line
+/// up pixel for pixel.
+struct QueueColumns {
+    row_padding: f32,
+    status_width: f32,
+    path_width: f32,
+    action_width: f32,
+    spacing: f32,
+}
+
+impl QueueColumns {
+    fn new(ui: &egui::Ui) -> Self {
+        let row_padding = QUEUE_ROW_INSET;
+        let status_width = QUEUE_STATUS_WIDTH;
+        let action_width = QUEUE_ACTION_WIDTH;
+        let spacing = ui.spacing().item_spacing.x;
+        // Leading inset + status + path + action, plus the item spacing egui
+        // inserts between them, plus a right inset.
+        let path_width = (ui.available_width()
+            - row_padding
+            - status_width
+            - action_width
+            - spacing * 3.0
+            - QUEUE_RIGHT_INSET)
+            .max(QUEUE_MIN_PATH_WIDTH);
+        Self {
+            row_padding,
+            status_width,
+            path_width,
+            action_width,
+            spacing,
+        }
+    }
+}
+
+/// Draws the header band that labels the queue columns.
+///
+/// It repeats the exact allocation sequence of a row so that the columns line
+/// up pixel for pixel.
+fn queue_header_band(ui: &mut egui::Ui, columns: &QueueColumns) {
+    egui::Frame::new()
+        .fill(theme::SUNKEN)
+        .corner_radius(CornerRadius {
+            nw: theme::RADIUS_CONTROL,
+            ne: theme::RADIUS_CONTROL,
+            sw: 0,
+            se: 0,
+        })
+        .inner_margin(Margin {
+            left: 0,
+            right: 0,
+            top: QUEUE_HEADER_PADDING as i8,
+            bottom: QUEUE_HEADER_PADDING as i8,
+        })
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let _ = ui.allocate_exact_size(
+                    Vec2::new(columns.row_padding, QUEUE_HEADER_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                let (status_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(columns.status_width, QUEUE_HEADER_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                let (path_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(columns.path_width, QUEUE_HEADER_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                let action_center = egui::pos2(
+                    path_rect.right() + columns.spacing + columns.action_width / 2.0,
+                    status_rect.center().y,
+                );
+                let painter = ui.painter();
+                painter.text(
+                    status_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "状态",
+                    FontId::proportional(13.0),
+                    theme::TEXT_SECONDARY,
+                );
+                painter.text(
+                    path_rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    "文件或目录",
+                    FontId::proportional(13.0),
+                    theme::TEXT_SECONDARY,
+                );
+                painter.text(
+                    action_center,
+                    egui::Align2::CENTER_CENTER,
+                    "操作",
+                    FontId::proportional(13.0),
+                    theme::TEXT_SECONDARY,
+                );
+            });
+        });
+}
+
+/// Draws one queue row and reports whether its remove button was clicked.
+fn queue_row(
+    ui: &mut egui::Ui,
+    item: &InputItem,
+    modify_enabled: bool,
+    columns: &QueueColumns,
+) -> bool {
+    let path = item.path.display().to_string();
+    let status_text = format!("{} {}", item.state.icon(), item.state.label());
+    let status_color = item.state.color();
+    let status_background = item.state.badge_background();
+    let mut removed = false;
+    ui.horizontal(|ui| {
+        let _ = ui.allocate_exact_size(
+            Vec2::new(columns.row_padding, QUEUE_ROW_HEIGHT),
+            egui::Sense::hover(),
+        );
+        let (status_rect, _) = ui.allocate_exact_size(
+            Vec2::new(columns.status_width, QUEUE_ROW_HEIGHT),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        painter.rect_filled(
+            status_rect,
+            CornerRadius::same(QUEUE_BADGE_RADIUS),
+            status_background,
+        );
+        painter.text(
+            status_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            &status_text,
+            FontId::proportional(12.0),
+            status_color,
+        );
+        let (path_rect, response) = ui.allocate_exact_size(
+            Vec2::new(columns.path_width, QUEUE_PATH_HEIGHT),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter().with_clip_rect(path_rect);
+        painter.text(
+            path_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            &path,
+            FontId::proportional(14.0),
+            theme::TEXT_PRIMARY,
+        );
+        let _ = response.on_hover_text(path.clone());
+        if ui
+            .add_enabled(
+                modify_enabled,
+                egui::Button::new("移除")
+                    .min_size(Vec2::new(columns.action_width, QUEUE_ACTION_HEIGHT)),
+            )
+            .clicked()
+        {
+            removed = true;
+        }
+    });
+    removed
+}
+
 struct GuiOptions {
     output_dir: String,
     jpeg_quality: String,
@@ -963,61 +1139,8 @@ impl SvsGui {
     }
 
     fn sources(&mut self, parent: &Frame, ui: &mut egui::Ui) {
-        let item_count = self.items.len();
-        let can_modify = !self.running;
-        let can_clear = can_modify && item_count > 0;
-
         card().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("1  切片队列")
-                        .strong()
-                        .size(16.0)
-                        .color(theme::TEXT_PRIMARY),
-                );
-                chip(
-                    ui,
-                    format!("{item_count} 项"),
-                    theme::TEXT_SECONDARY,
-                    theme::SUNKEN,
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            can_clear,
-                            egui::Button::new("清空").min_size(Vec2::new(72.0, 34.0)),
-                        )
-                        .clicked()
-                    {
-                        self.items.clear();
-                        self.completed = 0;
-                        self.failed = 0;
-                        self.batch_total = 0;
-                        self.last_message = "等待添加切片".to_owned();
-                    }
-                    if ui
-                        .add_enabled(
-                            can_modify,
-                            egui::Button::new("添加目录").min_size(Vec2::new(96.0, 34.0)),
-                        )
-                        .clicked()
-                    {
-                        self.choose_folder(parent);
-                    }
-                    if ui
-                        .add_enabled(
-                            can_modify,
-                            egui::Button::new(RichText::new("＋ 添加文件").color(Color32::WHITE))
-                                .fill(theme::PRIMARY)
-                                .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
-                                .min_size(Vec2::new(118.0, 34.0)),
-                        )
-                        .clicked()
-                    {
-                        self.choose_files(parent);
-                    }
-                });
-            });
+            self.queue_toolbar(parent, ui);
             ui.add_space(2.0);
             ui.label(
                 RichText::new("支持多文件与目录批量添加，也可以把切片直接拖拽到下方列表。")
@@ -1037,147 +1160,89 @@ impl SvsGui {
                 .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
                 .inner_margin(Margin::ZERO)
                 .show(ui, |ui| {
-                    let action_width = 72.0;
-                    let status_width = 92.0;
-                    let row_padding = 14.0;
-                    let spacing = ui.spacing().item_spacing.x;
-                    // Leading inset + status + path + action, plus the item
-                    // spacing egui inserts between them, plus a 12px right inset.
-                    let path_width = (ui.available_width()
-                        - row_padding
-                        - status_width
-                        - action_width
-                        - spacing * 3.0
-                        - 12.0)
-                        .max(120.0);
-
-                    // Header band. It repeats the exact allocation sequence of a
-                    // row so that the three columns line up pixel for pixel.
-                    egui::Frame::new()
-                        .fill(theme::SUNKEN)
-                        .corner_radius(CornerRadius {
-                            nw: theme::RADIUS_CONTROL,
-                            ne: theme::RADIUS_CONTROL,
-                            sw: 0,
-                            se: 0,
-                        })
-                        .inner_margin(Margin {
-                            left: 0,
-                            right: 0,
-                            top: 7,
-                            bottom: 7,
-                        })
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                let _ = ui.allocate_exact_size(
-                                    Vec2::new(row_padding, 20.0),
-                                    egui::Sense::hover(),
-                                );
-                                let (status_rect, _) = ui.allocate_exact_size(
-                                    Vec2::new(status_width, 20.0),
-                                    egui::Sense::hover(),
-                                );
-                                let (path_rect, _) = ui.allocate_exact_size(
-                                    Vec2::new(path_width, 20.0),
-                                    egui::Sense::hover(),
-                                );
-                                let action_center = egui::pos2(
-                                    path_rect.right() + spacing + action_width / 2.0,
-                                    status_rect.center().y,
-                                );
-                                let painter = ui.painter();
-                                painter.text(
-                                    status_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "状态",
-                                    FontId::proportional(13.0),
-                                    theme::TEXT_SECONDARY,
-                                );
-                                painter.text(
-                                    path_rect.left_center(),
-                                    egui::Align2::LEFT_CENTER,
-                                    "文件或目录",
-                                    FontId::proportional(13.0),
-                                    theme::TEXT_SECONDARY,
-                                );
-                                painter.text(
-                                    action_center,
-                                    egui::Align2::CENTER_CENTER,
-                                    "操作",
-                                    FontId::proportional(13.0),
-                                    theme::TEXT_SECONDARY,
-                                );
-                            });
-                        });
+                    let columns = QueueColumns::new(ui);
+                    queue_header_band(ui, &columns);
 
                     egui::ScrollArea::vertical()
                         .id_salt("queue_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
-                            let mut remove_index = None;
-                            for index in 0..self.items.len() {
-                                let item = &self.items[index];
-                                let path = item.path.display().to_string();
-                                let status_text =
-                                    format!("{} {}", item.state.icon(), item.state.label());
-                                let status_color = item.state.color();
-                                let status_background = item.state.badge_background();
-                                ui.horizontal(|ui| {
-                                    let _ = ui.allocate_exact_size(
-                                        Vec2::new(row_padding, 26.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    let (status_rect, _) = ui.allocate_exact_size(
-                                        Vec2::new(status_width, 26.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    let painter = ui.painter();
-                                    painter.rect_filled(
-                                        status_rect,
-                                        CornerRadius::same(9),
-                                        status_background,
-                                    );
-                                    painter.text(
-                                        status_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        &status_text,
-                                        FontId::proportional(12.0),
-                                        status_color,
-                                    );
-                                    let (path_rect, response) = ui.allocate_exact_size(
-                                        Vec2::new(path_width, 46.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    let painter = ui.painter().with_clip_rect(path_rect);
-                                    painter.text(
-                                        path_rect.left_center(),
-                                        egui::Align2::LEFT_CENTER,
-                                        &path,
-                                        FontId::proportional(14.0),
-                                        theme::TEXT_PRIMARY,
-                                    );
-                                    let _ = response.on_hover_text(path.clone());
-                                    if ui
-                                        .add_enabled(
-                                            !self.running,
-                                            egui::Button::new("移除")
-                                                .min_size(Vec2::new(action_width, 32.0)),
-                                        )
-                                        .clicked()
-                                    {
-                                        remove_index = Some(index);
-                                    }
-                                });
-                                ui.separator();
-                            }
-                            if let Some(index) = remove_index {
-                                self.remove_at(index);
-                            }
+                            self.queue_rows(ui, &columns);
                         });
                 });
         });
+    }
+
+    /// Draws the queue card title, its item-count chip and the toolbar buttons.
+    fn queue_toolbar(&mut self, parent: &Frame, ui: &mut egui::Ui) {
+        let item_count = self.items.len();
+        let can_modify = !self.running;
+        let can_clear = can_modify && item_count > 0;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("1  切片队列")
+                    .strong()
+                    .size(16.0)
+                    .color(theme::TEXT_PRIMARY),
+            );
+            chip(
+                ui,
+                format!("{item_count} 项"),
+                theme::TEXT_SECONDARY,
+                theme::SUNKEN,
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        can_clear,
+                        egui::Button::new("清空").min_size(Vec2::new(72.0, 34.0)),
+                    )
+                    .clicked()
+                {
+                    self.items.clear();
+                    self.completed = 0;
+                    self.failed = 0;
+                    self.batch_total = 0;
+                    self.last_message = "等待添加切片".to_owned();
+                }
+                if ui
+                    .add_enabled(
+                        can_modify,
+                        egui::Button::new("添加目录").min_size(Vec2::new(96.0, 34.0)),
+                    )
+                    .clicked()
+                {
+                    self.choose_folder(parent);
+                }
+                if ui
+                    .add_enabled(
+                        can_modify,
+                        egui::Button::new(RichText::new("＋ 添加文件").color(Color32::WHITE))
+                            .fill(theme::PRIMARY)
+                            .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+                            .min_size(Vec2::new(118.0, 34.0)),
+                    )
+                    .clicked()
+                {
+                    self.choose_files(parent);
+                }
+            });
+        });
+    }
+
+    /// Draws one row per queued input and applies a pending removal.
+    fn queue_rows(&mut self, ui: &mut egui::Ui, columns: &QueueColumns) {
+        let mut remove_index = None;
+        for (index, item) in self.items.iter().enumerate() {
+            if queue_row(ui, item, !self.running, columns) {
+                remove_index = Some(index);
+            }
+            ui.separator();
+        }
+        if let Some(index) = remove_index {
+            self.remove_at(index);
+        }
     }
 
     fn settings(&mut self, parent: &Frame, ui: &mut egui::Ui) {
@@ -1192,7 +1257,6 @@ impl SvsGui {
     }
 
     fn settings_content(&mut self, parent: &Frame, ui: &mut egui::Ui) {
-        let quality_text = self.options.jpeg_quality.clone();
         let drop_target = self.output_field_accepts_drop(ui.ctx());
 
         ui.label(
@@ -1208,7 +1272,13 @@ impl SvsGui {
                 .color(theme::TEXT_SECONDARY),
         );
         ui.add_space(14.0);
+        self.output_directory_field(parent, ui, drop_target);
+        ui.add_space(12.0);
+        self.quality_selector(ui);
+    }
 
+    /// Output directory text field, its browse button and the drop hint.
+    fn output_directory_field(&mut self, parent: &Frame, ui: &mut egui::Ui, drop_target: bool) {
         ui.label(
             RichText::new("输出位置")
                 .strong()
@@ -1273,8 +1343,11 @@ impl SvsGui {
                 theme::TEXT_SECONDARY
             }),
         );
-        ui.add_space(12.0);
+    }
 
+    /// JPEG quality combo box, its hint and the overwrite toggle.
+    fn quality_selector(&mut self, ui: &mut egui::Ui) {
+        let quality_text = self.options.jpeg_quality.clone();
         ui.label(
             RichText::new("SVS 保存质量")
                 .strong()
