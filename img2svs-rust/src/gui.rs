@@ -574,6 +574,27 @@ fn empty_state(ui: &mut egui::Ui) {
         });
 }
 
+/// Slim progress track.
+///
+/// egui's own `ProgressBar` clamps its fill to at least one corner diameter,
+/// so at 0% it paints a stray rounded blob at the left end. Drawing the track
+/// here keeps the empty state clean and only paints a fill once there is
+/// progress.
+fn progress_bar(ui: &mut egui::Ui, fraction: f32, width: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 8.0), egui::Sense::hover());
+    let radius = CornerRadius::same(4);
+    let fraction = fraction.clamp(0.0, 1.0);
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, theme::SUNKEN);
+    if fraction > 0.0 {
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * fraction, rect.height())),
+            radius,
+            color,
+        );
+    }
+}
+
 /// Clamps a log line so the collapsed drawer header stays on one line.
 fn truncate(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
@@ -919,16 +940,15 @@ impl SvsGui {
                         .color(theme::TEXT_PRIMARY),
                 );
                 ui.add_space(10.0);
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .desired_width(200.0)
-                        .desired_height(8.0)
-                        .corner_radius(CornerRadius::same(4))
-                        .fill(if finished_with_failures {
-                            theme::WARNING
-                        } else {
-                            theme::PRIMARY
-                        }),
+                progress_bar(
+                    ui,
+                    fraction,
+                    200.0,
+                    if finished_with_failures {
+                        theme::WARNING
+                    } else {
+                        theme::PRIMARY
+                    },
                 );
             });
         });
