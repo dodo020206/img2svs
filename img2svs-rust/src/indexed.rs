@@ -83,7 +83,7 @@ fn parse_csp(path: &Path) -> Result<Slide> {
             };
             let x = u32_at(&tail, position + 24)?;
             let y = u32_at(&tail, position + 28)?;
-            validate_range(data, file_size, "CSP tile")?;
+            data.validate(file_size, "CSP tile")?;
             entries
                 .entry((x, y))
                 .or_insert((data, tile_width, tile_height));
@@ -101,10 +101,7 @@ fn parse_csp(path: &Path) -> Result<Slide> {
                 let x = col * 256;
                 let y = row * 256;
                 let (data, _tile_width, _tile_height) = entries.get(&(x, y)).copied().unwrap_or((
-                    ByteRange {
-                        offset: 0,
-                        length: 0,
-                    },
+                    ByteRange::EMPTY,
                     (width - x).min(256),
                     (height - y).min(256),
                 ));
@@ -167,7 +164,7 @@ fn parse_csp_associated(
             offset: stream_start + offset,
             length,
         };
-        validate_range(data, file_size, "CSP associated image")?;
+        data.validate(file_size, "CSP associated image")?;
         images.push((width, height, data));
         if images.len() == 3 {
             break;
@@ -298,7 +295,7 @@ fn parse_kfb(path: &Path) -> Result<Slide> {
             offset: absolute as u64,
             length: length as u64,
         };
-        validate_range(data, file_size, "KFB tile")?;
+        data.validate(file_size, "KFB tile")?;
         levels[index].tiles.push(data);
         levels[index].tile_positions.push(TilePlacement {
             x: x as u32,
@@ -399,7 +396,7 @@ fn read_kfb_embedded(
         offset: offset + 52,
         length: length as u64,
     };
-    validate_range(data, file_size, "KFB embedded image")?;
+    data.validate(file_size, "KFB embedded image")?;
     Ok((width as u32, height as u32, data))
 }
 
@@ -461,7 +458,7 @@ fn parse_mdsx(path: &Path) -> Result<Slide> {
             let offset = reader.u32()? as u64;
             let length = reader.u32()? as u64;
             let data = ByteRange { offset, length };
-            validate_range(data, reader.len(), "MDSX tile")?;
+            data.validate(reader.len(), "MDSX tile")?;
             let row = tile_index / cols as u64;
             let col = tile_index % cols as u64;
             let x = (col as u32) * matrix.tile_width;
@@ -721,13 +718,6 @@ fn first_int(values: [Option<&String>; 2]) -> Option<i32> {
         .into_iter()
         .flatten()
         .find_map(|value| value.parse().ok())
-}
-
-fn validate_range(data: ByteRange, file_size: u64, context: &str) -> Result<()> {
-    if !data.present() || data.offset >= file_size || data.length > file_size - data.offset {
-        bail!("invalid byte range for {context}");
-    }
-    Ok(())
 }
 
 fn u32_at(data: &[u8], offset: usize) -> Result<u32> {
