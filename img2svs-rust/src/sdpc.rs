@@ -32,18 +32,30 @@ const PERSON_INFO_TAIL_SIZE: usize = 4 + 4 + 256;
 /// Reserved bytes between a picture-info next-offset and the next block.
 const PIC_INFO_TAIL_SIZE: usize = 8 + 4 + 4 + 1 + 63;
 
+/// Width of the size field that follows a block's flag.
+const BLOCK_SIZE_FIELD_SIZE: usize = 4;
+/// Reserved sub-fields of the picture header, in file order.
+const PIC_HEAD_FILE_SIZE_SIZE: usize = 8;
+const PIC_HEAD_RESERVED_SIZE: usize = 4;
+const PIC_HEAD_BYTE_RESERVED_SIZE: usize = 1;
+const PIC_HEAD_OFFSET_SIZE: usize = 8;
+/// Reserved sub-field of a picture-info block ahead of the tile counts.
+const PIC_INFO_LAYER_FIELD_SIZE: usize = 4;
+/// Tolerance when checking that a level scale is an exact reciprocal.
+const SCALE_EPSILON: f32 = 1e-5;
+
 /// Fixed fields of a macrograph block, in file order.
-const MACROGRAPH_FLAG_SIZE: u64 = 2;
-const MACROGRAPH_RGB_SIZE: u64 = 8;
-const MACROGRAPH_DIMENSIONS_SIZE: u64 = 8;
-const MACROGRAPH_METADATA_SIZE: u64 = 16;
-const MACROGRAPH_ENCODED_SIZE_FIELD: u64 = 8;
-const MACROGRAPH_STREAM_MARKER_SIZE: u64 = 1;
-const MACROGRAPH_NEXT_OFFSET_FIELD: u64 = 8;
-const MACROGRAPH_TAIL_SIZE: u64 = 4 + 4 + 64;
+const MACROGRAPH_FLAG_SIZE: usize = 2;
+const MACROGRAPH_RGB_SIZE: usize = 8;
+const MACROGRAPH_DIMENSIONS_SIZE: usize = 8;
+const MACROGRAPH_METADATA_SIZE: usize = 16;
+const MACROGRAPH_ENCODED_SIZE_FIELD: usize = 8;
+const MACROGRAPH_STREAM_MARKER_SIZE: usize = 1;
+const MACROGRAPH_NEXT_OFFSET_FIELD: usize = 8;
+const MACROGRAPH_TAIL_SIZE: usize = 4 + 4 + 64;
 /// Offset of the payload inside a macrograph block, i.e. the sum of every fixed
 /// field that precedes it.
-const MACROGRAPH_DATA_OFFSET: u64 = MACROGRAPH_FLAG_SIZE
+const MACROGRAPH_DATA_OFFSET: usize = MACROGRAPH_FLAG_SIZE
     + MACROGRAPH_RGB_SIZE
     + MACROGRAPH_DIMENSIONS_SIZE
     + MACROGRAPH_METADATA_SIZE
@@ -95,7 +107,7 @@ fn read_person_info(reader: &mut Reader, head_size: u64) -> Result<u64> {
     if reader.u16()? != PERSON_INFO_FLAG {
         bail!("unsupported SDPC person-info block");
     }
-    reader.skip(4, "SDPC person-info size")?;
+    reader.skip(BLOCK_SIZE_FIELD_SIZE, "SDPC person-info size")?;
     reader.skip(PERSON_INFO_HEADER_SIZE, "SDPC person-info")?;
     let next = reader.u64()?;
     reader.skip(PERSON_INFO_TAIL_SIZE, "SDPC person-info tail")?;
@@ -122,25 +134,19 @@ fn read_macrographs(reader: &mut Reader, count: u32, start: u64) -> Result<Macro
         if reader.u16()? != MACROGRAPH_INFO_FLAG {
             bail!("unsupported SDPC macrograph block");
         }
-        reader.skip(MACROGRAPH_RGB_SIZE as usize, "SDPC macrograph rgb")?;
-        reader.skip(
-            MACROGRAPH_DIMENSIONS_SIZE as usize,
-            "SDPC macrograph dimensions",
-        )?;
-        reader.skip(
-            MACROGRAPH_METADATA_SIZE as usize,
-            "SDPC macrograph metadata",
-        )?;
+        reader.skip(MACROGRAPH_RGB_SIZE, "SDPC macrograph rgb")?;
+        reader.skip(MACROGRAPH_DIMENSIONS_SIZE, "SDPC macrograph dimensions")?;
+        reader.skip(MACROGRAPH_METADATA_SIZE, "SDPC macrograph metadata")?;
         let encoded_size = reader.u64()?;
         reader.skip(
-            MACROGRAPH_STREAM_MARKER_SIZE as usize,
+            MACROGRAPH_STREAM_MARKER_SIZE,
             "SDPC macrograph stream marker",
         )?;
         let next = reader.u64()?;
-        reader.skip(MACROGRAPH_TAIL_SIZE as usize, "SDPC macrograph tail")?;
+        reader.skip(MACROGRAPH_TAIL_SIZE, "SDPC macrograph tail")?;
 
         let data = ByteRange {
-            offset: current + MACROGRAPH_DATA_OFFSET,
+            offset: current + MACROGRAPH_DATA_OFFSET as u64,
             length: encoded_size,
         };
         data.validate(reader.len(), "SDPC macrograph")?;
@@ -283,9 +289,9 @@ fn read_pic_head(reader: &mut Reader) -> Result<PicHead> {
     }
     reader.skip(PIC_HEAD_VERSION_SIZE, "SDPC version")?;
     let head_size = u64::from(reader.u32()?);
-    reader.skip(8, "SDPC file size")?;
+    reader.skip(PIC_HEAD_FILE_SIZE_SIZE, "SDPC file size")?;
     let macrograph_count = reader.u32()?;
-    reader.skip(4, "SDPC head reserved")?;
+    reader.skip(PIC_HEAD_RESERVED_SIZE, "SDPC head reserved")?;
     let hierarchy = reader.u32()?;
     let src_width = reader.u32()?;
     let src_height = reader.u32()?;
@@ -293,15 +299,15 @@ fn read_pic_head(reader: &mut Reader) -> Result<PicHead> {
     let tile_height = reader.u32()?;
     let thumbnail_width = reader.u32()?;
     let thumbnail_height = reader.u32()?;
-    reader.skip(1, "SDPC head reserved")?;
+    reader.skip(PIC_HEAD_BYTE_RESERVED_SIZE, "SDPC head reserved")?;
     let jpeg_quality = reader.u8()?;
-    reader.skip(1, "SDPC head reserved")?;
+    reader.skip(PIC_HEAD_BYTE_RESERVED_SIZE, "SDPC head reserved")?;
     reader.skip(PIC_HEAD_COLOR_FIELDS_SIZE, "SDPC color fields")?;
     let scale = reader.f32()?;
     let ruler = reader.f64()?;
     let rate = reader.u32()?;
-    reader.skip(8, "SDPC extra offset")?;
-    reader.skip(8, "SDPC tile offset")?;
+    reader.skip(PIC_HEAD_OFFSET_SIZE, "SDPC extra offset")?;
+    reader.skip(PIC_HEAD_OFFSET_SIZE, "SDPC tile offset")?;
     let slice_fmt = reader.u8()?;
     if scale <= 0.0 || ruler <= 0.0 || rate == 0 || tile_width == 0 || tile_height == 0 {
         bail!("invalid SDPC dimensions or metadata");
@@ -343,7 +349,7 @@ fn read_pic_info(reader: &mut Reader, offset: u64) -> Result<PicInfo> {
         bail!("unsupported SqPicInfo flag at {offset}");
     }
     let info_size = reader.u32()?;
-    reader.skip(4, "SDPC picture-info layer")?;
+    reader.skip(PIC_INFO_LAYER_FIELD_SIZE, "SDPC picture-info layer")?;
     let slice_num = reader.u32()?;
     let slice_num_x = reader.u32()?;
     let slice_num_y = reader.u32()?;
@@ -371,7 +377,7 @@ fn downsample_from_scale(scale: f32) -> Result<u32> {
         bail!("invalid SDPC level scale: {scale}");
     }
     let value = (1.0 / scale).round() as u32;
-    if value == 0 || ((scale * value as f32) - 1.0).abs() > 1e-5 {
+    if value == 0 || ((scale * value as f32) - 1.0).abs() > SCALE_EPSILON {
         bail!("unsupported non-integral SDPC level scale: {scale}");
     }
     Ok(value)

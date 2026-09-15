@@ -9,6 +9,9 @@ use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
+/// Size of the read-ahead buffer kept in front of the file handle.
+const READ_BUFFER_SIZE: usize = 256 * 1024;
+
 /// A buffered file handle with the scalar and random-access helpers the
 /// container parsers need.
 pub struct Reader {
@@ -22,7 +25,7 @@ impl Reader {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let len = file.metadata()?.len();
         Ok(Self {
-            file: BufReader::with_capacity(256 * 1024, file),
+            file: BufReader::with_capacity(READ_BUFFER_SIZE, file),
             len,
         })
     }
@@ -41,9 +44,7 @@ impl Reader {
     /// Reads exactly `count` bytes at the cursor.
     pub fn bytes(&mut self, count: usize, context: &str) -> Result<Vec<u8>> {
         let mut data = vec![0; count];
-        self.file
-            .read_exact(&mut data)
-            .with_context(|| format!("read {context}"))?;
+        self.read_exact(&mut data, context)?;
         Ok(data)
     }
 
@@ -109,10 +110,15 @@ impl Reader {
     /// Reads a fixed-size array without allocating.
     fn array<const N: usize>(&mut self, context: &str) -> Result<[u8; N]> {
         let mut data = [0; N];
-        self.file
-            .read_exact(&mut data)
-            .with_context(|| format!("read {context}"))?;
+        self.read_exact(&mut data, context)?;
         Ok(data)
+    }
+
+    /// Fills `data`, labelling the read with `context` on failure.
+    fn read_exact(&mut self, data: &mut [u8], context: &str) -> Result<()> {
+        self.file
+            .read_exact(data)
+            .with_context(|| format!("read {context}"))
     }
 }
 
