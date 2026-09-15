@@ -1,39 +1,66 @@
+//! Buffered little-endian reader shared by every vendor container parser.
+//!
+//! Container layouts are mostly fixed offsets, so the readers combine streaming
+//! scalar reads with explicit [`Reader::seek`] / [`Reader::range`] access. Every
+//! read takes a short `context` label that ends up in the error message, which
+//! is what makes a truncated or corrupt container diagnosable.
+
 use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
+/// Size of the read-ahead buffer kept in front of the file handle.
+const READ_BUFFER_SIZE: usize = 256 * 1024;
+
+/// A buffered file handle with the scalar and random-access helpers the
+/// container parsers need.
 pub struct Reader {
     file: BufReader<File>,
     len: u64,
 }
 
 impl Reader {
+    /// Opens `path` and remembers its size for range validation.
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let len = file.metadata()?.len();
         Ok(Self {
-            file: BufReader::with_capacity(256 * 1024, file),
+            file: BufReader::with_capacity(READ_BUFFER_SIZE, file),
             len,
         })
     }
 
+    /// Total size of the underlying file in bytes.
     pub fn len(&self) -> u64 {
         self.len
     }
 
+    /// Positions the cursor at an absolute byte `offset`.
     pub fn seek(&mut self, offset: u64) -> Result<()> {
         self.file.seek(SeekFrom::Start(offset))?;
         Ok(())
     }
 
+    /// Reads exactly `count` bytes at the cursor.
     pub fn bytes(&mut self, count: usize, context: &str) -> Result<Vec<u8>> {
         let mut data = vec![0; count];
-        self.file
-            .read_exact(&mut data)
-            .with_context(|| format!("read {context}"))?;
+        self.read_exact(&mut data, context)?;
         Ok(data)
     }
 
+    /// Advances the cursor over `count` bytes that carry no usable data.
+    ///
+    /// Container headers interleave length-reserved fields we ignore; skipping
+    /// them by name keeps the surrounding offsets readable. Reads through the
+    /// buffer on purpose so that a truncated file still fails immediately.
+    pub fn skip(&mut self, count: usize, context: &str) -> Result<()> {
+        self.bytes(count, context).map(|_| ())
+    }
+
+    /// Reads `length` bytes located at absolute `offset`.
+    ///
+    /// Unlike [`Reader::bytes`] this rejects ranges that fall outside the file,
+    /// so callers can use it directly on offsets taken from an index.
     pub fn range(&mut self, offset: u64, length: u64, context: &str) -> Result<Vec<u8>> {
         if offset == 0 || length == 0 || offset >= self.len || length > self.len - offset {
             bail!("invalid byte range for {context}: offset={offset}, length={length}");
@@ -45,40 +72,53 @@ impl Reader {
         )
     }
 
+    /// Reads one unsigned byte at the cursor.
     pub fn u8(&mut self) -> Result<u8> {
         Ok(self.array::<1>("u8")?[0])
     }
 
+    /// Reads a little-endian `u16` at the cursor.
     pub fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.array("u16")?))
     }
 
+    /// Reads a little-endian `i32` at the cursor.
     pub fn i32(&mut self) -> Result<i32> {
         Ok(i32::from_le_bytes(self.array("i32")?))
     }
 
+    /// Reads a little-endian `u32` at the cursor.
     pub fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.array("u32")?))
     }
 
+    /// Reads a little-endian `u64` at the cursor.
     pub fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.array("u64")?))
     }
 
+    /// Reads a little-endian `f32` at the cursor.
     pub fn f32(&mut self) -> Result<f32> {
         Ok(f32::from_le_bytes(self.array("f32")?))
     }
 
+    /// Reads a little-endian `f64` at the cursor.
     pub fn f64(&mut self) -> Result<f64> {
         Ok(f64::from_le_bytes(self.array("f64")?))
     }
 
+    /// Reads a fixed-size array without allocating.
     fn array<const N: usize>(&mut self, context: &str) -> Result<[u8; N]> {
         let mut data = [0; N];
-        self.file
-            .read_exact(&mut data)
-            .with_context(|| format!("read {context}"))?;
+        self.read_exact(&mut data, context)?;
         Ok(data)
+    }
+
+    /// Fills `data`, labelling the read with `context` on failure.
+    fn read_exact(&mut self, data: &mut [u8], context: &str) -> Result<()> {
+        self.file
+            .read_exact(data)
+            .with_context(|| format!("read {context}"))
     }
 }
 

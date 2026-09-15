@@ -100,6 +100,53 @@ pub struct Decoder {
     codec_context: *mut CodecContext,
 }
 
+/// Owns the FFmpeg packet and frame used by one [`Decoder::decode`] call.
+///
+/// Both handles are released on drop, so the error paths inside `decode` no
+/// longer repeat the packet/frame cleanup calls.
+struct DecodeBuffers<'a> {
+    decoder: &'a Decoder,
+    packet: *mut Packet,
+    frame: *mut FramePrefix,
+}
+
+impl<'a> DecodeBuffers<'a> {
+    /// Allocates a packet and a frame, failing when FFmpeg returns null.
+    ///
+    /// A partially failed allocation still releases whichever handle was
+    /// created, because the returned error drops `self`.
+    unsafe fn allocate(decoder: &'a Decoder) -> Result<Self> {
+        let buffers = Self {
+            decoder,
+            packet: (decoder.packet_alloc)(),
+            frame: (decoder.frame_alloc)(),
+        };
+        if buffers.packet.is_null() || buffers.frame.is_null() {
+            bail!("FFmpeg packet/frame allocation failed");
+        }
+        Ok(buffers)
+    }
+}
+
+impl Drop for DecodeBuffers<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.packet.is_null() {
+                (self.decoder.packet_unref)(self.packet);
+                let mut packet = self.packet;
+                (self.decoder.packet_free)(&mut packet);
+                self.packet = ptr::null_mut();
+            }
+            if !self.frame.is_null() {
+                (self.decoder.frame_unref)(self.frame);
+                let mut frame = self.frame;
+                (self.decoder.frame_free)(&mut frame);
+                self.frame = ptr::null_mut();
+            }
+        }
+    }
+}
+
 impl Decoder {
     pub fn new() -> Result<Self> {
         let directory = locate_ffmpeg_dir().context(
@@ -164,56 +211,26 @@ impl Decoder {
         }
         let size = c_int::try_from(data.len()).context("HEVC tile exceeds FFmpeg packet size")?;
         unsafe {
-            let packet = (self.packet_alloc)();
-            let frame = (self.frame_alloc)();
-            if packet.is_null() || frame.is_null() {
-                let mut packet = packet;
-                let mut frame = frame;
-                if !packet.is_null() {
-                    (self.packet_free)(&mut packet);
-                }
-                if !frame.is_null() {
-                    (self.frame_free)(&mut frame);
-                }
-                bail!("FFmpeg packet/frame allocation failed");
-            }
+            let buffers = DecodeBuffers::allocate(self)?;
             let raw = (self.av_malloc)(data.len());
             if raw.is_null() {
-                let mut packet = packet;
-                let mut frame = frame;
-                (self.packet_free)(&mut packet);
-                (self.frame_free)(&mut frame);
                 bail!("FFmpeg packet allocation failed");
             }
             ptr::copy_nonoverlapping(data.as_ptr(), raw, data.len());
-            let result = (self.packet_from_data)(packet, raw, size);
+            let result = (self.packet_from_data)(buffers.packet, raw, size);
             if result < 0 {
                 (self.av_free)(raw.cast());
-                let mut packet = packet;
-                let mut frame = frame;
-                (self.packet_free)(&mut packet);
-                (self.frame_free)(&mut frame);
                 bail!("av_packet_from_data failed with error {result}");
             }
-            let send = (self.send_packet)(self.codec_context, packet);
+            let send = (self.send_packet)(self.codec_context, buffers.packet);
             if send < 0 {
-                (self.packet_unref)(packet);
-                let mut packet = packet;
-                let mut frame = frame;
-                (self.packet_free)(&mut packet);
-                (self.frame_free)(&mut frame);
                 bail!("avcodec_send_packet failed with error {send}");
             }
-            let receive = (self.receive_frame)(self.codec_context, frame);
+            let receive = (self.receive_frame)(self.codec_context, buffers.frame);
             if receive < 0 {
-                (self.packet_unref)(packet);
-                let mut packet = packet;
-                let mut frame = frame;
-                (self.packet_free)(&mut packet);
-                (self.frame_free)(&mut frame);
                 bail!("HEVC tile did not decode to a frame (error {receive})");
             }
-            let prefix = &*frame;
+            let prefix = &*buffers.frame;
             let source_width = u32::try_from(prefix.width).context("invalid HEVC frame width")?;
             let source_height =
                 u32::try_from(prefix.height).context("invalid HEVC frame height")?;
@@ -270,12 +287,6 @@ impl Decoder {
                     result.put_pixel(x, y, *source.get_pixel(x, y));
                 }
             }
-            (self.packet_unref)(packet);
-            let mut packet = packet;
-            let mut frame = frame;
-            (self.packet_free)(&mut packet);
-            (self.frame_unref)(frame);
-            (self.frame_free)(&mut frame);
             (self.flush_buffers)(self.codec_context);
             Ok(result)
         }
