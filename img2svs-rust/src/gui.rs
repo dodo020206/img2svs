@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Instant;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "csp", "dmetrix", "kfb", "mdsx", "msdx", "mrxs", "ndpi", "sdpc", "dyqx",
+    "csp", "dmetrix", "kfb", "mdsx", "msdx", "mrxs", "ndpi", "tif", "tiff", "sdpc", "dyqx",
 ];
 
 /// Design tokens for the view layer.
@@ -1244,8 +1244,8 @@ impl SvsGui {
             ui.add_space(10.0);
             for row in [
                 &["CSP", "KFB", "MDSX", "MRXS"][..],
-                &["NDPI", "DMETRIX", "SDPC"][..],
-                &["MSDX", "DYQX"][..],
+                &["NDPI", "TIFF", "DMETRIX", "SDPC"][..],
+                &["DYQX", "MSDX"][..],
             ] {
                 ui.horizontal(|ui| {
                     for name in row {
@@ -1416,7 +1416,7 @@ fn convert_one(
         "dmetrix" => dmetrix::parse(&input)?,
         "sdpc" | "dyqx" => sdpc::parse(&input)?,
         "csp" | "kfb" | "mdsx" | "msdx" => indexed::parse(&input)?,
-        "ndpi" | "mrxs" => {
+        "ndpi" | "mrxs" | "tif" | "tiff" => {
             let selected_quality = quality.unwrap_or(75);
             vips::convert(&input, output, selected_quality, overwrite)?;
             return Ok(output.to_path_buf());
@@ -1517,7 +1517,7 @@ fn normalize_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{output_path_for, plan_jobs};
+    use super::{is_supported, output_path_for, plan_jobs};
     use std::path::Path;
 
     #[test]
@@ -1548,5 +1548,11 @@ mod tests {
             output_path_for(input, None),
             Path::new(r"C:\slides\nested\sample.svs")
         );
+    }
+
+    #[test]
+    fn tiff_extensions_are_supported_case_insensitively() {
+        assert!(is_supported(Path::new(r"C:\slides\sample.tif")));
+        assert!(is_supported(Path::new(r"C:\slides\sample.TIFF")));
     }
 }
