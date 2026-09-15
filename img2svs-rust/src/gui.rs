@@ -577,35 +577,6 @@ fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn lerp_color(from: Color32, to: Color32, t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-    Color32::from_rgb(
-        mix(from.r(), to.r()),
-        mix(from.g(), to.g()),
-        mix(from.b(), to.b()),
-    )
-}
-
-/// Paints the 3px brand accent that separates the header from the workspace.
-fn paint_accent(ui: &mut egui::Ui) {
-    let rect = ui.max_rect();
-    let painter = ui.painter();
-    const STEPS: usize = 64;
-    for index in 0..STEPS {
-        let t0 = index as f32 / STEPS as f32;
-        let t1 = (index + 1) as f32 / STEPS as f32;
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(rect.left() + rect.width() * t0, rect.top()),
-                egui::pos2(rect.left() + rect.width() * t1, rect.bottom()),
-            ),
-            CornerRadius::ZERO,
-            lerp_color(theme::PRIMARY, theme::PRIMARY_HOVER, t0),
-        );
-    }
-}
-
 fn install_windows_font(ctx: &egui::Context) {
     #[cfg(target_os = "windows")]
     {
@@ -660,11 +631,12 @@ impl App for SvsGui {
             )
             .show(ctx, |ui| self.header(ui));
 
-        egui::TopBottomPanel::top("header_accent")
+        // Hairline under the top bar, using the same colour as the card borders.
+        egui::TopBottomPanel::top("header_border")
             .show_separator_line(false)
-            .exact_height(3.0)
-            .frame(egui::Frame::new())
-            .show(ctx, |ui| paint_accent(ui));
+            .exact_height(1.0)
+            .frame(egui::Frame::new().fill(theme::BORDER_SUBTLE))
+            .show(ctx, |_ui| {});
 
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(54.0)
