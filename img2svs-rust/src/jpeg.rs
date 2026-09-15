@@ -18,6 +18,9 @@ const RAW_TO_JPEG_SIZE_DIVISOR: usize = 8;
 /// Lower bound for pre-allocated JPEG output buffers.
 const MIN_JPEG_BUFFER: usize = 1024;
 
+/// Start-of-image marker that opens every JPEG stream.
+pub const SOI_MARKER: [u8; 2] = [0xff, 0xd8];
+
 /// Decodes a JPEG buffer into a freshly allocated RGB image.
 pub fn decode_rgb(data: &[u8]) -> Result<RgbImage> {
     Ok(image::load_from_memory_with_format(data, ImageFormat::Jpeg)

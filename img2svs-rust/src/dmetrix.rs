@@ -6,7 +6,7 @@
 //! so `parse` walks them in reverse to recover the real image size.
 
 use crate::binary::Reader;
-use crate::jpeg::decode_image;
+use crate::jpeg::{decode_image, SOI_MARKER};
 use crate::model::{AssociatedImage, ByteRange, Compression, Level, Metadata, Slide};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -31,6 +31,8 @@ const MACRO_ID: u16 = 0xfffe;
 const DEFAULT_JPEG_QUALITY: u8 = 75;
 const MIN_TILE_SIZE: u32 = 16;
 const MAX_TILE_SIZE: u32 = 4096;
+/// Width of the reserved fields inside an associated-image record.
+const ASSOCIATED_RESERVED_SIZE: usize = 4;
 
 /// One pyramid level as described by the descriptor table.
 #[derive(Clone, Copy, Debug)]
@@ -39,6 +41,33 @@ struct Descriptor {
     max_x: u32,
     max_y: u32,
     index_offset: u64,
+}
+
+impl Descriptor {
+    /// Number of tile columns, i.e. the largest x index plus one.
+    fn cols(&self) -> u32 {
+        self.max_x + 1
+    }
+
+    /// Number of tile rows, i.e. the largest y index plus one.
+    fn rows(&self) -> u32 {
+        self.max_y + 1
+    }
+
+    /// Total number of tiles in the level's grid.
+    fn tile_count(&self) -> Option<u32> {
+        self.cols().checked_mul(self.rows())
+    }
+
+    /// Whether `(x, y)` addresses a tile inside the level's grid.
+    fn contains(&self, x: u32, y: u32) -> bool {
+        x <= self.max_x && y <= self.max_y
+    }
+
+    /// Row-major position of the tile at `(x, y)` inside the level's index.
+    fn slot(&self, x: u32, y: u32) -> usize {
+        (y * self.cols() + x) as usize
+    }
 }
 
 /// The scan geometry read from the fixed header.
@@ -129,7 +158,7 @@ fn build_levels(
     let mut levels = Vec::with_capacity(descriptors.len());
     for (index, (descriptor, tiles)) in descriptors.iter().zip(raw_levels.iter()).rev().enumerate()
     {
-        let edge = tiles[(descriptor.max_y * (descriptor.max_x + 1) + descriptor.max_x) as usize];
+        let edge = tiles[descriptor.slot(descriptor.max_x, descriptor.max_y)];
         let image = decode_image(&reader.range(edge.offset, edge.length, "DMetrix edge tile")?)?;
         if image.width() == 0
             || image.width() > tile_size
@@ -146,8 +175,8 @@ fn build_levels(
             width: descriptor.max_x * tile_size + image.width(),
             height: descriptor.max_y * tile_size + image.height(),
             downsample: 2f64.powi(index as i32),
-            tile_cols: descriptor.max_x + 1,
-            tile_rows: descriptor.max_y + 1,
+            tile_cols: descriptor.cols(),
+            tile_rows: descriptor.rows(),
             tiles: tiles.clone(),
             tile_positions: Vec::new(),
             tile_groups: Vec::new(),
@@ -203,8 +232,8 @@ fn read_associated(
     let mut macro_image = None;
     for _ in 0..ASSOCIATED_IMAGE_RECORDS {
         let id = reader.u16()?;
-        let _ = reader.u32()?;
-        let _ = reader.u32()?;
+        reader.skip(ASSOCIATED_RESERVED_SIZE, "DMetrix associated reserved")?;
+        reader.skip(ASSOCIATED_RESERVED_SIZE, "DMetrix associated reserved")?;
         let offset = reader.u64()?;
         let length = reader.u32()? as u64;
         let data = ByteRange { offset, length };
@@ -235,16 +264,14 @@ fn read_tile_indexes(
     let mut result = Vec::with_capacity(descriptors.len());
     for descriptor in descriptors {
         reader.seek(descriptor.index_offset)?;
-        let count = (descriptor.max_x + 1)
-            .checked_mul(descriptor.max_y + 1)
-            .context("DMetrix tile count overflow")?;
-        let mut tiles = vec![ByteRange::EMPTY; count as usize];
-        let mut seen = vec![false; count as usize];
+        let count = descriptor
+            .tile_count()
+            .context("DMetrix tile count overflow")? as usize;
+        let mut tiles = vec![ByteRange::EMPTY; count];
+        let mut seen = vec![false; count];
         for _ in 0..count {
             let record = read_tile_record(reader)?;
-            if record.source_id != descriptor.source_id
-                || record.x > descriptor.max_x
-                || record.y > descriptor.max_y
+            if record.source_id != descriptor.source_id || !descriptor.contains(record.x, record.y)
             {
                 bail!(
                     "invalid DMetrix tile record in level {}",
@@ -252,7 +279,7 @@ fn read_tile_indexes(
                 );
             }
             record.data.validate(file_size, "DMetrix level tile")?;
-            let slot = (record.y * (descriptor.max_x + 1) + record.x) as usize;
+            let slot = descriptor.slot(record.x, record.y);
             if seen[slot] {
                 bail!(
                     "duplicate DMetrix tile coordinate ({}, {})",
@@ -323,7 +350,7 @@ fn estimate_quality(reader: &mut Reader, range: ByteRange) -> Option<u8> {
 
 /// Whether `data` starts with the JPEG start-of-image marker.
 fn is_jpeg(data: &[u8]) -> bool {
-    data.len() >= 2 && data[0..2] == [0xff, 0xd8]
+    data.starts_with(&SOI_MARKER)
 }
 
 /// First tile of the smallest pyramid level.
