@@ -18,6 +18,11 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     "csp", "dmetrix", "kfb", "mdsx", "msdx", "mrxs", "ndpi", "tif", "tiff", "sdpc", "dyqx",
 ];
 
+/// Display names for the format strip in the header.
+const FORMAT_LABELS: &[&str] = &[
+    "CSP", "DMETRIX", "KFB", "MDSX", "MSDX", "MRXS", "NDPI", "TIF/TIFF", "SDPC", "DYQX",
+];
+
 /// Design tokens for the view layer.
 ///
 /// Every colour, radius, margin and size used by the GUI lives here so the
@@ -617,26 +622,17 @@ impl App for SvsGui {
         self.handle_dropped_files(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
+        // The top bar is painted as a card inside this panel, so it gets the
+        // same four rounded corners and page margin as the workspace cards.
         egui::TopBottomPanel::top("header")
             .show_separator_line(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::SURFACE)
-                    .inner_margin(Margin {
-                        left: 20,
-                        right: 20,
-                        top: 14,
-                        bottom: 14,
-                    }),
-            )
+            .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin {
+                left: 20,
+                right: 20,
+                top: 18,
+                bottom: 0,
+            }))
             .show(ctx, |ui| self.header(ui));
-
-        // Hairline under the top bar, using the same colour as the card borders.
-        egui::TopBottomPanel::top("header_border")
-            .show_separator_line(false)
-            .exact_height(1.0)
-            .frame(egui::Frame::new().fill(theme::BORDER_SUBTLE))
-            .show(ctx, |_ui| {});
 
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(54.0)
@@ -711,69 +707,89 @@ impl SvsGui {
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            egui::Frame::new()
-                .fill(theme::PRIMARY)
-                .corner_radius(CornerRadius::same(10))
-                .inner_margin(Margin::symmetric(12, 7))
-                .show(ui, |ui| {
+        // A card like the workspace panels, so all four corners are rounded
+        // instead of running to the window edges.
+        card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                egui::Frame::new()
+                    .fill(theme::PRIMARY)
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::symmetric(12, 7))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("SVS")
+                                .strong()
+                                .size(17.0)
+                                .color(Color32::WHITE),
+                        );
+                    });
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
                     ui.label(
-                        RichText::new("SVS")
+                        RichText::new("病理图像转 SVS 工具")
                             .strong()
-                            .size(17.0)
-                            .color(Color32::WHITE),
+                            .size(19.0)
+                            .color(theme::TEXT_PRIMARY),
+                    );
+                    ui.label(
+                        RichText::new("把常见数字病理切片批量转换为兼容性更好的 SVS")
+                            .size(13.0)
+                            .color(theme::TEXT_SECONDARY),
                     );
                 });
-            ui.add_space(6.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let stop_enabled = self.running;
+                    let stop = if stop_enabled {
+                        egui::Button::new(
+                            RichText::new("停止").size(15.0).color(theme::TEXT_PRIMARY),
+                        )
+                        .fill(theme::SURFACE)
+                    } else {
+                        egui::Button::new(
+                            RichText::new("停止").size(15.0).color(theme::TEXT_DISABLED),
+                        )
+                        .fill(theme::SUNKEN)
+                    }
+                    .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+                    .min_size(Vec2::new(96.0, 40.0));
+                    if ui.add_enabled(stop_enabled, stop).clicked() {
+                        self.stop();
+                    }
+
+                    let start_enabled = !self.running;
+                    let start = if start_enabled {
+                        egui::Button::new(
+                            RichText::new("开始转换  F5")
+                                .size(15.0)
+                                .color(Color32::WHITE),
+                        )
+                        .fill(theme::PRIMARY)
+                    } else {
+                        egui::Button::new(
+                            RichText::new("开始转换  F5")
+                                .size(15.0)
+                                .color(theme::TEXT_DISABLED),
+                        )
+                        .fill(theme::SUNKEN)
+                    }
+                    .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+                    .min_size(Vec2::new(150.0, 40.0));
+                    if ui.add_enabled(start_enabled, start).clicked() {
+                        self.start();
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("病理图像转 SVS 工具")
-                        .strong()
-                        .size(19.0)
-                        .color(theme::TEXT_PRIMARY),
-                );
-                ui.label(
-                    RichText::new("把常见数字病理切片批量转换为兼容性更好的 SVS")
-                        .size(13.0)
+                    RichText::new("支持格式")
+                        .size(12.0)
                         .color(theme::TEXT_SECONDARY),
                 );
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let stop_enabled = self.running;
-                let stop = if stop_enabled {
-                    egui::Button::new(RichText::new("停止").size(15.0).color(theme::TEXT_PRIMARY))
-                        .fill(theme::SURFACE)
-                } else {
-                    egui::Button::new(RichText::new("停止").size(15.0).color(theme::TEXT_DISABLED))
-                        .fill(theme::SUNKEN)
-                }
-                .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
-                .min_size(Vec2::new(96.0, 40.0));
-                if ui.add_enabled(stop_enabled, stop).clicked() {
-                    self.stop();
-                }
-
-                let start_enabled = !self.running;
-                let start = if start_enabled {
-                    egui::Button::new(
-                        RichText::new("开始转换  F5")
-                            .size(15.0)
-                            .color(Color32::WHITE),
-                    )
-                    .fill(theme::PRIMARY)
-                } else {
-                    egui::Button::new(
-                        RichText::new("开始转换  F5")
-                            .size(15.0)
-                            .color(theme::TEXT_DISABLED),
-                    )
-                    .fill(theme::SUNKEN)
-                }
-                .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
-                .min_size(Vec2::new(150.0, 40.0));
-                if ui.add_enabled(start_enabled, start).clicked() {
-                    self.start();
+                ui.add_space(2.0);
+                for label in FORMAT_LABELS {
+                    chip(ui, *label, theme::TEXT_SECONDARY, theme::SUNKEN);
                 }
             });
         });
@@ -1202,62 +1218,6 @@ impl SvsGui {
                 &mut self.options.overwrite,
                 RichText::new("覆盖已存在的 SVS").size(14.0),
             );
-        });
-
-        ui.add_space(16.0);
-
-        card().show(ui, |ui| {
-            ui.label(
-                RichText::new("支持格式")
-                    .strong()
-                    .size(14.0)
-                    .color(theme::TEXT_PRIMARY),
-            );
-            ui.add_space(10.0);
-            for row in [
-                &["CSP", "KFB", "MDSX", "MRXS"][..],
-                &["NDPI", "TIFF", "DMETRIX", "SDPC"][..],
-                &["DYQX", "MSDX"][..],
-            ] {
-                ui.horizontal(|ui| {
-                    for name in row {
-                        chip(ui, *name, theme::TEXT_SECONDARY, theme::SUNKEN);
-                    }
-                });
-                ui.add_space(4.0);
-            }
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(12.0);
-            ui.label(
-                RichText::new("快捷键")
-                    .strong()
-                    .size(14.0)
-                    .color(theme::TEXT_PRIMARY),
-            );
-            ui.add_space(6.0);
-            for (keys, description) in [
-                ("Ctrl+O", "添加文件"),
-                ("Ctrl+Shift+O", "添加目录"),
-                ("F5", "开始转换"),
-                ("Esc", "停止队列"),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(keys)
-                            .monospace()
-                            .size(12.0)
-                            .color(theme::PRIMARY),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(description)
-                                .size(12.0)
-                                .color(theme::TEXT_SECONDARY),
-                        );
-                    });
-                });
-            }
         });
     }
 
