@@ -7,3 +7,4 @@
 /test_data/
 /.verify/
 /.baseline-img2svs-rust.exe
+/test-output/
