@@ -287,23 +287,24 @@ impl SvsGui {
         }
     }
 
-    fn choose_files(&mut self) {
+    fn choose_files(&mut self, parent: &Frame) {
         if let Some(paths) = FileDialog::new()
             .add_filter("Whole-slide files", SUPPORTED_EXTENSIONS)
+            .set_parent(parent)
             .pick_files()
         {
             self.add_paths(paths);
         }
     }
 
-    fn choose_folder(&mut self) {
-        if let Some(path) = FileDialog::new().pick_folder() {
+    fn choose_folder(&mut self, parent: &Frame) {
+        if let Some(path) = FileDialog::new().set_parent(parent).pick_folder() {
             self.add_paths([path]);
         }
     }
 
-    fn choose_output(&mut self) {
-        if let Some(path) = FileDialog::new().pick_folder() {
+    fn choose_output(&mut self, parent: &Frame) {
+        if let Some(path) = FileDialog::new().set_parent(parent).pick_folder() {
             self.options.output_dir = path.display().to_string();
         }
     }
@@ -636,13 +637,16 @@ fn install_windows_font(ctx: &egui::Context) {
 }
 
 impl App for SvsGui {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut Frame) {
         self.receive_events();
         if self.smoke_test {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        self.handle_shortcuts(ctx);
+        // The native file dialogs need an owner window. Without one Windows
+        // gives them their own taskbar button and they are not modal to us.
+        let window: &Frame = frame;
+        self.handle_shortcuts(window, ctx);
         self.handle_dropped_files(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
@@ -689,12 +693,12 @@ impl App for SvsGui {
                     .fill(theme::CANVAS)
                     .inner_margin(Margin::ZERO),
             )
-            .show(ctx, |ui| self.workspace(ui));
+            .show(ctx, |ui| self.workspace(window, ui));
     }
 }
 
 impl SvsGui {
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+    fn handle_shortcuts(&mut self, parent: &Frame, ctx: &egui::Context) {
         let (f5, escape, ctrl_o, ctrl_shift_o) = ctx.input(|input| {
             (
                 input.key_pressed(egui::Key::F5),
@@ -710,9 +714,9 @@ impl SvsGui {
             self.stop();
         }
         if ctrl_shift_o {
-            self.choose_folder();
+            self.choose_folder(parent);
         } else if ctrl_o {
-            self.choose_files();
+            self.choose_files(parent);
         }
     }
 
@@ -854,7 +858,7 @@ impl SvsGui {
     }
 
     /// Queue on the left (flexible) and the fixed-width settings rail on the right.
-    fn workspace(&mut self, ui: &mut egui::Ui) {
+    fn workspace(&mut self, parent: &Frame, ui: &mut egui::Ui) {
         egui::SidePanel::right("settings_rail")
             .resizable(false)
             .show_separator_line(false)
@@ -864,7 +868,7 @@ impl SvsGui {
                     .fill(theme::CANVAS)
                     .inner_margin(theme::RAIL_MARGIN),
             )
-            .show_inside(ui, |ui| self.settings(ui));
+            .show_inside(ui, |ui| self.settings(parent, ui));
 
         egui::CentralPanel::default()
             .frame(
@@ -872,7 +876,7 @@ impl SvsGui {
                     .fill(theme::CANVAS)
                     .inner_margin(theme::QUEUE_MARGIN),
             )
-            .show_inside(ui, |ui| self.sources(ui));
+            .show_inside(ui, |ui| self.sources(parent, ui));
     }
 
     /// Slim strip holding the progress bar, live counters and the latest status.
@@ -954,7 +958,7 @@ impl SvsGui {
         });
     }
 
-    fn sources(&mut self, ui: &mut egui::Ui) {
+    fn sources(&mut self, parent: &Frame, ui: &mut egui::Ui) {
         let item_count = self.items.len();
         let can_modify = !self.running;
         let can_clear = can_modify && item_count > 0;
@@ -993,7 +997,7 @@ impl SvsGui {
                         )
                         .clicked()
                     {
-                        self.choose_folder();
+                        self.choose_folder(parent);
                     }
                     if ui
                         .add_enabled(
@@ -1005,7 +1009,7 @@ impl SvsGui {
                         )
                         .clicked()
                     {
-                        self.choose_files();
+                        self.choose_files(parent);
                     }
                 });
             });
@@ -1171,18 +1175,18 @@ impl SvsGui {
         });
     }
 
-    fn settings(&mut self, ui: &mut egui::Ui) {
+    fn settings(&mut self, parent: &Frame, ui: &mut egui::Ui) {
         // The card fills the rail and scrolls internally, so the settings card
         // always matches the height of the queue card while resizing.
         card().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("settings_scroll")
                 .auto_shrink([false, false])
-                .show(ui, |ui| self.settings_content(ui));
+                .show(ui, |ui| self.settings_content(parent, ui));
         });
     }
 
-    fn settings_content(&mut self, ui: &mut egui::Ui) {
+    fn settings_content(&mut self, parent: &Frame, ui: &mut egui::Ui) {
         let quality_text = self.options.jpeg_quality.clone();
         let drop_target = self.output_field_accepts_drop(ui.ctx());
 
@@ -1247,7 +1251,7 @@ impl SvsGui {
                 .add_sized([browse_width, 38.0], egui::Button::new("浏览"))
                 .clicked()
             {
-                self.choose_output();
+                self.choose_output(parent);
             }
         });
         ui.add_space(4.0);
