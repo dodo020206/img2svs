@@ -1,7 +1,7 @@
 use crate::hevc::Decoder as HevcDecoder;
 use crate::jpeg::{
     decode_image, decode_rgb, encode_jpeg, encode_jpeg_with_capacity, thumbnail as make_thumbnail,
-    transcode_jpeg_to_420, white_image,
+    transcode_jpeg_to_420, white_image, SOI_MARKER,
 };
 use crate::model::{ByteRange, Compression, Level, Slide};
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,6 +14,48 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 const APERIO_VERSION: &str = "Aperio Image Library v12.4.3";
+/// Micrometres in one centimetre, the scale of the `ResolutionUnit=3` header
+/// fields written into every page.
+const MICROMETRES_PER_CENTIMETRE: f64 = 10_000.0;
+/// Lower bound applied to MPP before conversion, so a missing resolution cannot
+/// turn into a division by zero.
+const MIN_MPP: f64 = 0.000_001;
+
+/// Field type codes written into IFD entries, as defined by the TIFF 6.0
+/// specification and its BigTIFF extension.
+const TIFF_TYPE_ASCII: u16 = 2;
+const TIFF_TYPE_SHORT: u16 = 3;
+const TIFF_TYPE_LONG: u16 = 4;
+const TIFF_TYPE_RATIONAL: u16 = 5;
+const TIFF_TYPE_UNDEFINED: u16 = 7;
+const TIFF_TYPE_LONG8: u16 = 16;
+
+/// Field tags written into the pages this writer emits.
+const TAG_NEW_SUBFILE_TYPE: u16 = 254;
+const TAG_IMAGE_WIDTH: u16 = 256;
+const TAG_IMAGE_LENGTH: u16 = 257;
+const TAG_BITS_PER_SAMPLE: u16 = 258;
+const TAG_COMPRESSION: u16 = 259;
+const TAG_PHOTOMETRIC_INTERPRETATION: u16 = 262;
+const TAG_IMAGE_DESCRIPTION: u16 = 270;
+const TAG_STRIP_OFFSETS: u16 = 273;
+const TAG_ORIENTATION: u16 = 274;
+const TAG_SAMPLES_PER_PIXEL: u16 = 277;
+const TAG_ROWS_PER_STRIP: u16 = 278;
+const TAG_STRIP_BYTE_COUNTS: u16 = 279;
+const TAG_X_RESOLUTION: u16 = 282;
+const TAG_Y_RESOLUTION: u16 = 283;
+const TAG_PLANAR_CONFIGURATION: u16 = 284;
+const TAG_RESOLUTION_UNIT: u16 = 296;
+const TAG_SOFTWARE: u16 = 305;
+const TAG_TILE_WIDTH: u16 = 322;
+const TAG_TILE_LENGTH: u16 = 323;
+const TAG_TILE_OFFSETS: u16 = 324;
+const TAG_TILE_BYTE_COUNTS: u16 = 325;
+const TAG_SAMPLE_FORMAT: u16 = 339;
+const TAG_JPEG_TABLES: u16 = 347;
+const TAG_YCBCR_SUB_SAMPLING: u16 = 530;
+const TAG_REFERENCE_BLACK_WHITE: u16 = 532;
 
 pub struct WriteOptions {
     pub jpeg_quality: u8,
@@ -69,13 +111,23 @@ pub fn append_associated_images(
     if u16::from_le_bytes([header[2], header[3]]) == 43 {
         let mut writer = BigTiffWriter::open_append(output)?;
         for (kind, image) in images {
-            writer.write_strip_page(image, quality, 10000.0 / mpp, Some(&format!("{kind}\r")))?;
+            writer.write_strip_page(
+                image,
+                quality,
+                MICROMETRES_PER_CENTIMETRE / mpp,
+                Some(&format!("{kind}\r")),
+            )?;
         }
         return writer.finish();
     }
     let mut writer = TiffWriter::open_append(output)?;
     for (kind, image) in images {
-        writer.write_strip_page(image, quality, 10000.0 / mpp, Some(&format!("{kind}\r")))?;
+        writer.write_strip_page(
+            image,
+            quality,
+            MICROMETRES_PER_CENTIMETRE / mpp,
+            Some(&format!("{kind}\r")),
+        )?;
     }
     writer.finish()
 }
@@ -134,7 +186,7 @@ pub fn prepend_compatible_pages(
         },
         mpp
     );
-    let resolution = 10000.0 / mpp.max(0.000001);
+    let resolution = MICROMETRES_PER_CENTIMETRE / mpp.max(MIN_MPP);
 
     file.seek(SeekFrom::End(0))?;
     let thumb_offset = file.stream_position()?;
@@ -359,32 +411,40 @@ fn write_compatible_classic_main(
     let jpeg_tables = sample_format + 6;
     let reference_bw = align(jpeg_tables + source.jpeg_tables.len() as u64, 4);
     let mut entries = vec![
-        long(254, 0),
-        long(256, source.width),
-        long(257, source.height),
-        short_array_at(258, bits),
-        short(259, source.compression),
-        short(262, source.photometric),
-        ascii_at(270, desc, description.len() + 1)?,
-        short(274, 1),
-        short(277, source.samples),
-        rational_at(282, xres),
-        rational_at(283, xres + 8),
-        short(284, source.planar),
-        short(296, 3),
-        long_at(322, source.tile_width),
-        long_at(323, source.tile_height),
-        u64_long_array_at(324, &source.tile_offsets, offsets)?,
-        u64_long_array_at(325, &source.tile_byte_counts, counts)?,
-        ascii_at(305, software, 13)?,
-        short_array_at(339, sample_format),
+        long(TAG_NEW_SUBFILE_TYPE, 0),
+        long(TAG_IMAGE_WIDTH, source.width),
+        long(TAG_IMAGE_LENGTH, source.height),
+        short_array_at(TAG_BITS_PER_SAMPLE, bits),
+        short(TAG_COMPRESSION, source.compression),
+        short(TAG_PHOTOMETRIC_INTERPRETATION, source.photometric),
+        ascii_at(TAG_IMAGE_DESCRIPTION, desc, description.len() + 1)?,
+        short(TAG_ORIENTATION, 1),
+        short(TAG_SAMPLES_PER_PIXEL, source.samples),
+        rational_at(TAG_X_RESOLUTION, xres),
+        rational_at(TAG_Y_RESOLUTION, xres + 8),
+        short(TAG_PLANAR_CONFIGURATION, source.planar),
+        short(TAG_RESOLUTION_UNIT, 3),
+        long_at(TAG_TILE_WIDTH, source.tile_width),
+        long_at(TAG_TILE_LENGTH, source.tile_height),
+        u64_long_array_at(TAG_TILE_OFFSETS, &source.tile_offsets, offsets)?,
+        u64_long_array_at(TAG_TILE_BYTE_COUNTS, &source.tile_byte_counts, counts)?,
+        ascii_at(TAG_SOFTWARE, software, 13)?,
+        short_array_at(TAG_SAMPLE_FORMAT, sample_format),
     ];
     if !source.jpeg_tables.is_empty() {
-        entries.push(undefined_at(347, source.jpeg_tables.len(), jpeg_tables)?);
+        entries.push(undefined_at(
+            TAG_JPEG_TABLES,
+            source.jpeg_tables.len(),
+            jpeg_tables,
+        )?);
     }
     if ycbcr {
-        entries.push(short_pair(530, 2, 2));
-        entries.push(rational_array_at(532, reference_bw, 6)?);
+        entries.push(short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2));
+        entries.push(rational_array_at(
+            TAG_REFERENCE_BLACK_WHITE,
+            reference_bw,
+            6,
+        )?);
     }
     entries.sort_by_key(|entry| entry.tag);
     file.write_all(&count.to_le_bytes())?;
@@ -439,22 +499,22 @@ fn write_compatible_classic_thumbnail(
     let xres = align(bits + 6, 2);
     let reference_bw = align(xres + 16, 4);
     let entries = vec![
-        long(256, image.width()),
-        long(257, image.height()),
-        short_array_at(258, bits),
-        short(259, 7),
-        short(262, 6),
-        long_at(273, offset),
-        long_at(278, image.height()),
-        long_at(279, count),
-        short(274, 1),
-        short(277, 3),
-        rational_at(282, xres),
-        rational_at(283, xres + 8),
-        short(284, 1),
-        short(296, 3),
-        short_pair(530, 2, 2),
-        rational_array_at(532, reference_bw, 6)?,
+        long(TAG_IMAGE_WIDTH, image.width()),
+        long(TAG_IMAGE_LENGTH, image.height()),
+        short_array_at(TAG_BITS_PER_SAMPLE, bits),
+        short(TAG_COMPRESSION, 7),
+        short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
+        long_at(TAG_STRIP_OFFSETS, offset),
+        long_at(TAG_ROWS_PER_STRIP, image.height()),
+        long_at(TAG_STRIP_BYTE_COUNTS, count),
+        short(TAG_ORIENTATION, 1),
+        short(TAG_SAMPLES_PER_PIXEL, 3),
+        rational_at(TAG_X_RESOLUTION, xres),
+        rational_at(TAG_Y_RESOLUTION, xres + 8),
+        short(TAG_PLANAR_CONFIGURATION, 1),
+        short(TAG_RESOLUTION_UNIT, 3),
+        short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
+        rational_array_at(TAG_REFERENCE_BLACK_WHITE, reference_bw, 6)?,
     ];
     let mut entries = entries;
     entries.sort_by_key(|entry| entry.tag);
@@ -497,32 +557,40 @@ fn write_compatible_big_main(
     let jpeg_tables = sample_format + 6;
     let reference_bw = align(jpeg_tables + source.jpeg_tables.len() as u64, 8);
     let mut entries = vec![
-        big_long(254, 0),
-        big_long(256, source.width),
-        big_long(257, source.height),
-        big_short_array(258, bits),
-        big_short(259, source.compression),
-        big_short(262, source.photometric),
-        big_ascii_at(270, desc, description.len() + 1)?,
-        big_short(274, 1),
-        big_short(277, source.samples),
-        big_rational(282, xres),
-        big_rational(283, xres + 8),
-        big_short(284, source.planar),
-        big_short(296, 3),
-        big_long(322, source.tile_width),
-        big_long(323, source.tile_height),
-        big_long8_values_at(324, &source.tile_offsets, offsets)?,
-        big_long8_values_at(325, &source.tile_byte_counts, counts)?,
-        big_ascii_at(305, software, 13)?,
-        big_short_array(339, sample_format),
+        big_long(TAG_NEW_SUBFILE_TYPE, 0),
+        big_long(TAG_IMAGE_WIDTH, source.width),
+        big_long(TAG_IMAGE_LENGTH, source.height),
+        big_short_array(TAG_BITS_PER_SAMPLE, bits),
+        big_short(TAG_COMPRESSION, source.compression),
+        big_short(TAG_PHOTOMETRIC_INTERPRETATION, source.photometric),
+        big_ascii_at(TAG_IMAGE_DESCRIPTION, desc, description.len() + 1)?,
+        big_short(TAG_ORIENTATION, 1),
+        big_short(TAG_SAMPLES_PER_PIXEL, source.samples),
+        big_rational(TAG_X_RESOLUTION, xres),
+        big_rational(TAG_Y_RESOLUTION, xres + 8),
+        big_short(TAG_PLANAR_CONFIGURATION, source.planar),
+        big_short(TAG_RESOLUTION_UNIT, 3),
+        big_long(TAG_TILE_WIDTH, source.tile_width),
+        big_long(TAG_TILE_LENGTH, source.tile_height),
+        big_long8_values_at(TAG_TILE_OFFSETS, &source.tile_offsets, offsets)?,
+        big_long8_values_at(TAG_TILE_BYTE_COUNTS, &source.tile_byte_counts, counts)?,
+        big_ascii_at(TAG_SOFTWARE, software, 13)?,
+        big_short_array(TAG_SAMPLE_FORMAT, sample_format),
     ];
     if !source.jpeg_tables.is_empty() {
-        entries.push(big_undefined(347, source.jpeg_tables.len(), jpeg_tables)?);
+        entries.push(big_undefined(
+            TAG_JPEG_TABLES,
+            source.jpeg_tables.len(),
+            jpeg_tables,
+        )?);
     }
     if ycbcr {
-        entries.push(big_short_pair(530, 2, 2));
-        entries.push(big_rational_array(532, reference_bw, 6));
+        entries.push(big_short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2));
+        entries.push(big_rational_array(
+            TAG_REFERENCE_BLACK_WHITE,
+            reference_bw,
+            6,
+        ));
     }
     entries.sort_by_key(|entry| entry.tag);
     file.write_all(&count.to_le_bytes())?;
@@ -577,32 +645,32 @@ fn write_compatible_big_thumbnail(
     let xres = align(bits + 6, 8);
     let reference_bw = align(xres + 16, 8);
     let mut entries = vec![
-        big_long(256, image.width()),
-        big_long(257, image.height()),
-        big_short_array(258, bits),
-        big_short(259, 7),
-        big_short(262, 6),
+        big_long(TAG_IMAGE_WIDTH, image.width()),
+        big_long(TAG_IMAGE_LENGTH, image.height()),
+        big_short_array(TAG_BITS_PER_SAMPLE, bits),
+        big_short(TAG_COMPRESSION, 7),
+        big_short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
         BigEntry {
-            tag: 273,
-            kind: 16,
+            tag: TAG_STRIP_OFFSETS,
+            kind: TIFF_TYPE_LONG8,
             count: 1,
             value: offset,
         },
-        big_long(278, image.height()),
+        big_long(TAG_ROWS_PER_STRIP, image.height()),
         BigEntry {
-            tag: 279,
-            kind: 16,
+            tag: TAG_STRIP_BYTE_COUNTS,
+            kind: TIFF_TYPE_LONG8,
             count: 1,
             value: count,
         },
-        big_short(274, 1),
-        big_short(277, 3),
-        big_rational(282, xres),
-        big_rational(283, xres + 8),
-        big_short(284, 1),
-        big_short(296, 3),
-        big_short_pair(530, 2, 2),
-        big_rational_array(532, reference_bw, 6),
+        big_short(TAG_ORIENTATION, 1),
+        big_short(TAG_SAMPLES_PER_PIXEL, 3),
+        big_rational(TAG_X_RESOLUTION, xres),
+        big_rational(TAG_Y_RESOLUTION, xres + 8),
+        big_short(TAG_PLANAR_CONFIGURATION, 1),
+        big_short(TAG_RESOLUTION_UNIT, 3),
+        big_short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
+        big_rational_array(TAG_REFERENCE_BLACK_WHITE, reference_bw, 6),
     ];
     entries.sort_by_key(|entry| entry.tag);
     file.write_all(&entry_count.to_le_bytes())?;
@@ -626,7 +694,7 @@ fn write_compatible_big_thumbnail(
 fn big_ascii_at(tag: u16, offset: u64, count: usize) -> Result<BigEntry> {
     Ok(BigEntry {
         tag,
-        kind: 2,
+        kind: TIFF_TYPE_ASCII,
         count: u64::try_from(count)?,
         value: offset,
     })
@@ -635,7 +703,7 @@ fn big_ascii_at(tag: u16, offset: u64, count: usize) -> Result<BigEntry> {
 fn big_long8_array(tag: u16, count: usize, offset: u64) -> Result<BigEntry> {
     Ok(BigEntry {
         tag,
-        kind: 16,
+        kind: TIFF_TYPE_LONG8,
         count: u64::try_from(count)?,
         value: offset,
     })
@@ -645,7 +713,7 @@ fn big_long8_values_at(tag: u16, values: &[u64], offset: u64) -> Result<BigEntry
     if values.len() == 1 {
         Ok(BigEntry {
             tag,
-            kind: 16,
+            kind: TIFF_TYPE_LONG8,
             count: 1,
             value: values[0],
         })
@@ -721,7 +789,7 @@ fn write_slide_inner(slide: &Slide, output: &Path, options: &WriteOptions) -> Re
     writer.write_strip_page(
         &thumbnail,
         options.jpeg_quality,
-        10000.0 / slide.metadata.mpp,
+        MICROMETRES_PER_CENTIMETRE / slide.metadata.mpp,
         None,
     )?;
     for level in slide.levels.iter().skip(1) {
@@ -738,7 +806,7 @@ fn write_slide_inner(slide: &Slide, output: &Path, options: &WriteOptions) -> Re
         writer.write_strip_page(
             &image,
             options.jpeg_quality,
-            10000.0 / slide.metadata.mpp,
+            MICROMETRES_PER_CENTIMETRE / slide.metadata.mpp,
             Some(&format!("{}\r", associated.kind)),
         )?;
     }
@@ -950,8 +1018,8 @@ impl TiffWriter {
         let merge_rows = 16 / gcd(slide.tile_height, 16);
         let tile_width = slide.tile_width * merge_cols;
         let tile_height = slide.tile_height * merge_rows;
-        let output_cols = (level.tile_cols + merge_cols - 1) / merge_cols;
-        let output_rows = (level.tile_rows + merge_rows - 1) / merge_rows;
+        let output_cols = level.tile_cols.div_ceil(merge_cols);
+        let output_rows = level.tile_rows.div_ceil(merge_rows);
         let mut offsets = Vec::with_capacity((output_cols * output_rows) as usize);
         let mut counts = Vec::with_capacity(offsets.capacity());
 
@@ -985,8 +1053,9 @@ impl TiffWriter {
             self.file.write_all(&batch)?;
         }
         let description = aperio_description(slide, level, tile_width, tile_height, quality);
-        let resolution =
-            10000.0 / slide.metadata.mpp / if reduced { level.downsample } else { 1.0 };
+        let resolution = MICROMETRES_PER_CENTIMETRE
+            / slide.metadata.mpp
+            / if reduced { level.downsample } else { 1.0 };
         self.write_ifd(Page::Tiled {
             width: level.width,
             height: level.height,
@@ -1058,6 +1127,30 @@ struct TileTask {
     output_width: u32,
     output_height: u32,
     quality: u8,
+}
+
+/// Position and extent of one output tile inside the merged tile grid.
+#[derive(Clone, Copy)]
+struct TilePlacement {
+    output_row: u32,
+    output_col: u32,
+    merge_rows: u32,
+    merge_cols: u32,
+    output_width: u32,
+    output_height: u32,
+}
+
+impl TileTask {
+    fn placement(&self) -> TilePlacement {
+        TilePlacement {
+            output_row: self.output_row,
+            output_col: self.output_col,
+            merge_rows: self.merge_rows,
+            merge_cols: self.merge_cols,
+            output_width: self.output_width,
+            output_height: self.output_height,
+        }
+    }
 }
 
 struct TileResult {
@@ -1242,18 +1335,7 @@ fn encode_output_tile(
         let bytes = mapped_range(source, range)?;
         if bytes.is_empty() {
             return encode_jpeg(
-                &compose_tile(
-                    slide,
-                    source,
-                    level,
-                    task.output_row,
-                    task.output_col,
-                    task.merge_rows,
-                    task.merge_cols,
-                    task.output_width,
-                    task.output_height,
-                    hevc,
-                )?,
+                &compose_tile(slide, source, level, task.placement(), hevc)?,
                 task.quality,
             );
         }
@@ -1264,18 +1346,7 @@ fn encode_output_tile(
         }
         return Ok(bytes.to_vec());
     }
-    let image = compose_tile(
-        slide,
-        source,
-        level,
-        task.output_row,
-        task.output_col,
-        task.merge_rows,
-        task.merge_cols,
-        task.output_width,
-        task.output_height,
-        hevc,
-    )?;
+    let image = compose_tile(slide, source, level, task.placement(), hevc)?;
     encode_jpeg(&image, task.quality)
 }
 
@@ -1361,8 +1432,8 @@ impl BigTiffWriter {
         self.patch_u64(self.previous_next_pointer, ifd_offset)?;
         let entry_count = page.entry_count();
         let extras_offset = ifd_offset + 8 + entry_count as u64 * 20 + 8;
-        let extra = page.extra_data(extras_offset)?;
-        let entries = page.entries(&extra)?;
+        let extra = page.extra_data(extras_offset);
+        let entries = page.entries(&extra);
         self.file.write_all(&(entries.len() as u64).to_le_bytes())?;
         for entry in &entries {
             self.file.write_all(&entry.tag.to_le_bytes())?;
@@ -1432,14 +1503,14 @@ impl BigPage {
         }
     }
 
-    fn extra_data(&self, start: u64) -> Result<BigExtra> {
+    fn extra_data(&self, start: u64) -> BigExtra {
         match self {
             Self::Strip { description, .. } => {
                 let bits = align(start, 2);
                 let desc = if description.is_some() { bits + 6 } else { 0 };
                 let after_desc = bits + 6 + description.as_ref().map_or(0, |v| v.len() + 1) as u64;
                 let xres = align(after_desc, 2);
-                Ok(BigExtra {
+                BigExtra {
                     bits,
                     desc,
                     xres,
@@ -1447,12 +1518,12 @@ impl BigPage {
                     sample: xres + 16,
                     reference_bw: align(xres + 22, 8),
                     desc_text: description.clone().unwrap_or_default(),
-                })
+                }
             }
         }
     }
 
-    fn entries(&self, extra: &BigExtra) -> Result<Vec<BigEntry>> {
+    fn entries(&self, extra: &BigExtra) -> Vec<BigEntry> {
         match self {
             Self::Strip {
                 width,
@@ -1463,33 +1534,33 @@ impl BigPage {
                 ..
             } => {
                 let mut entries = vec![
-                    big_long(256, *width),
-                    big_long(257, *height),
-                    big_short_array(258, extra.bits),
-                    big_short(259, 7),
-                    big_short(262, 6),
-                    big_short(274, 1),
-                    big_short(277, 3),
-                    big_short(284, 1),
-                    big_long(278, *height),
+                    big_long(TAG_IMAGE_WIDTH, *width),
+                    big_long(TAG_IMAGE_LENGTH, *height),
+                    big_short_array(TAG_BITS_PER_SAMPLE, extra.bits),
+                    big_short(TAG_COMPRESSION, 7),
+                    big_short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
+                    big_short(TAG_ORIENTATION, 1),
+                    big_short(TAG_SAMPLES_PER_PIXEL, 3),
+                    big_short(TAG_PLANAR_CONFIGURATION, 1),
+                    big_long(TAG_ROWS_PER_STRIP, *height),
                     BigEntry {
-                        tag: 273,
-                        kind: 16,
+                        tag: TAG_STRIP_OFFSETS,
+                        kind: TIFF_TYPE_LONG8,
                         count: 1,
                         value: *offset,
                     },
                     BigEntry {
-                        tag: 279,
-                        kind: 16,
+                        tag: TAG_STRIP_BYTE_COUNTS,
+                        kind: TIFF_TYPE_LONG8,
                         count: 1,
                         value: *count,
                     },
-                    big_short(296, 3),
-                    big_rational(282, extra.xres),
-                    big_rational(283, extra.yres),
-                    big_short_array(339, extra.sample),
-                    big_short_pair(530, 2, 2),
-                    big_rational_array(532, extra.reference_bw, 6),
+                    big_short(TAG_RESOLUTION_UNIT, 3),
+                    big_rational(TAG_X_RESOLUTION, extra.xres),
+                    big_rational(TAG_Y_RESOLUTION, extra.yres),
+                    big_short_array(TAG_SAMPLE_FORMAT, extra.sample),
+                    big_short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
+                    big_rational_array(TAG_REFERENCE_BLACK_WHITE, extra.reference_bw, 6),
                 ];
                 if description.is_some() {
                     let value = if extra.desc_text.len() < 8 {
@@ -1498,14 +1569,14 @@ impl BigPage {
                         extra.desc
                     };
                     entries.push(BigEntry {
-                        tag: 270,
-                        kind: 2,
+                        tag: TAG_IMAGE_DESCRIPTION,
+                        kind: TIFF_TYPE_ASCII,
                         count: extra.desc_text.len() as u64 + 1,
                         value,
                     });
                 }
                 entries.sort_by_key(|entry| entry.tag);
-                Ok(entries)
+                entries
             }
         }
     }
@@ -1541,7 +1612,7 @@ impl BigPage {
 fn big_short(tag: u16, value: u16) -> BigEntry {
     BigEntry {
         tag,
-        kind: 3,
+        kind: TIFF_TYPE_SHORT,
         count: 1,
         value: value as u64,
     }
@@ -1550,7 +1621,7 @@ fn big_short(tag: u16, value: u16) -> BigEntry {
 fn big_short_pair(tag: u16, first: u16, second: u16) -> BigEntry {
     BigEntry {
         tag,
-        kind: 3,
+        kind: TIFF_TYPE_SHORT,
         count: 2,
         value: first as u64 | ((second as u64) << 16),
     }
@@ -1559,7 +1630,7 @@ fn big_short_pair(tag: u16, first: u16, second: u16) -> BigEntry {
 fn big_short_array(tag: u16, offset: u64) -> BigEntry {
     BigEntry {
         tag,
-        kind: 3,
+        kind: TIFF_TYPE_SHORT,
         count: 3,
         value: offset,
     }
@@ -1568,7 +1639,7 @@ fn big_short_array(tag: u16, offset: u64) -> BigEntry {
 fn big_long(tag: u16, value: u32) -> BigEntry {
     BigEntry {
         tag,
-        kind: 4,
+        kind: TIFF_TYPE_LONG,
         count: 1,
         value: value as u64,
     }
@@ -1577,7 +1648,7 @@ fn big_long(tag: u16, value: u32) -> BigEntry {
 fn big_rational(tag: u16, offset: u64) -> BigEntry {
     BigEntry {
         tag,
-        kind: 5,
+        kind: TIFF_TYPE_RATIONAL,
         count: 1,
         value: offset,
     }
@@ -1586,7 +1657,7 @@ fn big_rational(tag: u16, offset: u64) -> BigEntry {
 fn big_rational_array(tag: u16, offset: u64, count: u64) -> BigEntry {
     BigEntry {
         tag,
-        kind: 5,
+        kind: TIFF_TYPE_RATIONAL,
         count,
         value: offset,
     }
@@ -1595,7 +1666,7 @@ fn big_rational_array(tag: u16, offset: u64, count: u64) -> BigEntry {
 fn big_undefined(tag: u16, count: usize, offset: u64) -> Result<BigEntry> {
     Ok(BigEntry {
         tag,
-        kind: 7,
+        kind: TIFF_TYPE_UNDEFINED,
         count: u64::try_from(count)?,
         value: offset,
     })
@@ -1653,7 +1724,7 @@ impl Page {
         }
     }
 
-    fn extra_data(&self, ifd_offset: u64) -> Result<Extra> {
+    fn extra_data(&self, ifd_offset: u64) -> Extra {
         let start = ifd_offset + 2 + self.entry_count() as u64 * 12 + 4;
         match self {
             Page::Tiled {
@@ -1670,7 +1741,7 @@ impl Page {
                 let yres = xres + 8;
                 let sample = yres + 8;
                 let reference_bw = align(sample + 6, 4);
-                Ok(Extra {
+                Extra {
                     bits,
                     tile_offsets,
                     tile_counts,
@@ -1680,7 +1751,7 @@ impl Page {
                     sample,
                     reference_bw,
                     desc_text: description.clone(),
-                })
+                }
             }
             Page::Strip { description, .. } => {
                 let bits = align(start, 2);
@@ -1692,7 +1763,7 @@ impl Page {
                 let yres = xres + 8;
                 let sample = yres + 8;
                 let reference_bw = align(sample + 6, 4);
-                Ok(Extra {
+                Extra {
                     bits,
                     tile_offsets: 0,
                     tile_counts: 0,
@@ -1702,13 +1773,13 @@ impl Page {
                     sample,
                     reference_bw,
                     desc_text: description.clone().unwrap_or_default(),
-                })
+                }
             }
         }
     }
 
     fn entries(&self, extra_offset: u64) -> Result<Vec<Entry>> {
-        let extra = self.extra_data(extra_offset - 2 - self.entry_count() as u64 * 12 - 4)?;
+        let extra = self.extra_data(extra_offset - 2 - self.entry_count() as u64 * 12 - 4);
         let e = match self {
             Page::Tiled {
                 width,
@@ -1720,26 +1791,26 @@ impl Page {
                 reduced,
                 ..
             } => vec![
-                long(254, if *reduced { 1 } else { 0 }),
-                long(256, *width),
-                long(257, *height),
-                short_array_at(258, extra.bits),
-                short(259, 7),
-                short(262, 6),
-                short(274, 1),
-                short(277, 3),
-                short(284, 1),
-                short(296, 3),
-                long_at(322, *tile_width),
-                long_at(323, *tile_height),
-                long_array_at(324, offsets, extra.tile_offsets)?,
-                long_array_at(325, counts, extra.tile_counts)?,
-                rational_at(282, extra.xres),
-                rational_at(283, extra.yres),
-                short_array_at(339, extra.sample),
-                ascii_at(270, extra.desc, extra.desc_text.len() + 1)?,
-                short_pair(530, 2, 2),
-                rational_array_at(532, extra.reference_bw, 6)?,
+                long(TAG_NEW_SUBFILE_TYPE, if *reduced { 1 } else { 0 }),
+                long(TAG_IMAGE_WIDTH, *width),
+                long(TAG_IMAGE_LENGTH, *height),
+                short_array_at(TAG_BITS_PER_SAMPLE, extra.bits),
+                short(TAG_COMPRESSION, 7),
+                short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
+                short(TAG_ORIENTATION, 1),
+                short(TAG_SAMPLES_PER_PIXEL, 3),
+                short(TAG_PLANAR_CONFIGURATION, 1),
+                short(TAG_RESOLUTION_UNIT, 3),
+                long_at(TAG_TILE_WIDTH, *tile_width),
+                long_at(TAG_TILE_LENGTH, *tile_height),
+                long_array_at(TAG_TILE_OFFSETS, offsets, extra.tile_offsets)?,
+                long_array_at(TAG_TILE_BYTE_COUNTS, counts, extra.tile_counts)?,
+                rational_at(TAG_X_RESOLUTION, extra.xres),
+                rational_at(TAG_Y_RESOLUTION, extra.yres),
+                short_array_at(TAG_SAMPLE_FORMAT, extra.sample),
+                ascii_at(TAG_IMAGE_DESCRIPTION, extra.desc, extra.desc_text.len() + 1)?,
+                short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
+                rational_array_at(TAG_REFERENCE_BLACK_WHITE, extra.reference_bw, 6)?,
             ],
             Page::Strip {
                 width,
@@ -1750,26 +1821,30 @@ impl Page {
                 ..
             } => {
                 let mut v = vec![
-                    long(256, *width),
-                    long(257, *height),
-                    short_array_at(258, extra.bits),
-                    short(259, 7),
-                    short(262, 6),
-                    short(274, 1),
-                    short(277, 3),
-                    short(284, 1),
-                    long_at(278, *height),
-                    long_at(273, *offset),
-                    long_at(279, *count),
-                    short(296, 3),
-                    rational_at(282, extra.xres),
-                    rational_at(283, extra.yres),
-                    short_array_at(339, extra.sample),
-                    short_pair(530, 2, 2),
-                    rational_array_at(532, extra.reference_bw, 6)?,
+                    long(TAG_IMAGE_WIDTH, *width),
+                    long(TAG_IMAGE_LENGTH, *height),
+                    short_array_at(TAG_BITS_PER_SAMPLE, extra.bits),
+                    short(TAG_COMPRESSION, 7),
+                    short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
+                    short(TAG_ORIENTATION, 1),
+                    short(TAG_SAMPLES_PER_PIXEL, 3),
+                    short(TAG_PLANAR_CONFIGURATION, 1),
+                    long_at(TAG_ROWS_PER_STRIP, *height),
+                    long_at(TAG_STRIP_OFFSETS, *offset),
+                    long_at(TAG_STRIP_BYTE_COUNTS, *count),
+                    short(TAG_RESOLUTION_UNIT, 3),
+                    rational_at(TAG_X_RESOLUTION, extra.xres),
+                    rational_at(TAG_Y_RESOLUTION, extra.yres),
+                    short_array_at(TAG_SAMPLE_FORMAT, extra.sample),
+                    short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
+                    rational_array_at(TAG_REFERENCE_BLACK_WHITE, extra.reference_bw, 6)?,
                 ];
                 if description.is_some() {
-                    v.push(ascii_at(270, extra.desc, extra.desc_text.len() + 1)?);
+                    v.push(ascii_at(
+                        TAG_IMAGE_DESCRIPTION,
+                        extra.desc,
+                        extra.desc_text.len() + 1,
+                    )?);
                 }
                 v
             }
@@ -1863,14 +1938,17 @@ fn compose_tile(
     slide: &Slide,
     source: &[u8],
     level: &Level,
-    output_row: u32,
-    output_col: u32,
-    merge_rows: u32,
-    merge_cols: u32,
-    output_width: u32,
-    output_height: u32,
+    placement: TilePlacement,
     mut hevc: Option<&mut HevcDecoder>,
 ) -> Result<RgbImage> {
+    let TilePlacement {
+        output_row,
+        output_col,
+        merge_rows,
+        merge_cols,
+        output_width,
+        output_height,
+    } = placement;
     let mut output = RgbImage::from_pixel(output_width, output_height, Rgb([255, 255, 255]));
     if !level.tile_positions.is_empty() {
         let origin_x = output_col * output_width;
@@ -1979,7 +2057,7 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 }
 
 fn jpeg_is_420(data: &[u8]) -> bool {
-    if !data.starts_with(&[0xff, 0xd8]) {
+    if !data.starts_with(&SOI_MARKER) {
         return false;
     }
     let mut offset = 2usize;
@@ -2038,7 +2116,7 @@ fn jpeg_is_420(data: &[u8]) -> bool {
 }
 
 fn align(value: u64, alignment: u64) -> u64 {
-    (value + alignment - 1) / alignment * alignment
+    value.div_ceil(alignment) * alignment
 }
 fn pad_to(file: &mut File, offset: u64) -> Result<()> {
     let current = file.stream_position()?;
@@ -2063,7 +2141,7 @@ fn write_reference_black_white(file: &mut File) -> Result<()> {
 fn short(tag: u16, value: u16) -> Entry {
     Entry {
         tag,
-        kind: 3,
+        kind: TIFF_TYPE_SHORT,
         count: 1,
         value: value as u32,
     }
@@ -2071,7 +2149,7 @@ fn short(tag: u16, value: u16) -> Entry {
 fn short_pair(tag: u16, first: u16, second: u16) -> Entry {
     Entry {
         tag,
-        kind: 3,
+        kind: TIFF_TYPE_SHORT,
         count: 2,
         value: first as u32 | ((second as u32) << 16),
     }
@@ -2079,7 +2157,7 @@ fn short_pair(tag: u16, first: u16, second: u16) -> Entry {
 fn short_array_at(tag: u16, offset: u64) -> Entry {
     Entry {
         tag,
-        kind: 3,
+        kind: TIFF_TYPE_SHORT,
         count: 3,
         value: offset as u32,
     }
@@ -2087,7 +2165,7 @@ fn short_array_at(tag: u16, offset: u64) -> Entry {
 fn long(tag: u16, value: u32) -> Entry {
     Entry {
         tag,
-        kind: 4,
+        kind: TIFF_TYPE_LONG,
         count: 1,
         value,
     }
@@ -2098,7 +2176,7 @@ fn long_at(tag: u16, value: u32) -> Entry {
 fn rational_at(tag: u16, offset: u64) -> Entry {
     Entry {
         tag,
-        kind: 5,
+        kind: TIFF_TYPE_RATIONAL,
         count: 1,
         value: offset as u32,
     }
@@ -2106,7 +2184,7 @@ fn rational_at(tag: u16, offset: u64) -> Entry {
 fn rational_array_at(tag: u16, offset: u64, count: u32) -> Result<Entry> {
     Ok(Entry {
         tag,
-        kind: 5,
+        kind: TIFF_TYPE_RATIONAL,
         count,
         value: u32::try_from(offset).context("TIFF rational array offset overflow")?,
     })
@@ -2114,7 +2192,7 @@ fn rational_array_at(tag: u16, offset: u64, count: u32) -> Result<Entry> {
 fn undefined_at(tag: u16, count: usize, offset: u64) -> Result<Entry> {
     Ok(Entry {
         tag,
-        kind: 7,
+        kind: TIFF_TYPE_UNDEFINED,
         count: u32::try_from(count)?,
         value: u32::try_from(offset).context("TIFF undefined data offset overflow")?,
     })
@@ -2122,7 +2200,7 @@ fn undefined_at(tag: u16, count: usize, offset: u64) -> Result<Entry> {
 fn array_at(tag: u16, count: usize, offset: u64) -> Result<Entry> {
     Ok(Entry {
         tag,
-        kind: 4,
+        kind: TIFF_TYPE_LONG,
         count: u32::try_from(count)?,
         value: u32::try_from(offset).context("TIFF extra data offset overflow")?,
     })
@@ -2140,6 +2218,14 @@ fn long_array_at(tag: u16, values: &[u32], offset: u64) -> Result<Entry> {
     } else {
         array_at(tag, values.len(), offset)
     }
+}
+fn ascii_at(tag: u16, offset: u64, count: usize) -> Result<Entry> {
+    Ok(Entry {
+        tag,
+        kind: TIFF_TYPE_ASCII,
+        count: u32::try_from(count)?,
+        value: u32::try_from(offset).context("TIFF description offset overflow")?,
+    })
 }
 
 #[cfg(test)]
@@ -2368,12 +2454,4 @@ mod tests {
         }
         Ok(())
     }
-}
-fn ascii_at(tag: u16, offset: u64, count: usize) -> Result<Entry> {
-    Ok(Entry {
-        tag,
-        kind: 2,
-        count: u32::try_from(count)?,
-        value: u32::try_from(offset).context("TIFF description offset overflow")?,
-    })
 }
