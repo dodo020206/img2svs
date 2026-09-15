@@ -1,3 +1,10 @@
+//! Reader for the `DmetrixN` container.
+//!
+//! The header holds scan metadata, a fixed table of pyramid descriptors and one
+//! tile index per level. Level 0 is the largest, but the descriptors are stored
+//! smallest-first and each level records the grid extent of the level below it,
+//! so `parse` walks them in reverse to recover the real image size.
+
 use crate::binary::Reader;
 use crate::jpeg::decode_image;
 use crate::model::{AssociatedImage, ByteRange, Compression, Level, Metadata, Slide};
@@ -6,7 +13,26 @@ use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"DmetrixN";
 const TILE_RECORD_SIZE: u64 = 22;
+const OFFSET_MPP_X: u64 = 0x30;
+const OFFSET_MPP_Y: u64 = 0x38;
+const OFFSET_APP_MAG: u64 = 0x40;
+const OFFSET_DESCRIPTORS: u64 = 0xc2;
+/// Upper bound on the descriptor table, which is terminated by a zero offset.
+const MAX_LEVELS: usize = 64;
+/// Sanity limit for the per-level tile grid.
+const MAX_GRID_EXTENT: u32 = 100_000;
+const MAX_MPP: f64 = 100.0;
+const MAX_APP_MAG: u32 = 200;
+/// Records stored immediately before the first level index hold the label and
+/// macro images.
+const ASSOCIATED_IMAGE_RECORDS: u64 = 2;
+const LABEL_ID: u16 = 0xffff;
+const MACRO_ID: u16 = 0xfffe;
+const DEFAULT_JPEG_QUALITY: u8 = 75;
+const MIN_TILE_SIZE: u32 = 16;
+const MAX_TILE_SIZE: u32 = 4096;
 
+/// One pyramid level as described by the descriptor table.
 #[derive(Clone, Copy, Debug)]
 struct Descriptor {
     source_id: u16,
@@ -15,6 +41,22 @@ struct Descriptor {
     index_offset: u64,
 }
 
+/// The scan geometry read from the fixed header.
+#[derive(Clone, Copy, Debug)]
+struct ScanMetadata {
+    mpp_x: f64,
+    mpp_y: f64,
+    app_mag: u32,
+}
+
+impl ScanMetadata {
+    /// Average of the two axis resolutions, which is what the SVS header wants.
+    fn mpp(&self) -> f64 {
+        (self.mpp_x + self.mpp_y) / 2.0
+    }
+}
+
+/// Parses `path` into a slide description without decoding tile pixels.
 pub fn parse(path: &Path) -> Result<Slide> {
     let mut reader = Reader::open(path)?;
     let file_size = reader.len();
@@ -22,27 +64,69 @@ pub fn parse(path: &Path) -> Result<Slide> {
     if reader.bytes(8, "DMetrix magic")? != MAGIC {
         bail!("unsupported DMetrix container: {}", path.display());
     }
-    let mpp_x = read_f64_at(&mut reader, 0x30)?;
-    let mpp_y = read_f64_at(&mut reader, 0x38)?;
-    let app_mag = read_u32_at(&mut reader, 0x40)?;
-    if !(0.0 < mpp_x
-        && mpp_x < 100.0
-        && 0.0 < mpp_y
-        && mpp_y < 100.0
-        && app_mag > 0
-        && app_mag <= 200)
-    {
-        bail!("invalid DMetrix scan metadata");
-    }
+
+    let scan = read_scan_metadata(&mut reader)?;
     let descriptors = read_descriptors(&mut reader)?;
     let associated = read_associated(&mut reader, descriptors[0].index_offset, file_size)?;
     let raw_levels = read_tile_indexes(&mut reader, &descriptors, file_size)?;
-    let tile_size = discover_tile_size(
-        &mut reader,
-        raw_levels.last().context("missing DMetrix levels")?[0],
-    )?;
+    let tile_size = discover_tile_size(&mut reader, first_tile(&raw_levels)?)?;
+    let levels = build_levels(&mut reader, &descriptors, &raw_levels, tile_size)?;
 
-    let mut levels = Vec::new();
+    let top = levels.first().context("missing DMetrix levels")?;
+    let jpeg_quality =
+        estimate_quality(&mut reader, first_tile(&raw_levels)?).unwrap_or(DEFAULT_JPEG_QUALITY);
+    Ok(Slide {
+        path: PathBuf::from(path),
+        metadata: Metadata {
+            width: top.width,
+            height: top.height,
+            mpp: scan.mpp(),
+            app_mag: f64::from(scan.app_mag),
+            jpeg_quality,
+        },
+        tile_width: tile_size,
+        tile_height: tile_size,
+        compression: Compression::Jpeg,
+        levels,
+        associated_images: associated,
+        thumbnail: None,
+    })
+}
+
+/// Reads the micrometres-per-pixel and objective power from the header.
+fn read_scan_metadata(reader: &mut Reader) -> Result<ScanMetadata> {
+    let scan = ScanMetadata {
+        mpp_x: read_f64_at(reader, OFFSET_MPP_X)?,
+        mpp_y: read_f64_at(reader, OFFSET_MPP_Y)?,
+        app_mag: read_u32_at(reader, OFFSET_APP_MAG)?,
+    };
+    if !(0.0 < scan.mpp_x
+        && scan.mpp_x < MAX_MPP
+        && 0.0 < scan.mpp_y
+        && scan.mpp_y < MAX_MPP
+        && scan.app_mag > 0
+        && scan.app_mag <= MAX_APP_MAG)
+    {
+        bail!("invalid DMetrix scan metadata");
+    }
+    Ok(scan)
+}
+
+/// Converts the raw tile indexes into model levels, smallest level first.
+///
+/// The descriptor order is reversed so that `levels[0]` is the full-resolution
+/// image, and each level's size is recovered from the tile grid of the level
+/// above it plus the size of its own bottom-right edge tile.
+fn build_levels(
+    reader: &mut Reader,
+    descriptors: &[Descriptor],
+    raw_levels: &[Vec<ByteRange>],
+    tile_size: u32,
+) -> Result<Vec<Level>> {
+    if descriptors.len() != raw_levels.len() {
+        bail!("DMetrix level descriptor/index count mismatch");
+    }
+    let mut levels = Vec::with_capacity(descriptors.len());
     for (index, (descriptor, tiles)) in descriptors.iter().zip(raw_levels.iter()).rev().enumerate()
     {
         let edge = tiles[(descriptor.max_y * (descriptor.max_x + 1) + descriptor.max_x) as usize];
@@ -69,31 +153,14 @@ pub fn parse(path: &Path) -> Result<Slide> {
             tile_groups: Vec::new(),
         });
     }
-    let width = levels[0].width;
-    let height = levels[0].height;
-    let jpeg_quality = estimate_quality(&mut reader, levels[0].tiles[0]).unwrap_or(75);
-    Ok(Slide {
-        path: PathBuf::from(path),
-        metadata: Metadata {
-            width,
-            height,
-            mpp: (mpp_x + mpp_y) / 2.0,
-            app_mag: app_mag as f64,
-            jpeg_quality,
-        },
-        tile_width: tile_size,
-        tile_height: tile_size,
-        compression: Compression::Jpeg,
-        levels,
-        associated_images: associated,
-        thumbnail: None,
-    })
+    Ok(levels)
 }
 
+/// Reads the descriptor table, which ends at the first zero index offset.
 fn read_descriptors(reader: &mut Reader) -> Result<Vec<Descriptor>> {
-    reader.seek(0xc2)?;
+    reader.seek(OFFSET_DESCRIPTORS)?;
     let mut result = Vec::new();
-    for _ in 0..64 {
+    for _ in 0..MAX_LEVELS {
         let source_id = reader.u16()?;
         let max_x = reader.u32()?;
         let max_y = reader.u32()?;
@@ -101,7 +168,7 @@ fn read_descriptors(reader: &mut Reader) -> Result<Vec<Descriptor>> {
         if index_offset == 0 {
             break;
         }
-        if max_x > 100_000 || max_y > 100_000 {
+        if max_x > MAX_GRID_EXTENT || max_y > MAX_GRID_EXTENT {
             bail!("invalid DMetrix level grid");
         }
         result.push(Descriptor {
@@ -122,17 +189,19 @@ fn read_descriptors(reader: &mut Reader) -> Result<Vec<Descriptor>> {
     Ok(result)
 }
 
+/// Reads the label and macro images stored ahead of the first level index.
 fn read_associated(
     reader: &mut Reader,
     first_index: u64,
     file_size: u64,
 ) -> Result<Vec<AssociatedImage>> {
     let start = first_index
-        .checked_sub(2 * TILE_RECORD_SIZE)
+        .checked_sub(ASSOCIATED_IMAGE_RECORDS * TILE_RECORD_SIZE)
         .context("invalid DMetrix associated-image index")?;
     reader.seek(start)?;
-    let mut found = [None, None];
-    for _ in 0..2 {
+    let mut label = None;
+    let mut macro_image = None;
+    for _ in 0..ASSOCIATED_IMAGE_RECORDS {
         let id = reader.u16()?;
         let _ = reader.u32()?;
         let _ = reader.u32()?;
@@ -140,14 +209,13 @@ fn read_associated(
         let length = reader.u32()? as u64;
         let data = ByteRange { offset, length };
         data.validate(file_size, "DMetrix associated image")?;
-        if id == 0xffff {
-            found[0] = Some(data);
-        }
-        if id == 0xfffe {
-            found[1] = Some(data);
+        if id == LABEL_ID {
+            label = Some(data);
+        } else if id == MACRO_ID {
+            macro_image = Some(data);
         }
     }
-    Ok([("label", found[0]), ("macro", found[1])]
+    Ok([("label", label), ("macro", macro_image)]
         .into_iter()
         .filter_map(|(kind, data)| {
             data.map(|data| AssociatedImage {
@@ -158,6 +226,7 @@ fn read_associated(
         .collect())
 }
 
+/// Reads one tile index per level into a row-major `ByteRange` grid.
 fn read_tile_indexes(
     reader: &mut Reader,
     descriptors: &[Descriptor],
@@ -172,26 +241,27 @@ fn read_tile_indexes(
         let mut tiles = vec![ByteRange::EMPTY; count as usize];
         let mut seen = vec![false; count as usize];
         for _ in 0..count {
-            let source_id = reader.u16()?;
-            let x = reader.u32()?;
-            let y = reader.u32()?;
-            let data = ByteRange {
-                offset: reader.u64()?,
-                length: reader.u32()? as u64,
-            };
-            if source_id != descriptor.source_id || x > descriptor.max_x || y > descriptor.max_y {
+            let record = read_tile_record(reader)?;
+            if record.source_id != descriptor.source_id
+                || record.x > descriptor.max_x
+                || record.y > descriptor.max_y
+            {
                 bail!(
                     "invalid DMetrix tile record in level {}",
                     descriptor.source_id
                 );
             }
-            data.validate(file_size, "DMetrix level tile")?;
-            let slot = (y * (descriptor.max_x + 1) + x) as usize;
+            record.data.validate(file_size, "DMetrix level tile")?;
+            let slot = (record.y * (descriptor.max_x + 1) + record.x) as usize;
             if seen[slot] {
-                bail!("duplicate DMetrix tile coordinate ({x}, {y})");
+                bail!(
+                    "duplicate DMetrix tile coordinate ({}, {})",
+                    record.x,
+                    record.y
+                );
             }
             seen[slot] = true;
-            tiles[slot] = data;
+            tiles[slot] = record.data;
         }
         if seen.iter().any(|value| !value) {
             bail!("DMetrix tile count mismatch");
@@ -201,9 +271,34 @@ fn read_tile_indexes(
     Ok(result)
 }
 
+/// One fixed-size tile index entry.
+#[derive(Clone, Copy, Debug)]
+struct TileRecord {
+    source_id: u16,
+    x: u32,
+    y: u32,
+    data: ByteRange,
+}
+
+/// Reads a single [`TILE_RECORD_SIZE`]-byte tile index entry.
+fn read_tile_record(reader: &mut Reader) -> Result<TileRecord> {
+    Ok(TileRecord {
+        source_id: reader.u16()?,
+        x: reader.u32()?,
+        y: reader.u32()?,
+        data: ByteRange {
+            offset: reader.u64()?,
+            length: reader.u32()? as u64,
+        },
+    })
+}
+
+/// Reads the first tile of the smallest level, whose grid is guaranteed to be
+/// fully populated, to learn the tile edge length.
 fn discover_tile_size(reader: &mut Reader, range: ByteRange) -> Result<u32> {
     let image = decode_image(&reader.range(range.offset, range.length, "DMetrix tile")?)?;
-    if image.width() != image.height() || !(16..=4096).contains(&image.width()) {
+    if image.width() != image.height() || !(MIN_TILE_SIZE..=MAX_TILE_SIZE).contains(&image.width())
+    {
         bail!(
             "unsupported DMetrix tile size: {}x{}",
             image.width(),
@@ -213,23 +308,78 @@ fn discover_tile_size(reader: &mut Reader, range: ByteRange) -> Result<u32> {
     Ok(image.width())
 }
 
+/// Source JPEG quality for the given tile, when it can be determined.
+///
+/// DMetrix stores plain JPEG tiles with no quality field, and the reference
+/// Python implementation derives the value from the quantization tables. Until
+/// that is ported, JPEG tiles report [`DEFAULT_JPEG_QUALITY`] and non-JPEG
+/// payloads report `None` so the caller can apply its own default.
 fn estimate_quality(reader: &mut Reader, range: ByteRange) -> Option<u8> {
     let data = reader
         .range(range.offset, range.length, "DMetrix JPEG")
         .ok()?;
-    if data.len() < 4 || data[0..2] != [0xff, 0xd8] {
-        return None;
-    }
-    // The working Python implementation estimates from quantization tables. Keep
-    // the safe default here; encoding quality is explicitly configurable by CLI.
-    Some(75)
+    is_jpeg(&data).then_some(DEFAULT_JPEG_QUALITY)
+}
+
+/// Whether `data` starts with the JPEG start-of-image marker.
+fn is_jpeg(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0..2] == [0xff, 0xd8]
+}
+
+/// First tile of the smallest pyramid level.
+fn first_tile(raw_levels: &[Vec<ByteRange>]) -> Result<ByteRange> {
+    raw_levels
+        .last()
+        .and_then(|tiles| tiles.first())
+        .copied()
+        .context("missing DMetrix levels")
 }
 
 fn read_u32_at(reader: &mut Reader, offset: u64) -> Result<u32> {
     reader.seek(offset)?;
     reader.u32()
 }
+
 fn read_f64_at(reader: &mut Reader, offset: u64) -> Result<f64> {
     reader.seek(offset)?;
     reader.f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn tile_record_consumes_the_declared_record_size() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("img2svs-dmetrix-record-{}.bin", std::process::id()));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&7u16.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&0x1000u64.to_le_bytes());
+        bytes.extend_from_slice(&0x200u32.to_le_bytes());
+        assert_eq!(bytes.len() as u64, TILE_RECORD_SIZE);
+        fs::write(&path, &bytes)?;
+
+        let mut reader = Reader::open(&path)?;
+        let record = read_tile_record(&mut reader)?;
+        assert_eq!(record.source_id, 7);
+        assert_eq!((record.x, record.y), (3, 4));
+        assert_eq!(record.data.offset, 0x1000);
+        assert_eq!(record.data.length, 0x200);
+        assert_eq!(reader.len(), TILE_RECORD_SIZE);
+
+        drop(reader);
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn jpeg_marker_detection_requires_the_full_soi() {
+        assert!(is_jpeg(&[0xff, 0xd8, 0xff, 0xe0]));
+        assert!(!is_jpeg(&[0xff]));
+        assert!(!is_jpeg(b"\x89PNG"));
+    }
 }
