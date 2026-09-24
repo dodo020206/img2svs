@@ -23,8 +23,9 @@ The native backends are:
 - `.csp`: indexed JPEG tiles, pyramid levels and label/macro images.
 - `.kfb`: KFBio indexed JPEG tiles, sparse tile placement, pyramid levels and
   label/macro images.
-- `.mdsx` / `.msdx`: BKIO container, UTF-16/Base64 XML, INI metadata, JPEG
-  tiles and label/macro images.
+- `.mdsx` / `.msdx` / `.mdss`: BKIO container, UTF-16/Base64 XML, INI metadata,
+  JPEG tiles and label/macro images. The three extensions share one byte layout,
+  so they are served by the same reader.
 - `.sdpc` / `.dyqx`: JPEG- and HEVC-compressed SDPC files, including non-16-aligned source
   tiles such as `616x880`; adjacent source tiles are composed into valid TIFF
   output tiles and the final row/column is white-padded. HEVC uses the bundled
