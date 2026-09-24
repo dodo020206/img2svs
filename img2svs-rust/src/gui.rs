@@ -15,12 +15,12 @@ use std::thread;
 use std::time::Instant;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "csp", "dmetrix", "kfb", "mdsx", "msdx", "mrxs", "ndpi", "tif", "tiff", "sdpc", "dyqx",
+    "csp", "dmetrix", "kfb", "mdss", "mdsx", "msdx", "mrxs", "ndpi", "tif", "tiff", "sdpc", "dyqx",
 ];
 
 /// Display names for the format strip in the header.
 const FORMAT_LABELS: &[&str] = &[
-    "CSP", "DMETRIX", "KFB", "MDSX", "MSDX", "MRXS", "NDPI", "TIF/TIFF", "SDPC", "DYQX",
+    "CSP", "DMETRIX", "KFB", "MDSS", "MDSX", "MSDX", "MRXS", "NDPI", "TIF/TIFF", "SDPC", "DYQX",
 ];
 
 /// Design tokens for the view layer.
@@ -1511,7 +1511,7 @@ fn convert_one(
     let slide = match extension.as_str() {
         "dmetrix" => dmetrix::parse(&input)?,
         "sdpc" | "dyqx" => sdpc::parse(&input)?,
-        "csp" | "kfb" | "mdsx" | "msdx" => indexed::parse(&input)?,
+        "csp" | "kfb" | "mdss" | "mdsx" | "msdx" => indexed::parse(&input)?,
         "ndpi" | "mrxs" | "tif" | "tiff" => {
             let selected_quality = quality.unwrap_or(75);
             vips::convert(&input, output, selected_quality, overwrite)?;

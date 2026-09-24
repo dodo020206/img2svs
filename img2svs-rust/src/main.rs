@@ -24,7 +24,7 @@ use std::time::Instant;
     about = "Convert supported whole-slide files to Aperio SVS"
 )]
 struct Args {
-    /// Input .csp/.dmetrix/.kfb/.mdsx/.msdx/.mrxs/.ndpi/.tif/.tiff/.sdpc/.dyqx file.
+    /// Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.tif/.tiff/.sdpc/.dyqx file.
     /// Omit it to launch the GUI.
     input: Option<PathBuf>,
     /// Output .svs file. Defaults to the input path with an .svs extension.
@@ -73,7 +73,7 @@ fn run() -> Result<()> {
     let slide = match backend.as_str() {
         "dmetrix" => dmetrix::parse(&input)?,
         "sdpc" | "dyqx" => sdpc::parse(&input)?,
-        "csp" | "kfb" | "mdsx" | "msdx" => indexed::parse(&input)?,
+        "csp" | "kfb" | "mdss" | "mdsx" | "msdx" => indexed::parse(&input)?,
         "ndpi" | "mrxs" | "tif" | "tiff" => {
             let output = args
                 .output
