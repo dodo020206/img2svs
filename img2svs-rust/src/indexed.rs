@@ -1,6 +1,9 @@
 //! Rust readers for the vendor containers that store JPEG tiles in an index.
 //! The layouts mirror the validated Python readers, but all data stays on disk
 //! and is consumed by the common SVS writer through byte ranges.
+//!
+//! The BKIO container is shared by Motic's `.mdsx`, `.msdx` and `.mdss` slides,
+//! so [`parse`] routes all three extensions to the same reader.
 
 use crate::binary::Reader;
 use crate::model::{
@@ -72,7 +75,7 @@ const KFB_TILE_LEADING_RESERVED_SIZE: usize = 4;
 const KFB_TILE_MID_RESERVED_SIZE: usize = 8;
 const KFB_TILE_OFFSET_SIZE: usize = 8;
 const KFB_TILE_TAIL_SIZE: usize = 20;
-/// Magic of the MDSX container.
+/// Magic of the BKIO container used by `.mdsx`, `.msdx` and `.mdss`.
 const MDSX_MAGIC: &[u8] = b"BKIO";
 /// Offset and entry count of the block offset table.
 const MDSX_BLOCK_TABLE_OFFSET: u64 = 84;
@@ -107,7 +110,7 @@ pub fn parse(path: &Path) -> Result<Slide> {
     {
         "csp" => parse_csp(path),
         "kfb" => parse_kfb(path),
-        "mdsx" | "msdx" => parse_mdsx(path),
+        "mdsx" | "msdx" | "mdss" => parse_mdsx(path),
         extension => bail!("unsupported indexed slide extension: .{extension}"),
     }
 }
@@ -657,6 +660,11 @@ struct MdsxSections {
     slide: ByteRange,
 }
 
+/// Reads a Motic BKIO slide (`.mdsx`, `.msdx` or `.mdss`).
+///
+/// The three extensions differ only in their name: the container, the UTF-16 /
+/// Base64 XML sections, the pyramid tile index and the label/macro JPEGs are
+/// byte-for-byte the same layout.
 fn parse_mdsx(path: &Path) -> Result<Slide> {
     let mut reader = Reader::open(path)?;
     if reader.bytes(4, "MDSX magic")? != MDSX_MAGIC {
