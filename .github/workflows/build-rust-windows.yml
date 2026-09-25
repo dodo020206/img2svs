@@ -9,10 +9,12 @@ on:
       - "v*"
     paths:
       - "img2svs-rust/**"
+      - "scripts/**"
       - ".github/workflows/build-rust-windows.yml"
   pull_request:
     paths:
       - "img2svs-rust/**"
+      - "scripts/**"
       - ".github/workflows/build-rust-windows.yml"
 
 permissions:
@@ -56,35 +58,24 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $packageRoot = Join-Path $env:GITHUB_WORKSPACE "dist\PathologySVSConverter-rust"
-          $vipsArchive = Join-Path $env:RUNNER_TEMP "vips.zip"
-          $vipsExtract = Join-Path $env:RUNNER_TEMP "vips"
-          $pyavTarget = Join-Path $env:RUNNER_TEMP "pyav"
-          New-Item -ItemType Directory -Force -Path $packageRoot, $vipsExtract, $pyavTarget | Out-Null
+          $runtimeRoot = Join-Path $env:RUNNER_TEMP "img2svs-runtimes"
+          New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 
           Copy-Item -LiteralPath "img2svs-rust\target\release\img2svs-rust.exe" -Destination $packageRoot
           Copy-Item -LiteralPath "img2svs-rust\README.md" -Destination $packageRoot
 
-          $vipsUrl = "https://github.com/libvips/build-win64-mxe/releases/download/v$env:LIBVIPS_VERSION/vips-dev-w64-all-$env:LIBVIPS_VERSION.zip"
-          Invoke-WebRequest -Uri $vipsUrl -OutFile $vipsArchive
-          Expand-Archive -LiteralPath $vipsArchive -DestinationPath $vipsExtract
-          $vipsExe = Get-ChildItem -LiteralPath $vipsExtract -Recurse -File -Filter "vips.exe" |
-            Where-Object { $_.Directory.Name -eq "bin" } |
-            Select-Object -First 1
-          if (-not $vipsExe) {
-            throw "Downloaded libvips archive does not contain bin\vips.exe"
-          }
-          $vipsRoot = Split-Path -Parent $vipsExe.Directory.FullName
-          Copy-Item -LiteralPath $vipsRoot -Destination (Join-Path $packageRoot "vips") -Recurse
+          # Same acquisition path the local developer workflow uses, so the
+          # runtime versions and layout stay in one place.
+          # LIBVIPS_VERSION / PYAV_VERSION come from the job environment.
+          & "scripts\fetch_native_runtimes.ps1" -Destination $runtimeRoot
 
-          python -m pip install --disable-pip-version-check --only-binary=:all: --target $pyavTarget "av==$env:PYAV_VERSION"
-          if ($LASTEXITCODE -ne 0) {
-            throw "PyAV runtime installation failed with exit code $LASTEXITCODE"
+          foreach ($runtime in @("vips", "av.libs")) {
+            $source = Join-Path $runtimeRoot $runtime
+            if (-not (Test-Path -LiteralPath $source)) {
+              throw "The runtime acquisition script did not produce: $source"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $packageRoot $runtime) -Recurse
           }
-          $avLibs = Get-ChildItem -LiteralPath $pyavTarget -Directory -Filter "av.libs" | Select-Object -First 1
-          if (-not $avLibs) {
-            throw "PyAV wheel does not contain av.libs"
-          }
-          Copy-Item -LiteralPath $avLibs.FullName -Destination (Join-Path $packageRoot "av.libs") -Recurse
 
       - name: Smoke-test portable package
         shell: pwsh

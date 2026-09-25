@@ -50,10 +50,11 @@ img2svs\
 tests\           自动化测试
 tools\           性能测试等开发工具
 packaging\       PyInstaller 打包配置
-vips\            随 EXE 分发的 libvips 运行库
 ```
 
 根目录的 `svs_gui.py` 和 `convert_to_svs.py` 是兼容入口，实际功能代码均在 `img2svs` 包内。
+
+`libvips` 运行库不再放在本项目内，改由仓库根目录的 `third_party\` 统一提供，与 Rust 实现共用一份；获取方式见仓库根目录的 `README.md`。
 
 ## 界面使用方式
 
@@ -90,7 +91,9 @@ vips\            随 EXE 分发的 libvips 运行库
 set VIPS_HOME=C:\vips
 ```
 
-`build_windows_exe.bat` 也会自动尝试查找这些目录：项目下的 `vips`、`third_party\vips`、`C:\vips`、`C:\Program Files\vips*`。
+也可以直接用仓库共享的那一份：在仓库根目录运行 `pwsh -File scripts\fetch_native_runtimes.ps1`，`libvips` 会被放到 `third_party\vips`。
+
+`build_windows_exe.bat` 会自动尝试查找这些目录：项目的 `vips`、项目的 `third_party\vips`、仓库根目录的 `third_party\vips`、`C:\vips`、`C:\Program Files\vips*`。
 
 如果安装了 `UPX`，也可以额外设置：
 

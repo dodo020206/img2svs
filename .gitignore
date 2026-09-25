@@ -8,3 +8,8 @@
 /.verify/
 /.baseline-img2svs-rust.exe
 /test-output/
+
+# Native runtimes shared by img2svs-rust and img2svs-python.
+# Run scripts/fetch_native_runtimes.ps1 to populate this directory.
+/third_party/*
+!/third_party/README.md
