@@ -1,6 +1,8 @@
 # img2svs Rust
 
 This is the native Rust implementation of the converter in `../img2svs-python`.
+The repository layout, the shared native runtimes and the build entry points are
+described in [`../README.md`](../README.md).
 
 ## GUI
 
@@ -46,8 +48,8 @@ cargo run --release -- test_data/2605551-jpeg.sdpc -o test_output-rust/2605551.s
 
 JPEG/HEVC SDPC/DYQX and all formats listed above are supported by the Rust
 GUI/CLI. HEVC requires the FFmpeg native runtime: set `FFMPEG_HOME`, or place
-the bundled `av.libs` directory next to the executable. NDPI/MRXS require the
-TIFF/NDPI/MRXS require the OpenSlide/libvips runtime: set `VIPS_HOME`, or place the runtime at
+the bundled `av.libs` directory next to the executable. NDPI/MRXS and TIFF input
+require the OpenSlide/libvips runtime: set `VIPS_HOME`, or place the runtime at
 `vips\bin` next to the executable.
 Runtime discovery is relative to the executable or environment variables and
 does not depend on a development-machine path. NDPI/MRXS conversion keeps
@@ -84,10 +86,18 @@ cargo build --release
  .\target\release\img2svs-rust.exe --smoke-test
 ```
 
-For the repository's Windows development runtime, `build_windows.ps1` also
-copies `../img2svs-python/vips` and the FFmpeg DLLs beside the executable when
-those directories are present. Distribute the complete release directory,
-including `vips` and `av.libs`, rather than the executable alone.
+The repository keeps a single copy of the native runtimes in `../third_party`.
+Populate it once from the repository root:
+
+```powershell
+pwsh -File ..\scripts\fetch_native_runtimes.ps1
+```
+
+`build_windows.ps1` then copies `vips` and `av.libs` beside the executable. It
+resolves each runtime from `-VipsHome` / `-FfmpegHome`, `VIPS_HOME` /
+`FFMPEG_HOME`, or `../third_party`, and warns instead of staying silent when one
+is missing. Distribute the complete release directory, including `vips` and
+`av.libs`, rather than the executable alone.
 
 `--smoke-test` initializes the native window and closes after the first frame;
 it is useful for CI or packaging checks without leaving a GUI process running.

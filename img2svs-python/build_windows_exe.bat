@@ -34,6 +34,7 @@ if errorlevel 1 (
 
 if not defined VIPS_HOME if exist "%cd%\vips" set "VIPS_HOME=%cd%\vips"
 if not defined VIPS_HOME if exist "%cd%\third_party\vips" set "VIPS_HOME=%cd%\third_party\vips"
+if not defined VIPS_HOME if exist "%~dp0..\third_party\vips" set "VIPS_HOME=%~dp0..\third_party\vips"
 if not defined VIPS_HOME if exist "C:\vips" set "VIPS_HOME=C:\vips"
 if not defined VIPS_HOME for /d %%D in ("C:\Program Files\vips*") do if not defined VIPS_HOME set "VIPS_HOME=%%~fD"
 if not defined VIPS_HOME for /d %%D in ("C:\Program Files\libvips*") do if not defined VIPS_HOME set "VIPS_HOME=%%~fD"

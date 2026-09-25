@@ -53,6 +53,7 @@ for raw in (
     os.environ.get("VIPS_HOME"),
     project_dir / "vips",
     project_dir / "third_party" / "vips",
+    project_dir.parent / "third_party" / "vips",
 ):
     if not raw:
         continue
