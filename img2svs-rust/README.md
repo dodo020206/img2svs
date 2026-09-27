@@ -43,6 +43,18 @@ cargo run --release -- test_data/dmetrix/1.dmetrix -o test_output-rust/1.svs --o
 cargo run --release -- test_data/2605551-jpeg.sdpc -o test_output-rust/2605551.svs --overwrite
 ```
 
+CLI 参数（两个变体共用，`--gui` / `--smoke-test` 仅 GUI 变体）：
+
+| 参数 | 说明 |
+| --- | --- |
+| `<输入文件>` | 支持 `.csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.tif/.tiff/.sdpc/.dyqx`；GUI 变体省略时启动界面 |
+| `-o, --output <路径>` | 输出 `.svs` 路径，默认为输入路径改扩展名 |
+| `--jpeg-quality <1-100>` | 输出 JPEG 质量；默认沿用源文件元数据，libvips 路径（ndpi/mrxs/tif）默认 75 |
+| `--overwrite` | 覆盖已存在的输出文件 |
+| `--info` | 只解析并打印切片元数据，不转换 |
+| `--gui` | 启动 GUI（仅 GUI 变体） |
+| `--version` | 输出版本并带 `(gui)` / `(cli)` 变体后缀 |
+
 Rust GUI/CLI 支持 JPEG/HEVC 的 SDPC/DYQX 以及上述所有格式。
 HEVC 需要 FFmpeg 原生运行库：设置 `FFMPEG_HOME`，或将随附的
 `av.libs` 目录放在可执行文件旁边。NDPI/MRXS 和 TIFF 输入需要

@@ -18,6 +18,8 @@
 
 - `SVS`
 
+注：`.mdss` 与 `.tif/.tiff` 输入仅 Rust 实现（`..\img2svs-rust`）支持，本项目不支持。
+
 ## 直接运行
 
 建议先进入项目虚拟环境，然后运行：
@@ -93,7 +95,7 @@ set VIPS_HOME=C:\vips
 
 也可以直接用仓库共享的那一份：在仓库根目录运行 `pwsh -File scripts\fetch_native_runtimes.ps1`，`libvips` 会被放到 `third_party\vips`。
 
-`build_windows_exe.bat` 会自动尝试查找这些目录：项目的 `vips`、项目的 `third_party\vips`、仓库根目录的 `third_party\vips`、`C:\vips`、`C:\Program Files\vips*`。
+`build_windows_exe.bat` 会自动尝试查找这些目录：项目的 `vips`、项目的 `third_party\vips`、仓库根目录的 `third_party\vips`、`C:\vips`、`C:\Program Files\vips*`、`C:\Program Files\libvips*`。
 
 如果安装了 `UPX`，也可以额外设置：
 
