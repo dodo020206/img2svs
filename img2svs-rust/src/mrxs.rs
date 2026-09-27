@@ -18,8 +18,8 @@
 //! them through the same positioned-tile path as KFB.
 //!
 //! Current limitations: every zoom level must store JPEG tiles (PNG/BMP24
-//! variants fall back to the libvips path), and tiles missing from the index
-//! are filled with white regardless of `IMAGE_FILL_COLOR_BGR`.
+//! variants are rejected), and tiles missing from the index are filled with
+//! white regardless of `IMAGE_FILL_COLOR_BGR`.
 
 use crate::model::{
     assign_tile_groups, AssociatedImage, ByteRange, Compression, Level, Metadata, Slide,
@@ -133,6 +133,7 @@ pub fn parse(path: &Path) -> Result<Slide> {
         width,
         height,
         data,
+        ..Default::default()
     });
 
     let mut associated_images = Vec::new();
@@ -152,6 +153,7 @@ pub fn parse(path: &Path) -> Result<Slide> {
             associated_images.push(AssociatedImage {
                 kind: kind.to_owned(),
                 data,
+                ..Default::default()
             });
         }
     }
@@ -710,6 +712,7 @@ fn build_levels(
             tiles,
             tile_positions,
             tile_groups: Vec::new(),
+            tiling: Default::default(),
         });
     }
     assign_tile_groups(&mut levels, OUTPUT_TILE_SIZE, OUTPUT_TILE_SIZE);

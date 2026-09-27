@@ -1,4 +1,4 @@
-use crate::{dmetrix, indexed, mrxs, sdpc, svs, vips};
+use crate::{dmetrix, indexed, mrxs, ndpi, sdpc, svs, tiff};
 use anyhow::{bail, Context, Result};
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, RichText,
@@ -15,12 +15,14 @@ use std::thread;
 use std::time::Instant;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "csp", "dmetrix", "kfb", "mdss", "mdsx", "msdx", "mrxs", "ndpi", "tif", "tiff", "sdpc", "dyqx",
+    "csp", "dmetrix", "kfb", "mdss", "mdsx", "msdx", "mrxs", "ndpi", "sdpc", "dyqx", "svs", "tif",
+    "tiff",
 ];
 
 /// Display names for the format strip in the header.
 const FORMAT_LABELS: &[&str] = &[
-    "CSP", "DMETRIX", "KFB", "MDSS", "MDSX", "MSDX", "MRXS", "NDPI", "TIF/TIFF", "SDPC", "DYQX",
+    "CSP", "DMETRIX", "KFB", "MDSS", "MDSX", "MSDX", "MRXS", "NDPI", "SDPC", "DYQX", "SVS",
+    "TIF/TIFF",
 ];
 
 /// Design tokens for the view layer.
@@ -1512,29 +1514,9 @@ fn convert_one(
         "dmetrix" => dmetrix::parse(&input)?,
         "sdpc" | "dyqx" => sdpc::parse(&input)?,
         "csp" | "kfb" | "mdss" | "mdsx" | "msdx" => indexed::parse(&input)?,
-        "mrxs" => {
-            let selected_quality = quality.unwrap_or(75);
-            let native = mrxs::parse(&input).and_then(|slide| {
-                svs::write_slide(
-                    &slide,
-                    output,
-                    &svs::WriteOptions {
-                        jpeg_quality: selected_quality,
-                        overwrite,
-                    },
-                )
-            });
-            if let Err(error) = native {
-                eprintln!("Native MRXS conversion failed ({error:#}); falling back to libvips");
-                vips::convert(&input, output, selected_quality, overwrite)?;
-            }
-            return Ok(output.to_path_buf());
-        }
-        "ndpi" | "tif" | "tiff" => {
-            let selected_quality = quality.unwrap_or(75);
-            vips::convert(&input, output, selected_quality, overwrite)?;
-            return Ok(output.to_path_buf());
-        }
+        "mrxs" => mrxs::parse(&input)?,
+        "tif" | "tiff" | "svs" => tiff::parse(&input)?,
+        "ndpi" => ndpi::parse(&input)?,
         other => bail!("unsupported input extension .{other}"),
     };
     let selected_quality = quality.unwrap_or(slide.metadata.jpeg_quality);

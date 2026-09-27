@@ -21,6 +21,35 @@ const MIN_JPEG_BUFFER: usize = 1024;
 /// Start-of-image marker that opens every JPEG stream.
 pub const SOI_MARKER: [u8; 2] = [0xff, 0xd8];
 
+/// End-of-image marker that closes every JPEG stream.
+pub const EOI_MARKER: [u8; 2] = [0xff, 0xd9];
+
+/// Joins a TIFF `JPEGTables` stream with one strip's abbreviated stream.
+///
+/// TIFF Compression=7 lets a stripped page keep quantization and Huffman
+/// tables once in tag 347 and let every strip omit them.  The tables hold
+/// `SOI + DQT + DHT + EOI`, a strip holds `SOI + SOF + SOS + entropy + EOI`,
+/// so the two pieces splice into a self-contained JPEG once the duplicated
+/// markers are dropped.  Vendors that store full streams instead leave the
+/// tables empty, in which case the strip is returned untouched.
+pub fn merge_jpeg_tables(tables: &[u8], strip: &[u8]) -> Result<Vec<u8>> {
+    if tables.is_empty() {
+        return Ok(strip.to_vec());
+    }
+    if !tables.starts_with(&SOI_MARKER) {
+        bail!("TIFF JPEGTables stream does not start with SOI");
+    }
+    let tables = tables.strip_suffix(&EOI_MARKER).unwrap_or(tables);
+    let body = strip.strip_prefix(&SOI_MARKER).unwrap_or(strip);
+    let mut merged = Vec::with_capacity(tables.len() + body.len() + 2);
+    merged.extend_from_slice(&tables[..]);
+    merged.extend_from_slice(body);
+    if !merged.ends_with(&EOI_MARKER) {
+        merged.extend_from_slice(&EOI_MARKER);
+    }
+    Ok(merged)
+}
+
 /// Splits a full interchange JPEG into a tables-only stream (for the TIFF
 /// `JPEGTables` tag) and an abbreviated stream (for the tile payload).
 ///

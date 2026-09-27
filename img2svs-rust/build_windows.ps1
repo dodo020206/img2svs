@@ -3,18 +3,20 @@
     Build img2svs-rust and place the native runtimes next to the executable.
 
 .DESCRIPTION
-    Runtime lookup order for each dependency (first match wins):
+    Every input format is decoded and written by this repository, so no
+    OpenSlide/libvips runtime is involved.  FFmpeg stays because HEVC-compressed
+    .sdpc/.dyqx sources need it.
 
-      1. -VipsHome / -FfmpegHome parameter
-      2. VIPS_HOME / FFMPEG_HOME environment variable
-      3. <repository root>\third_party\vips and \third_party\av.libs
-      4. %USERPROFILE%\vips
+    Runtime lookup order for FFmpeg (first match wins):
+
+      1. -FfmpegHome parameter
+      2. FFMPEG_HOME environment variable
+      3. <repository root>\third_party\av.libs
 
     Nothing points into img2svs-python. Populate third_party\ once with
     scripts\fetch_native_runtimes.ps1 and both projects use the same copy.
 #>
 param(
-    [string]$VipsHome,
     [string]$FfmpegHome
 )
 
@@ -77,16 +79,6 @@ cargo build --release
 
 $binary = Join-Path $projectRoot "target\release\img2svs-rust.exe"
 $releaseRoot = Join-Path $projectRoot "target\release"
-
-$vipsCandidates = @($VipsHome, $env:VIPS_HOME, (Join-Path $repositoryRoot "third_party\vips"))
-if ($env:USERPROFILE) { $vipsCandidates += (Join-Path $env:USERPROFILE "vips") }
-$vipsRoot = Find-RuntimeRoot -Candidates $vipsCandidates -NamePattern "libvips-*.dll"
-if ($vipsRoot) {
-    Copy-RuntimeDirectory -Source $vipsRoot -Destination (Join-Path $releaseRoot "vips") -Label "OpenSlide/libvips"
-} else {
-    Write-Warning "libvips runtime not found; .ndpi/.mrxs/.tif conversion stays unavailable."
-    Write-Warning "Run scripts\fetch_native_runtimes.ps1, pass -VipsHome, or set VIPS_HOME."
-}
 
 $ffmpegCandidates = @($FfmpegHome, $env:FFMPEG_HOME, (Join-Path $repositoryRoot "third_party\av.libs"))
 $avLibsRoot = Find-RuntimeRoot -Candidates $ffmpegCandidates -NamePattern "avcodec-*.dll"
