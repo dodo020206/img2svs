@@ -4,6 +4,7 @@
 /target-rust-pr/
 /target-rust-tif/
 /release/
+/dist/
 /test_data/
 /.verify/
 /.baseline-img2svs-rust.exe

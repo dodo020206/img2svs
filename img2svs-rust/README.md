@@ -1,84 +1,92 @@
 # img2svs Rust
 
-This is the native Rust implementation of the converter in `../img2svs-python`.
-The repository layout, the shared native runtimes and the build entry points are
-described in [`../README.md`](../README.md).
+这是 `../img2svs-python` 中转换器的原生 Rust 实现。
+仓库布局、共享原生运行库和构建入口的说明见
+[`../README.md`](../README.md)。
 
 ## GUI
 
-Run the executable without arguments, or pass `--gui`:
+不带参数直接运行可执行文件，或传入 `--gui`：
 
 ```powershell
 .\target\release\img2svs-rust.exe
 .\target\release\img2svs-rust.exe --gui
 ```
 
-The GUI supports multi-file selection, recursive folder scanning, Windows drag
-and drop, output-folder selection, JPEG quality, overwrite/associated-image
-options, a queued background worker, progress, per-file status, logs and
-cooperative cancellation. Each row has its own `移除` button. Shortcuts are
-`Ctrl+O` (files), `Ctrl+Shift+O` (folder), `F5` (start) and `Esc` (stop).
+GUI 支持多文件选择、递归文件夹扫描、Windows 拖放、输出文件夹选择、
+JPEG 质量、覆盖/关联图像选项、队列式后台工作线程、进度显示、逐文件状态、
+日志以及协作式取消。每一行都有独立的 `移除` 按钮。快捷键为
+`Ctrl+O`（文件）、`Ctrl+Shift+O`（文件夹）、`F5`（开始）和 `Esc`（停止）。
 
-The native backends are:
+原生后端包括：
 
-- `.dmetrix`: JPEG tiles, pyramid levels, label and macro images.
-- `.csp`: indexed JPEG tiles, pyramid levels and label/macro images.
-- `.kfb`: KFBio indexed JPEG tiles, sparse tile placement, pyramid levels and
-  label/macro images.
-- `.mdsx` / `.msdx` / `.mdss`: BKIO container, UTF-16/Base64 XML, INI metadata,
-  JPEG tiles and label/macro images. The three extensions share one byte layout,
-  so they are served by the same reader.
-- `.sdpc` / `.dyqx`: JPEG- and HEVC-compressed SDPC files, including non-16-aligned source
-  tiles such as `616x880`; adjacent source tiles are composed into valid TIFF
-  output tiles and the final row/column is white-padded. HEVC uses the bundled
-  FFmpeg native runtime when available.
-- `.ndpi` / `.mrxs`: OpenSlide/libvips-backed streaming loading and pyramidal
-  JPEG SVS output (classic TIFF when possible, BigTIFF only when required),
-  including the Aperio description and thumbnail pages; the Rust adapter does
-  not materialize the whole slide as an uncompressed intermediate image.
-- `.tif` / `.tiff`: tiled or scanline TIFF input through libvips, with TIFF
-  resolution and objective-power metadata carried into a pyramidal JPEG SVS.
+- `.dmetrix`：JPEG 瓦片、金字塔层级、标签和宏观图像。
+- `.csp`：索引式 JPEG 瓦片、金字塔层级、标签/宏观图像。
+- `.kfb`：KFBio 索引式 JPEG 瓦片、稀疏瓦片布局、金字塔层级、
+  标签/宏观图像。
+- `.mdsx` / `.msdx` / `.mdss`：BKIO 容器、UTF-16/Base64 XML、INI 元数据、
+  JPEG 瓦片、标签/宏观图像。三种扩展名共用同一种字节布局，
+  因此由同一个读取器处理。
+- `.sdpc` / `.dyqx`：JPEG 和 HEVC 压缩的 SDPC 文件，包括非 16 对齐的源瓦片
+  （如 `616x880`）；相邻源瓦片会被合成为合法的 TIFF 输出瓦片，
+  最后一行/列用白色填充。HEVC 在可用时使用随附的 FFmpeg 原生运行库。
+- `.ndpi` / `.mrxs`：基于 OpenSlide/libvips 的流式加载和金字塔 JPEG SVS 输出
+  （尽可能使用经典 TIFF，仅在必要时使用 BigTIFF），包括 Aperio 描述页
+  和缩略图页；Rust 适配器不会将整张切片物化为未压缩的中间图像。
+- `.tif` / `.tiff`：通过 libvips 读取瓦片式或扫描线式 TIFF 输入，
+  并将 TIFF 分辨率和物镜倍率元数据带入金字塔 JPEG SVS。
 
-The CLI and output layout are intentionally close to the working Python version:
+CLI 和输出布局有意与可用的 Python 版本保持一致：
 
 ```text
 cargo run --release -- test_data/dmetrix/1.dmetrix -o test_output-rust/1.svs --overwrite
 cargo run --release -- test_data/2605551-jpeg.sdpc -o test_output-rust/2605551.svs --overwrite
 ```
 
-JPEG/HEVC SDPC/DYQX and all formats listed above are supported by the Rust
-GUI/CLI. HEVC requires the FFmpeg native runtime: set `FFMPEG_HOME`, or place
-the bundled `av.libs` directory next to the executable. NDPI/MRXS and TIFF input
-require the OpenSlide/libvips runtime: set `VIPS_HOME`, or place the runtime at
-`vips\bin` next to the executable.
-Runtime discovery is relative to the executable or environment variables and
-does not depend on a development-machine path. NDPI/MRXS conversion keeps
-libvips' hardware-aware concurrency default; `VIPS_CONCURRENCY` can be used as
-an advanced override after benchmarking the target machine.
+CLI 参数（两个变体共用，`--gui` / `--smoke-test` 仅 GUI 变体）：
 
-## Performance
+| 参数 | 说明 |
+| --- | --- |
+| `<输入文件>` | 支持 `.csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.tif/.tiff/.sdpc/.dyqx`；GUI 变体省略时启动界面 |
+| `-o, --output <路径>` | 输出 `.svs` 路径，默认为输入路径改扩展名 |
+| `--jpeg-quality <1-100>` | 输出 JPEG 质量；默认沿用源文件元数据，libvips 路径（ndpi/mrxs/tif）默认 75 |
+| `--overwrite` | 覆盖已存在的输出文件 |
+| `--info` | 只解析并打印切片元数据，不转换 |
+| `--gui` | 启动 GUI（仅 GUI 变体） |
+| `--version` | 输出版本并带 `(gui)` / `(cli)` 变体后缀 |
 
-Native JPEG and HEVC tile decode/encode work runs in a bounded worker pool.
-JPEG conversion defaults to the logical CPU count reported by the operating
-system (up to 64 workers). HEVC keeps one logical CPU available and is capped
-at 32 workers because each worker owns a decoder. Set `IMG2SVS_THREADS` before
-launching the CLI or GUI to override the detected value, for example:
+Rust GUI/CLI 支持 JPEG/HEVC 的 SDPC/DYQX 以及上述所有格式。
+HEVC 需要 FFmpeg 原生运行库：设置 `FFMPEG_HOME`，或将随附的
+`av.libs` 目录放在可执行文件旁边。NDPI/MRXS 和 TIFF 输入需要
+OpenSlide/libvips 运行库：设置 `VIPS_HOME`，或将运行库放在可执行文件
+旁边的 `vips\bin` 中。
+运行库查找相对于可执行文件或环境变量进行，
+不依赖开发机器上的路径。NDPI/MRXS 转换保留 libvips 的
+硬件感知并发默认值；如需高级覆盖，可在对目标机器基准测试后使用
+`VIPS_CONCURRENCY`。
+
+## 性能
+
+原生 JPEG 和 HEVC 瓦片解码/编码工作运行在有界工作线程池中。
+JPEG 转换默认使用操作系统报告的逻辑 CPU 数量（最多 64 个工作线程）。
+HEVC 保留一个逻辑 CPU，且上限为 32 个工作线程，因为每个工作线程
+独占一个解码器。在启动 CLI 或 GUI 前设置 `IMG2SVS_THREADS`
+可覆盖检测到的值，例如：
 
 ```powershell
 $env:IMG2SVS_THREADS = '8'
 .\target\release\img2svs-rust.exe input.csp -o output.svs --overwrite
 ```
 
-JPEG tiles use the Rust encoder's SIMD path. Non-4:2:0 JPEG tiles are decoded
-directly to YCbCr before 4:2:0 encoding, avoiding an unnecessary RGB color
-conversion. Source tiles are read through a shared read-only memory map;
-encoded tiles are buffered only in bounded batches and written in source
-order, so parallel conversion does not load the complete slide into memory or
-change the TIFF tile-offset order.
+JPEG 瓦片使用 Rust 编码器的 SIMD 路径。非 4:2:0 的 JPEG 瓦片在
+4:2:0 编码前直接解码为 YCbCr，避免了不必要的 RGB 色彩转换。
+源瓦片通过共享的只读内存映射读取；编码后的瓦片仅以有界批次缓冲，
+并按源顺序写出，因此并行转换不会将整张切片加载进内存，
+也不会改变 TIFF 瓦片偏移顺序。
 
-## Build and smoke test
+## 构建与冒烟测试
 
-On a normal Rust Windows installation:
+在正常的 Rust Windows 环境上：
 
 ```powershell
  cargo fmt --all -- --check
@@ -86,30 +94,58 @@ cargo build --release
  .\target\release\img2svs-rust.exe --smoke-test
 ```
 
-The repository keeps a single copy of the native runtimes in `../third_party`.
-Populate it once from the repository root:
+仓库在 `../third_party` 中只保留一份原生运行库。
+在仓库根目录执行一次以下命令填充它：
 
 ```powershell
 pwsh -File ..\scripts\fetch_native_runtimes.ps1
 ```
 
-`build_windows.ps1` then copies `vips` and `av.libs` beside the executable. It
-resolves each runtime from `-VipsHome` / `-FfmpegHome`, `VIPS_HOME` /
-`FFMPEG_HOME`, or `../third_party`, and warns instead of staying silent when one
-is missing. Distribute the complete release directory, including `vips` and
-`av.libs`, rather than the executable alone.
+随后 `build_windows.ps1` 会将 `vips` 和 `av.libs` 复制到可执行文件旁边。
+它依次从 `-VipsHome` / `-FfmpegHome`、`VIPS_HOME` / `FFMPEG_HOME`
+或 `../third_party` 解析各运行库，缺失时会发出警告而不是静默跳过。
+分发时请发布完整的 release 目录（包括 `vips` 和 `av.libs`），
+而不是只发可执行文件。
 
-`--smoke-test` initializes the native window and closes after the first frame;
-it is useful for CI or packaging checks without leaving a GUI process running.
+`--smoke-test` 会初始化原生窗口并在第一帧后关闭；
+适用于 CI 或打包检查，不会留下运行中的 GUI 进程。
 
-## GitHub Actions Windows package
+## GUI 与控制台构建
 
-The [`build-rust-windows.yml`](../.github/workflows/build-rust-windows.yml)
-workflow builds and tests the Rust converter on GitHub's Windows runner. It
-downloads the pinned libvips and PyAV runtimes, performs both GUI and
-TIFF-to-SVS smoke tests, and uploads a portable ZIP plus its SHA256 checksum as
-an Actions artifact. The workflow runs for relevant pull requests and `main`
-updates, and it can also be started manually.
+GUI 位于默认的 `gui` cargo feature 之后，两个变体来自同一份源码：
 
-Pushing a tag whose name starts with `v` additionally creates or updates a
-GitHub Release containing the same ZIP and checksum.
+```powershell
+cargo build --release                        # GUI 构建，隐藏控制台
+cargo build --release --no-default-features  # 控制台构建，无 egui/rfd
+```
+
+控制台构建去掉了 egui 和 rfd 依赖，并保留控制台子系统，
+因此命令行输出保持可见，且不接受 `--gui` / `--smoke-test`。
+体积约为 GUI 可执行文件的三分之一。`--version` 会报告
+当前运行的变体，例如 `img2svs 0.1.0 (cli)`。
+
+生成两个便携式 Windows 包（可执行文件、README、`vips` 和 `av.libs`），
+各带一个 ZIP 和一个 SHA256 校验和：
+
+```powershell
+pwsh -File ..\scripts\package_windows.ps1
+```
+
+输出位于 `../dist`：
+
+| 包 | 可执行文件 | 内容 |
+| --- | --- | --- |
+| `PathologySVSConverter-rust-gui\` | `img2svs-rust.exe` | GUI 构建，双击即用，也可传入 CLI 参数 |
+| `PathologySVSConverter-rust-cli\` | `img2svs-cli.exe` | 控制台构建，用于脚本和批处理任务 |
+
+## GitHub Actions Windows 打包
+
+[`build-rust-windows.yml`](../.github/workflows/build-rust-windows.yml)
+工作流在 GitHub 的 Windows runner 上构建并测试 Rust 转换器。
+它下载固定版本的 libvips 和 PyAV 运行库，执行 GUI 和
+TIFF 转 SVS 冒烟测试，并将便携 ZIP 及其 SHA256 校验和
+作为 Actions 产物上传。该工作流会在相关 pull request 和 `main`
+更新时运行，也可手动触发。
+
+推送以 `v` 开头的标签时，还会额外创建或更新一个
+包含相同 ZIP 和校验和的 GitHub Release。
