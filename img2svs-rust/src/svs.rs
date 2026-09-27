@@ -1,7 +1,7 @@
 use crate::hevc::Decoder as HevcDecoder;
 use crate::jpeg::{
-    decode_image, decode_rgb, encode_jpeg, encode_jpeg_with_capacity, thumbnail as make_thumbnail,
-    transcode_jpeg_to_420, white_image, SOI_MARKER,
+    decode_image, decode_rgb, encode_jpeg, encode_jpeg_with_capacity, split_jpeg_tables,
+    thumbnail as make_thumbnail, transcode_jpeg_to_420, white_image, SOI_MARKER,
 };
 use crate::model::{ByteRange, Compression, Level, Slide};
 use anyhow::{anyhow, bail, Context, Result};
@@ -560,14 +560,19 @@ fn write_compatible_big_main(
         big_long(TAG_NEW_SUBFILE_TYPE, 0),
         big_long(TAG_IMAGE_WIDTH, source.width),
         big_long(TAG_IMAGE_LENGTH, source.height),
-        big_short_array(TAG_BITS_PER_SAMPLE, bits),
+        big_short_triplet(
+            TAG_BITS_PER_SAMPLE,
+            source.bits[0],
+            source.bits[1],
+            source.bits[2],
+        ),
         big_short(TAG_COMPRESSION, source.compression),
         big_short(TAG_PHOTOMETRIC_INTERPRETATION, source.photometric),
         big_ascii_at(TAG_IMAGE_DESCRIPTION, desc, description.len() + 1)?,
         big_short(TAG_ORIENTATION, 1),
         big_short(TAG_SAMPLES_PER_PIXEL, source.samples),
-        big_rational(TAG_X_RESOLUTION, xres),
-        big_rational(TAG_Y_RESOLUTION, xres + 8),
+        big_rational_inline(TAG_X_RESOLUTION, resolution),
+        big_rational_inline(TAG_Y_RESOLUTION, resolution),
         big_short(TAG_PLANAR_CONFIGURATION, source.planar),
         big_short(TAG_RESOLUTION_UNIT, 3),
         big_long(TAG_TILE_WIDTH, source.tile_width),
@@ -575,7 +580,7 @@ fn write_compatible_big_main(
         big_long8_values_at(TAG_TILE_OFFSETS, &source.tile_offsets, offsets)?,
         big_long8_values_at(TAG_TILE_BYTE_COUNTS, &source.tile_byte_counts, counts)?,
         big_ascii_at(TAG_SOFTWARE, software, 13)?,
-        big_short_array(TAG_SAMPLE_FORMAT, sample_format),
+        big_short_triplet(TAG_SAMPLE_FORMAT, 1, 1, 1),
     ];
     if !source.jpeg_tables.is_empty() {
         entries.push(big_undefined(
@@ -647,7 +652,7 @@ fn write_compatible_big_thumbnail(
     let mut entries = vec![
         big_long(TAG_IMAGE_WIDTH, image.width()),
         big_long(TAG_IMAGE_LENGTH, image.height()),
-        big_short_array(TAG_BITS_PER_SAMPLE, bits),
+        big_short_triplet(TAG_BITS_PER_SAMPLE, 8, 8, 8),
         big_short(TAG_COMPRESSION, 7),
         big_short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
         BigEntry {
@@ -665,8 +670,8 @@ fn write_compatible_big_thumbnail(
         },
         big_short(TAG_ORIENTATION, 1),
         big_short(TAG_SAMPLES_PER_PIXEL, 3),
-        big_rational(TAG_X_RESOLUTION, xres),
-        big_rational(TAG_Y_RESOLUTION, xres + 8),
+        big_rational_inline(TAG_X_RESOLUTION, resolution),
+        big_rational_inline(TAG_Y_RESOLUTION, resolution),
         big_short(TAG_PLANAR_CONFIGURATION, 1),
         big_short(TAG_RESOLUTION_UNIT, 3),
         big_short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
@@ -768,8 +773,7 @@ fn temporary_path(output: &Path) -> PathBuf {
 }
 
 fn write_slide_inner(slide: &Slide, output: &Path, options: &WriteOptions) -> Result<()> {
-    let mut input =
-        File::open(&slide.path).with_context(|| format!("open input {}", slide.path.display()))?;
+    let mut input = SourceFiles::open(slide)?;
     let mut writer = TiffWriter::create(output)?;
     let mut hevc = if slide.compression == Compression::Hevc {
         Some(HevcDecoder::new()?)
@@ -797,7 +801,7 @@ fn write_slide_inner(slide: &Slide, output: &Path, options: &WriteOptions) -> Re
     }
 
     for associated in &slide.associated_images {
-        let bytes = read_range(&mut input, associated.data.offset, associated.data.length)?;
+        let bytes = input.read_range(associated.data.offset, associated.data.length)?;
         if bytes.is_empty() {
             continue;
         }
@@ -813,15 +817,61 @@ fn write_slide_inner(slide: &Slide, output: &Path, options: &WriteOptions) -> Re
     writer.finish()
 }
 
+/// Read handles over the virtual source space of a slide.
+///
+/// Single-file slides hold exactly one entry whose base is zero; multi-file
+/// containers (MRXS `Data*.dat`) hold one handle per backing file and ranges
+/// are resolved by their virtual base offsets.
+struct SourceFiles {
+    files: Vec<(u64, File)>,
+}
+
+impl SourceFiles {
+    fn open(slide: &Slide) -> Result<Self> {
+        if slide.sources.is_empty() {
+            let file = File::open(&slide.path)
+                .with_context(|| format!("open input {}", slide.path.display()))?;
+            return Ok(Self {
+                files: vec![(0, file)],
+            });
+        }
+        let mut files = Vec::with_capacity(slide.sources.len());
+        for source in &slide.sources {
+            let file = File::open(&source.path)
+                .with_context(|| format!("open input {}", source.path.display()))?;
+            files.push((source.base, file));
+        }
+        files.sort_by_key(|(base, _)| *base);
+        Ok(Self { files })
+    }
+
+    fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let size = usize::try_from(length).context("tile is too large for this platform")?;
+        let index = self
+            .files
+            .partition_point(|(base, _)| *base <= offset)
+            .checked_sub(1)
+            .context("source range precedes the first backing file")?;
+        let (base, file) = &mut self.files[index];
+        file.seek(SeekFrom::Start(offset - *base))?;
+        let mut bytes = vec![0; size];
+        std::io::Read::read_exact(file, &mut bytes)?;
+        Ok(bytes)
+    }
+}
+
 fn render_thumbnail(
     slide: &Slide,
-    input: &mut File,
+    input: &mut SourceFiles,
     quality: u8,
     hevc: Option<&mut HevcDecoder>,
 ) -> Result<RgbImage> {
     if let Some(thumbnail) = &slide.thumbnail {
         let _declared_thumbnail_size = (thumbnail.width, thumbnail.height);
-        let bytes = read_range(input, thumbnail.data.offset, thumbnail.data.length)?;
+        let bytes = input.read_range(thumbnail.data.offset, thumbnail.data.length)?;
         if !bytes.is_empty() {
             if let Ok(image) = decode_image(&bytes) {
                 return Ok(make_thumbnail(&image, 1024));
@@ -835,7 +885,7 @@ fn render_thumbnail(
 
 fn render_level(
     slide: &Slide,
-    input: &mut File,
+    input: &mut SourceFiles,
     level: &Level,
     _quality: u8,
     mut hevc: Option<&mut HevcDecoder>,
@@ -845,7 +895,7 @@ fn render_level(
         if !range.present() {
             continue;
         }
-        let bytes = read_range(input, range.offset, range.length)?;
+        let bytes = input.read_range(range.offset, range.length)?;
         let tile = decode_tile(slide, &bytes, hevc.as_deref_mut())?;
         if let Some(position) = level.tile_positions.get(index) {
             copy_region(
@@ -853,6 +903,8 @@ fn render_level(
                 &tile,
                 position.x,
                 position.y,
+                position.src_x,
+                position.src_y,
                 position.width,
                 position.height,
             );
@@ -894,37 +946,73 @@ fn copy_clipped(dst: &mut RgbImage, src: &RgbImage, left: u32, top: u32) {
     }
 }
 
-fn copy_region(dst: &mut RgbImage, src: &RgbImage, left: u32, top: u32, width: u32, height: u32) {
+fn copy_region(
+    dst: &mut RgbImage,
+    src: &RgbImage,
+    left: u32,
+    top: u32,
+    src_x: u32,
+    src_y: u32,
+    width: u32,
+    height: u32,
+) {
     if left >= dst.width() || top >= dst.height() {
         return;
     }
-    let width = width.min(src.width()).min(dst.width() - left);
-    let height = height.min(src.height()).min(dst.height() - top);
+    let width = width
+        .min(src.width().saturating_sub(src_x))
+        .min(dst.width() - left);
+    let height = height
+        .min(src.height().saturating_sub(src_y))
+        .min(dst.height() - top);
     for y in 0..height {
         for x in 0..width {
-            dst.put_pixel(left + x, top + y, *src.get_pixel(x, y));
+            dst.put_pixel(left + x, top + y, *src.get_pixel(src_x + x, src_y + y));
         }
     }
 }
 
-fn read_range(input: &mut File, offset: u64, length: u64) -> Result<Vec<u8>> {
-    if length == 0 {
-        return Ok(Vec::new());
-    }
-    let size = usize::try_from(length).context("tile is too large for this platform")?;
-    input.seek(SeekFrom::Start(offset))?;
-    let mut bytes = vec![0; size];
-    std::io::Read::read_exact(input, &mut bytes)?;
-    Ok(bytes)
+/// Memory-mapped view over the virtual source space of a slide.
+struct SourceMaps {
+    maps: Vec<(u64, memmap2::Mmap)>,
 }
 
-fn mapped_range(source: &[u8], range: ByteRange) -> Result<&[u8]> {
-    let start = usize::try_from(range.offset).context("tile offset exceeds this platform")?;
-    let length = usize::try_from(range.length).context("tile length exceeds this platform")?;
-    let end = start.checked_add(length).context("tile range overflow")?;
-    source
-        .get(start..end)
-        .context("tile range exceeds input file")
+impl SourceMaps {
+    fn open(slide: &Slide) -> Result<Self> {
+        let mut maps = Vec::new();
+        if slide.sources.is_empty() {
+            let file = File::open(&slide.path)
+                .with_context(|| format!("open input {}", slide.path.display()))?;
+            // SAFETY: the converter opens the source read-only and never mutates
+            // it while this mapping is alive.
+            let map = unsafe { MmapOptions::new().map(&file)? };
+            maps.push((0, map));
+        } else {
+            for source in &slide.sources {
+                let file = File::open(&source.path)
+                    .with_context(|| format!("open input {}", source.path.display()))?;
+                // SAFETY: same read-only guarantee as the single-file case.
+                let map = unsafe { MmapOptions::new().map(&file)? };
+                maps.push((source.base, map));
+            }
+            maps.sort_by_key(|(base, _)| *base);
+        }
+        Ok(Self { maps })
+    }
+
+    fn range(&self, range: ByteRange) -> Result<&[u8]> {
+        let start = usize::try_from(range.offset).context("tile offset exceeds this platform")?;
+        let length = usize::try_from(range.length).context("tile length exceeds this platform")?;
+        let index = self
+            .maps
+            .partition_point(|(base, _)| *base <= range.offset)
+            .checked_sub(1)
+            .context("tile range precedes the first backing file")?;
+        let (base, map) = &self.maps[index];
+        let local = start - usize::try_from(*base).context("source base overflows")?;
+        let end = local.checked_add(length).context("tile range overflow")?;
+        map.get(local..end).context("tile range exceeds input file")
+    }
 }
 
 struct TiffWriter {
@@ -1025,6 +1113,15 @@ impl TiffWriter {
 
         let total = usize::try_from(output_cols as u64 * output_rows as u64)
             .context("output tile count exceeds this platform")?;
+        // Tiles we re-encode are written as abbreviated streams; the shared
+        // quantization/Huffman tables ride once in the IFD's JPEGTables tag.
+        // Pass-through tiles keep their own embedded tables, which TIFF
+        // Compression=7 permits on a per-tile basis.
+        let jpeg_tables = {
+            let probe = white_image(16, 16);
+            let (tables, _) = split_jpeg_tables(&encode_jpeg(&probe, quality)?)?;
+            tables
+        };
         for batch_start in (0..total).step_by(tile_pool.batch_size()) {
             let batch_end = (batch_start + tile_pool.batch_size()).min(total);
             let tasks: Vec<_> = (batch_start..batch_end)
@@ -1066,6 +1163,7 @@ impl TiffWriter {
             description,
             reduced,
             resolution,
+            jpeg_tables: Some(jpeg_tables),
         })
     }
 
@@ -1195,11 +1293,7 @@ impl TilePool {
         let (task_sender, task_receiver) = mpsc::channel::<TileTask>();
         let task_receiver = Arc::new(Mutex::new(task_receiver));
         let slide = Arc::new(slide.clone());
-        let source_file = File::open(&slide.path)
-            .with_context(|| format!("open input {}", slide.path.display()))?;
-        // SAFETY: the converter opens the source read-only and never mutates it
-        // while this mapping is alive.
-        let source = Arc::new(unsafe { MmapOptions::new().map(&source_file)? });
+        let source = Arc::new(SourceMaps::open(slide.as_ref())?);
         let mut workers = Vec::with_capacity(worker_count);
 
         for index in 0..worker_count {
@@ -1266,7 +1360,7 @@ impl Drop for TilePool {
 
 fn tile_worker(
     slide: Arc<Slide>,
-    source: Arc<memmap2::Mmap>,
+    source: Arc<SourceMaps>,
     tasks: Arc<Mutex<mpsc::Receiver<TileTask>>>,
     results: mpsc::Sender<TileResult>,
 ) {
@@ -1312,7 +1406,7 @@ fn tile_worker(
 
 fn encode_output_tile(
     slide: &Slide,
-    source: &[u8],
+    source: &SourceMaps,
     task: TileTask,
     hevc: Option<&mut HevcDecoder>,
 ) -> Result<Vec<u8>> {
@@ -1332,22 +1426,62 @@ fn encode_output_tile(
             .tiles
             .get((task.output_row * level.tile_cols + task.output_col) as usize)
             .context("invalid source tile index")?;
-        let bytes = mapped_range(source, range)?;
+        let bytes = source.range(range)?;
         if bytes.is_empty() {
-            return encode_jpeg(
+            return encode_tile_image(
                 &compose_tile(slide, source, level, task.placement(), hevc)?,
                 task.quality,
             );
         }
         if !jpeg_is_420(bytes) {
-            return transcode_jpeg_to_420(bytes, task.quality).or_else(|_| {
+            // Lossless transcode keeps the source quantization tables, which
+            // differ from the shared JPEGTables tag — keep the full stream.
+            let encoded = transcode_jpeg_to_420(bytes, task.quality).or_else(|_| {
                 encode_jpeg_with_capacity(&decode_rgb(bytes)?, task.quality, bytes.len())
-            });
+            })?;
+            return Ok(encoded);
         }
         return Ok(bytes.to_vec());
     }
     let image = compose_tile(slide, source, level, task.placement(), hevc)?;
-    encode_jpeg(&image, task.quality)
+    encode_tile_image(&image, task.quality)
+}
+
+/// Encodes a composed tile, memoizing the output when it is uniformly white.
+///
+/// Slides whose scan area covers a fraction of the canvas (MRXS in
+/// particular) produce hundreds of thousands of identical white tiles; the
+/// JPEG for a given geometry and quality is byte-identical, so it is encoded
+/// once per worker thread instead of once per tile.
+fn encode_tile_image(image: &RgbImage, quality: u8) -> Result<Vec<u8>> {
+    const WHITE: [u8; 3] = [255, 255, 255];
+    if !image
+        .as_raw()
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .all(|&p| p == WHITE)
+    {
+        // Re-encoded tiles are written as abbreviated streams (tables live in
+        // the shared JPEGTables tag), matching Aperio's layout.
+        return Ok(split_jpeg_tables(&encode_jpeg(image, quality)?)?.1);
+    }
+    thread_local! {
+        static WHITE_TILE_CACHE: std::cell::RefCell<
+            std::collections::HashMap<(u8, u32, u32), Vec<u8>>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    WHITE_TILE_CACHE.with(|cache| {
+        let key = (quality, image.width(), image.height());
+        let mut cache = cache.borrow_mut();
+        if let Some(encoded) = cache.get(&key) {
+            return Ok(encoded.clone());
+        }
+        // Cache the abbreviated stream; tables are shared via JPEGTables.
+        let encoded = split_jpeg_tables(&encode_jpeg(image, quality)?)?.1;
+        cache.insert(key, encoded.clone());
+        Ok(encoded)
+    })
 }
 
 struct BigTiffWriter {
@@ -1484,8 +1618,6 @@ struct BigExtra {
     bits: u64,
     desc: u64,
     xres: u64,
-    yres: u64,
-    sample: u64,
     reference_bw: u64,
     desc_text: String,
 }
@@ -1514,8 +1646,6 @@ impl BigPage {
                     bits,
                     desc,
                     xres,
-                    yres: xres + 8,
-                    sample: xres + 16,
                     reference_bw: align(xres + 22, 8),
                     desc_text: description.clone().unwrap_or_default(),
                 }
@@ -1531,12 +1661,13 @@ impl BigPage {
                 offset,
                 count,
                 description,
+                resolution,
                 ..
             } => {
                 let mut entries = vec![
                     big_long(TAG_IMAGE_WIDTH, *width),
                     big_long(TAG_IMAGE_LENGTH, *height),
-                    big_short_array(TAG_BITS_PER_SAMPLE, extra.bits),
+                    big_short_triplet(TAG_BITS_PER_SAMPLE, 8, 8, 8),
                     big_short(TAG_COMPRESSION, 7),
                     big_short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
                     big_short(TAG_ORIENTATION, 1),
@@ -1556,9 +1687,9 @@ impl BigPage {
                         value: *count,
                     },
                     big_short(TAG_RESOLUTION_UNIT, 3),
-                    big_rational(TAG_X_RESOLUTION, extra.xres),
-                    big_rational(TAG_Y_RESOLUTION, extra.yres),
-                    big_short_array(TAG_SAMPLE_FORMAT, extra.sample),
+                    big_rational_inline(TAG_X_RESOLUTION, *resolution),
+                    big_rational_inline(TAG_Y_RESOLUTION, *resolution),
+                    big_short_triplet(TAG_SAMPLE_FORMAT, 1, 1, 1),
                     big_short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
                     big_rational_array(TAG_REFERENCE_BLACK_WHITE, extra.reference_bw, 6),
                 ];
@@ -1627,12 +1758,24 @@ fn big_short_pair(tag: u16, first: u16, second: u16) -> BigEntry {
     }
 }
 
-fn big_short_array(tag: u16, offset: u64) -> BigEntry {
+fn big_short_triplet(tag: u16, first: u16, second: u16, third: u16) -> BigEntry {
     BigEntry {
         tag,
         kind: TIFF_TYPE_SHORT,
         count: 3,
-        value: offset,
+        value: first as u64 | ((second as u64) << 16) | ((third as u64) << 32),
+    }
+}
+
+/// BigTIFF value fields are 8 bytes wide, so a single RATIONAL (8 bytes) must
+/// be stored inline rather than behind an offset (libtiff reads it inline).
+fn big_rational_inline(tag: u16, value: f64) -> BigEntry {
+    let numerator = (value.max(0.0) * 1000.0).round() as u32;
+    BigEntry {
+        tag,
+        kind: TIFF_TYPE_RATIONAL,
+        count: 1,
+        value: numerator as u64 | (1000u64 << 32),
     }
 }
 
@@ -1642,15 +1785,6 @@ fn big_long(tag: u16, value: u32) -> BigEntry {
         kind: TIFF_TYPE_LONG,
         count: 1,
         value: value as u64,
-    }
-}
-
-fn big_rational(tag: u16, offset: u64) -> BigEntry {
-    BigEntry {
-        tag,
-        kind: TIFF_TYPE_RATIONAL,
-        count: 1,
-        value: offset,
     }
 }
 
@@ -1691,6 +1825,7 @@ enum Page {
         description: String,
         reduced: bool,
         resolution: f64,
+        jpeg_tables: Option<Vec<u8>>,
     },
     Strip {
         width: u32,
@@ -1713,7 +1848,7 @@ struct Entry {
 impl Page {
     fn entry_count(&self) -> usize {
         match self {
-            Page::Tiled { .. } => 20,
+            Page::Tiled { jpeg_tables, .. } => 20 + usize::from(jpeg_tables.is_some()),
             Page::Strip { description, .. } => {
                 if description.is_some() {
                     18
@@ -1750,6 +1885,7 @@ impl Page {
                     yres,
                     sample,
                     reference_bw,
+                    tables: reference_bw + 48,
                     desc_text: description.clone(),
                 }
             }
@@ -1772,6 +1908,7 @@ impl Page {
                     yres,
                     sample,
                     reference_bw,
+                    tables: 0,
                     desc_text: description.clone().unwrap_or_default(),
                 }
             }
@@ -1789,29 +1926,42 @@ impl Page {
                 offsets,
                 counts,
                 reduced,
+                jpeg_tables,
                 ..
-            } => vec![
-                long(TAG_NEW_SUBFILE_TYPE, if *reduced { 1 } else { 0 }),
-                long(TAG_IMAGE_WIDTH, *width),
-                long(TAG_IMAGE_LENGTH, *height),
-                short_array_at(TAG_BITS_PER_SAMPLE, extra.bits),
-                short(TAG_COMPRESSION, 7),
-                short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
-                short(TAG_ORIENTATION, 1),
-                short(TAG_SAMPLES_PER_PIXEL, 3),
-                short(TAG_PLANAR_CONFIGURATION, 1),
-                short(TAG_RESOLUTION_UNIT, 3),
-                long_at(TAG_TILE_WIDTH, *tile_width),
-                long_at(TAG_TILE_LENGTH, *tile_height),
-                long_array_at(TAG_TILE_OFFSETS, offsets, extra.tile_offsets)?,
-                long_array_at(TAG_TILE_BYTE_COUNTS, counts, extra.tile_counts)?,
-                rational_at(TAG_X_RESOLUTION, extra.xres),
-                rational_at(TAG_Y_RESOLUTION, extra.yres),
-                short_array_at(TAG_SAMPLE_FORMAT, extra.sample),
-                ascii_at(TAG_IMAGE_DESCRIPTION, extra.desc, extra.desc_text.len() + 1)?,
-                short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
-                rational_array_at(TAG_REFERENCE_BLACK_WHITE, extra.reference_bw, 6)?,
-            ],
+            } => {
+                let mut entries = vec![
+                    long(TAG_NEW_SUBFILE_TYPE, if *reduced { 1 } else { 0 }),
+                    long(TAG_IMAGE_WIDTH, *width),
+                    long(TAG_IMAGE_LENGTH, *height),
+                    short_array_at(TAG_BITS_PER_SAMPLE, extra.bits),
+                    short(TAG_COMPRESSION, 7),
+                    short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
+                    short(TAG_ORIENTATION, 1),
+                    short(TAG_SAMPLES_PER_PIXEL, 3),
+                    short(TAG_PLANAR_CONFIGURATION, 1),
+                    short(TAG_RESOLUTION_UNIT, 3),
+                    long_at(TAG_TILE_WIDTH, *tile_width),
+                    long_at(TAG_TILE_LENGTH, *tile_height),
+                    long_array_at(TAG_TILE_OFFSETS, offsets, extra.tile_offsets)?,
+                    long_array_at(TAG_TILE_BYTE_COUNTS, counts, extra.tile_counts)?,
+                    rational_at(TAG_X_RESOLUTION, extra.xres),
+                    rational_at(TAG_Y_RESOLUTION, extra.yres),
+                    short_array_at(TAG_SAMPLE_FORMAT, extra.sample),
+                    ascii_at(TAG_IMAGE_DESCRIPTION, extra.desc, extra.desc_text.len() + 1)?,
+                    short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
+                    rational_array_at(TAG_REFERENCE_BLACK_WHITE, extra.reference_bw, 6)?,
+                ];
+                if let Some(tables) = jpeg_tables {
+                    entries.push(Entry {
+                        tag: TAG_JPEG_TABLES,
+                        kind: TIFF_TYPE_UNDEFINED,
+                        count: u32::try_from(tables.len()).context("JPEGTables is too large")?,
+                        value: u32::try_from(extra.tables)
+                            .context("TIFF exceeds classic 4 GiB offsets")?,
+                    });
+                }
+                entries
+            }
             Page::Strip {
                 width,
                 height,
@@ -1866,6 +2016,7 @@ impl Page {
                 offsets,
                 counts,
                 description,
+                jpeg_tables,
                 ..
             } => {
                 let tile_offsets = align(bits + 6, 4);
@@ -1896,6 +2047,9 @@ impl Page {
                 let reference_bw = align(file.stream_position()?, 4);
                 pad_to(file, reference_bw)?;
                 write_reference_black_white(file)?;
+                if let Some(tables) = jpeg_tables {
+                    file.write_all(tables)?;
+                }
             }
             Page::Strip { description, .. } => {
                 if let Some(text) = description {
@@ -1931,12 +2085,13 @@ struct Extra {
     yres: u64,
     sample: u64,
     reference_bw: u64,
+    tables: u64,
     desc_text: String,
 }
 
 fn compose_tile(
     slide: &Slide,
-    source: &[u8],
+    source: &SourceMaps,
     level: &Level,
     placement: TilePlacement,
     mut hevc: Option<&mut HevcDecoder>,
@@ -1972,10 +2127,12 @@ fn compose_tile(
             if !range.present() || position.x >= limit_x || position.y >= limit_y {
                 continue;
             }
-            let bytes = mapped_range(source, range)?;
+            let bytes = source.range(range)?;
             let image = decode_tile(slide, bytes, hevc.as_deref_mut())?;
-            let source_width = position.width.min(image.width());
-            let source_height = position.height.min(image.height());
+            let available_width = image.width().saturating_sub(position.src_x);
+            let available_height = image.height().saturating_sub(position.src_y);
+            let source_width = position.width.min(available_width);
+            let source_height = position.height.min(available_height);
             let right = (position.x + source_width).min(limit_x);
             let bottom = (position.y + source_height).min(limit_y);
             let left = origin_x.max(position.x);
@@ -1983,8 +2140,8 @@ fn compose_tile(
             if left >= right || top >= bottom {
                 continue;
             }
-            let src_left = left - position.x;
-            let src_top = top - position.y;
+            let src_left = left - position.x + position.src_x;
+            let src_top = top - position.y + position.src_y;
             for y in 0..(bottom - top) {
                 for x in 0..(right - left) {
                     output.put_pixel(
@@ -2012,7 +2169,7 @@ fn compose_tile(
             if !range.present() {
                 continue;
             }
-            let data = mapped_range(source, range)?;
+            let data = source.range(range)?;
             let image = decode_tile(slide, data, hevc.as_deref_mut())?;
             copy_clipped(
                 &mut output,
@@ -2367,6 +2524,7 @@ mod tests {
             description: "test".to_owned(),
             reduced: true,
             resolution: 1.0,
+            jpeg_tables: None,
         })?;
         writer.finish()?;
         drop(writer);
@@ -2426,6 +2584,7 @@ mod tests {
             }],
             associated_images: Vec::new(),
             thumbnail: None,
+            sources: Vec::new(),
         };
         let pool = TilePool::with_worker_count(&slide, 4)?;
         let tasks: Vec<_> = (0..4)
@@ -2445,8 +2604,21 @@ mod tests {
         drop(pool);
         fs::remove_file(path)?;
 
+        // Re-encoded tiles come back as abbreviated streams; rejoin them with
+        // the shared tables (as a TIFF reader would via JPEGTables) to decode.
+        let (tables, _) =
+            split_jpeg_tables(&encode_jpeg(&RgbImage::from_pixel(16, 16, Rgb([255, 255, 255])), 75)?)?;
+        let has_dqt = |data: &[u8]| data.windows(2).any(|w| w == [0xff, 0xdb]);
         for (data, expected) in encoded.iter().zip(colors) {
-            let image = decode_rgb(data)?;
+            let full = if has_dqt(data) {
+                data.clone()
+            } else {
+                let mut joined = tables.clone();
+                joined.truncate(joined.len() - 2);
+                joined.extend_from_slice(&data[2..]);
+                joined
+            };
+            let image = decode_rgb(&full)?;
             let pixel = image.get_pixel(8, 8);
             for channel in pixel.0 {
                 assert!((channel as i16 - expected as i16).abs() <= 3);

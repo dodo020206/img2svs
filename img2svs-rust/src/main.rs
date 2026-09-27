@@ -13,6 +13,7 @@ mod hevc;
 mod indexed;
 mod jpeg;
 mod model;
+mod mrxs;
 mod report;
 mod sdpc;
 mod svs;
@@ -99,7 +100,41 @@ fn run() -> Result<()> {
         "dmetrix" => dmetrix::parse(&input)?,
         "sdpc" | "dyqx" => sdpc::parse(&input)?,
         "csp" | "kfb" | "mdss" | "mdsx" | "msdx" => indexed::parse(&input)?,
-        "ndpi" | "mrxs" | "tif" | "tiff" => {
+        "mrxs" => {
+            let output = args
+                .output
+                .clone()
+                .unwrap_or_else(|| with_extension(&input, "svs"));
+            let quality = validate_quality(args.jpeg_quality.unwrap_or(75))?;
+            let native = mrxs::parse(&input).and_then(|slide| {
+                report::print_slide(&slide);
+                if args.info {
+                    return Ok(());
+                }
+                let started = Instant::now();
+                svs::write_slide(
+                    &slide,
+                    &output,
+                    &svs::WriteOptions {
+                        jpeg_quality: quality,
+                        overwrite: args.overwrite,
+                    },
+                )?;
+                println!("Output: {}", output.display());
+                println!("Time  : {:.2} s", started.elapsed().as_secs_f64());
+                Ok(())
+            });
+            if let Err(error) = native {
+                eprintln!("Native MRXS conversion failed ({error:#}); falling back to libvips");
+                if args.info {
+                    return vips::print_info(&input);
+                }
+                vips::convert(&input, &output, quality, args.overwrite)?;
+                println!("Output: {}", output.display());
+            }
+            return Ok(());
+        }
+        "ndpi" | "tif" | "tiff" => {
             let output = args
                 .output
                 .clone()

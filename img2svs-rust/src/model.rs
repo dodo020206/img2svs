@@ -78,6 +78,10 @@ pub struct TilePlacement {
     pub y: u32,
     pub width: u32,
     pub height: u32,
+    /// Offset into the decoded tile at which the placed rectangle starts.
+    /// Zero for containers that store one placed image per tile payload.
+    pub src_x: u32,
+    pub src_y: u32,
 }
 
 /// A label or macro image embedded in the container.
@@ -102,6 +106,43 @@ pub enum Compression {
     Hevc,
 }
 
+/// Maps each level's sparse placements onto its dense output grid.
+///
+/// A placement may cover several output cells, so every cell collects the
+/// list of tiles that can contribute to it. Shared by the KFB and MRXS
+/// readers, whose tiles sit at arbitrary pixel coordinates.
+pub fn assign_tile_groups(levels: &mut [Level], tile_width: u32, tile_height: u32) {
+    for level in levels {
+        let last_col = level.tile_cols.saturating_sub(1);
+        let last_row = level.tile_rows.saturating_sub(1);
+        level.tile_groups = vec![Vec::new(); (level.tile_cols * level.tile_rows) as usize];
+        for (tile_index, position) in level.tile_positions.iter().enumerate() {
+            let left = (position.x / tile_width).min(last_col);
+            let top = (position.y / tile_height).min(last_row);
+            let right =
+                ((position.x + position.width.saturating_sub(1)) / tile_width).min(last_col);
+            let bottom =
+                ((position.y + position.height.saturating_sub(1)) / tile_height).min(last_row);
+            for row in top..=bottom {
+                for col in left..=right {
+                    level.tile_groups[(row * level.tile_cols + col) as usize].push(tile_index);
+                }
+            }
+        }
+    }
+}
+
+/// One backing file of a multi-file container.
+///
+/// Readers describe tile payloads with virtual offsets in a single address
+/// space; each `SlideSource` maps a window of that space onto a real file.
+#[derive(Clone, Debug)]
+pub struct SlideSource {
+    pub path: PathBuf,
+    /// Virtual offset at which this file's first byte appears.
+    pub base: u64,
+}
+
 /// Everything the SVS writer needs in order to stream a source file.
 #[derive(Clone, Debug)]
 pub struct Slide {
@@ -113,4 +154,8 @@ pub struct Slide {
     pub levels: Vec<Level>,
     pub associated_images: Vec<AssociatedImage>,
     pub thumbnail: Option<Thumbnail>,
+    /// Backing files for containers that spread payloads across several files
+    /// (e.g. MRXS `Data*.dat`). Empty means every byte range addresses
+    /// `path` itself.
+    pub sources: Vec<SlideSource>,
 }

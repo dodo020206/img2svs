@@ -119,6 +119,7 @@ pub fn parse(path: &Path) -> Result<Slide> {
         levels,
         associated_images: associated,
         thumbnail: None,
+        sources: Vec::new(),
     })
 }
 

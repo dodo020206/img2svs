@@ -155,6 +155,7 @@ fn parse_csp(path: &Path) -> Result<Slide> {
         levels,
         associated_images: associated,
         thumbnail: None,
+        sources: Vec::new(),
     })
 }
 
@@ -428,6 +429,7 @@ fn parse_kfb(path: &Path) -> Result<Slide> {
         levels,
         associated_images: associated,
         thumbnail,
+        sources: Vec::new(),
     })
 }
 
@@ -558,6 +560,8 @@ fn read_kfb_tiles(
             y: y as u32,
             width: width as u32,
             height: height as u32,
+            src_x: 0,
+            src_y: 0,
         });
     }
     Ok(())
@@ -710,6 +714,7 @@ fn parse_mdsx(path: &Path) -> Result<Slide> {
         levels,
         associated_images,
         thumbnail: None,
+        sources: Vec::new(),
     })
 }
 

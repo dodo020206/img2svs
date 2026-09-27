@@ -32,6 +32,11 @@ const MICROMETRES_PER_MILLIMETRE: f64 = 1_000.0;
 /// turn into a division by zero.
 const MIN_MPP: f64 = 0.000_001;
 
+/// Raw L0 RGB bytes (or total input bytes) at which the output TIFF must be
+/// written as BigTIFF to stay below the 4 GiB 32-bit offset limit. Mirrors the
+/// threshold used by the legacy Python converters.
+const BIGTIFF_THRESHOLD_BYTES: u64 = 3_500_000_000;
+
 /// Builds a command for a bundled vips tool with `bin` prepended to `PATH`.
 fn vips_command(bin: &Path, executable: &Path) -> Result<Command> {
     let path = env::var_os("PATH").unwrap_or_default();
@@ -59,34 +64,39 @@ pub fn convert(input: &Path, output: &Path, quality: u8, overwrite: bool) -> Res
     }
     let temporary = temporary_path(output);
     let result = (|| {
-        let (mpp, app_mag) = thread::scope(|scope| {
+        let (mpp, app_mag, dimensions) = thread::scope(|scope| {
             let mpp = scope.spawn(|| read_mpp(&bin, input));
             let app_mag = scope.spawn(|| read_app_mag(&bin, input));
+            let dimensions = scope.spawn(|| read_dimensions(&bin, input));
             (
                 mpp.join().ok().flatten().unwrap_or(0.25),
                 app_mag.join().ok().flatten().unwrap_or(0.0),
+                dimensions.join().ok().flatten(),
             )
         });
+        // The vips CLI enables a boolean option by its mere presence, so
+        // --bigtiff=false would still produce a BigTIFF; only pass the flag
+        // when the output really needs 64-bit offsets.
+        let mut options = vec![
+            "--pyramid=true".to_owned(),
+            "--tile=true".to_owned(),
+            "--tile-width=256".to_owned(),
+            "--tile-height=256".to_owned(),
+            "--compression=jpeg".to_owned(),
+            format!("--Q={quality}"),
+            format!("--xres={}", vips_resolution(mpp)),
+            format!("--yres={}", vips_resolution(mpp)),
+            "--resunit=cm".to_owned(),
+        ];
+        if should_use_bigtiff(input, dimensions) {
+            options.push("--bigtiff=true".to_owned());
+        }
+        let options: Vec<&str> = options.iter().map(String::as_str).collect();
         let (thumbnail, images) = thread::scope(|scope| {
             let thumbnail = scope.spawn(|| load_thumbnail(&bin, input, &temporary));
             let associated =
                 scope.spawn(|| load_associated_images(&bin, input, quality, &temporary));
-            let pyramid = run_vips(
-                &bin,
-                "tiffsave",
-                &[input, &temporary],
-                &[
-                    "--pyramid=true",
-                    "--tile=true",
-                    "--tile-width=256",
-                    "--tile-height=256",
-                    "--compression=jpeg",
-                    &format!("--Q={quality}"),
-                    &format!("--xres={}", vips_resolution(mpp)),
-                    &format!("--yres={}", vips_resolution(mpp)),
-                    "--resunit=cm",
-                ],
-            );
+            let pyramid = run_vips(&bin, "tiffsave", &[input, &temporary], &options);
             let thumbnail = thumbnail
                 .join()
                 .map_err(|_| anyhow!("thumbnail worker panicked"))??;
@@ -223,6 +233,54 @@ fn read_text_field(bin: &Path, input: &Path, field: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+fn read_dimensions(bin: &Path, input: &Path) -> Option<(u64, u64)> {
+    let width = read_field(bin, input, "width")?;
+    let height = read_field(bin, input, "height")?;
+    (width > 0.0 && height > 0.0).then_some((width as u64, height as u64))
+}
+
+fn should_use_bigtiff(input: &Path, level0: Option<(u64, u64)>) -> bool {
+    if let Some((width, height)) = level0 {
+        let raw_bytes = width.saturating_mul(height).saturating_mul(3);
+        if raw_bytes >= BIGTIFF_THRESHOLD_BYTES {
+            return true;
+        }
+    }
+    total_input_bytes(input) >= BIGTIFF_THRESHOLD_BYTES
+}
+
+/// Input file size, plus the sibling data directory for `.mrxs` slides whose
+/// payload lives next to the index file.
+fn total_input_bytes(input: &Path) -> u64 {
+    let mut total = input.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let is_mrxs = input
+        .extension()
+        .map(|extension| extension.eq_ignore_ascii_case("mrxs"))
+        .unwrap_or(false);
+    if is_mrxs {
+        let data_dir = input.with_extension("");
+        if data_dir.is_dir() {
+            total = total.saturating_add(directory_size(&data_dir));
+        }
+    }
+    total
+}
+
+fn directory_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                total = total.saturating_add(directory_size(&path));
+            } else if let Ok(meta) = path.metadata() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
 fn read_mpp(bin: &Path, input: &Path) -> Option<f64> {
     if let Some(mpp) = read_field(bin, input, "openslide.mpp-x").filter(|value| *value > 0.0) {
         return Some(mpp);
@@ -306,7 +364,8 @@ fn temporary_path(output: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_labeled_number, vips_resolution};
+    use super::{parse_labeled_number, should_use_bigtiff, vips_resolution};
+    use std::path::Path;
 
     #[test]
     fn parses_tiff_objective_power() {
@@ -330,5 +389,14 @@ mod tests {
     #[test]
     fn converts_mpp_to_vips_pixels_per_millimeter() {
         assert_eq!(vips_resolution(0.25), 4_000.0);
+    }
+
+    #[test]
+    fn bigtiff_triggers_on_large_level0_pixels() {
+        // 40_000 x 30_000 px x 3 bytes = 3.6 GB of raw RGB, above the threshold.
+        let missing = Path::new("does-not-exist.mrxs");
+        assert!(should_use_bigtiff(missing, Some((40_000, 30_000))));
+        assert!(!should_use_bigtiff(missing, Some((20_000, 15_000))));
+        assert!(!should_use_bigtiff(missing, None));
     }
 }

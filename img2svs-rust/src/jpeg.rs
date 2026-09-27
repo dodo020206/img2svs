@@ -21,6 +21,59 @@ const MIN_JPEG_BUFFER: usize = 1024;
 /// Start-of-image marker that opens every JPEG stream.
 pub const SOI_MARKER: [u8; 2] = [0xff, 0xd8];
 
+/// Splits a full interchange JPEG into a tables-only stream (for the TIFF
+/// `JPEGTables` tag) and an abbreviated stream (for the tile payload).
+///
+/// TIFF Compression=7 allows tiles to omit quantization and Huffman tables
+/// when the IFD carries them once in `JPEGTables`; at ~590 bytes of tables per
+/// tile this is the difference between a 3.8 GB and a 3.2 GB MRXS conversion.
+/// The encoder's tables depend only on the quality setting, so every tile we
+/// re-encode in one run shares the same tables. Tiles passed through from the
+/// source container keep their own embedded tables and stay full streams.
+pub fn split_jpeg_tables(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    if !data.starts_with(&SOI_MARKER) {
+        bail!("JPEG stream does not start with SOI");
+    }
+    let mut tables = Vec::with_capacity(640);
+    let mut abbreviated = Vec::with_capacity(data.len());
+    tables.extend_from_slice(&SOI_MARKER);
+    abbreviated.extend_from_slice(&SOI_MARKER);
+
+    let mut cursor = 2;
+    while cursor + 4 <= data.len() {
+        if data[cursor] != 0xff {
+            bail!("malformed JPEG segment");
+        }
+        let marker = data[cursor + 1];
+        if marker == 0xda {
+            // SOS: everything from here to the end is entropy data plus EOI.
+            abbreviated.extend_from_slice(&data[cursor..]);
+            break;
+        }
+        if marker == 0xd8 || marker == 0xd9 || (0xd0..=0xd7).contains(&marker) {
+            abbreviated.extend_from_slice(&data[cursor..cursor + 2]);
+            cursor += 2;
+            continue;
+        }
+        let length = usize::from(u16::from_be_bytes([data[cursor + 2], data[cursor + 3]]));
+        let end = cursor + 2 + length;
+        if end > data.len() {
+            bail!("truncated JPEG segment");
+        }
+        if marker == 0xdb || marker == 0xc4 {
+            tables.extend_from_slice(&data[cursor..end]);
+        } else {
+            abbreviated.extend_from_slice(&data[cursor..end]);
+        }
+        cursor = end;
+    }
+    if !abbreviated.ends_with(&[0xff, 0xd9]) {
+        bail!("JPEG stream is missing its entropy data");
+    }
+    tables.extend_from_slice(&[0xff, 0xd9]);
+    Ok((tables, abbreviated))
+}
+
 /// Decodes a JPEG buffer into a freshly allocated RGB image.
 pub fn decode_rgb(data: &[u8]) -> Result<RgbImage> {
     Ok(image::load_from_memory_with_format(data, ImageFormat::Jpeg)
@@ -126,4 +179,31 @@ fn fit_scale(width: u32, height: u32, max_size: u32) -> f32 {
 /// Applies `scale` to one axis, clamping degenerate results to a single pixel.
 fn scaled_dimension(length: u32, scale: f32) -> u32 {
     (length as f32 * scale).max(1.0) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgb, RgbImage};
+
+    #[test]
+    fn split_tables_rejoin_decodes_identically() -> Result<()> {
+        let mut image = RgbImage::new(32, 24);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 5) as u8]);
+        }
+        let full = encode_jpeg(&image, 80)?;
+        let (tables, abbreviated) = split_jpeg_tables(&full)?;
+        assert!(tables.len() < full.len());
+        assert!(abbreviated.len() < full.len());
+
+        // Rejoin: SOI + table segments + everything after the SOI.
+        let mut rejoined = tables.clone();
+        rejoined.truncate(rejoined.len() - 2); // drop EOI
+        rejoined.extend_from_slice(&abbreviated[2..]);
+        let expected = decode_rgb(&full)?;
+        let actual = decode_rgb(&rejoined)?;
+        assert_eq!(expected.as_raw(), actual.as_raw());
+        Ok(())
+    }
 }

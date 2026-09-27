@@ -1,4 +1,4 @@
-use crate::{dmetrix, indexed, sdpc, svs, vips};
+use crate::{dmetrix, indexed, mrxs, sdpc, svs, vips};
 use anyhow::{bail, Context, Result};
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, RichText,
@@ -1512,7 +1512,25 @@ fn convert_one(
         "dmetrix" => dmetrix::parse(&input)?,
         "sdpc" | "dyqx" => sdpc::parse(&input)?,
         "csp" | "kfb" | "mdss" | "mdsx" | "msdx" => indexed::parse(&input)?,
-        "ndpi" | "mrxs" | "tif" | "tiff" => {
+        "mrxs" => {
+            let selected_quality = quality.unwrap_or(75);
+            let native = mrxs::parse(&input).and_then(|slide| {
+                svs::write_slide(
+                    &slide,
+                    output,
+                    &svs::WriteOptions {
+                        jpeg_quality: selected_quality,
+                        overwrite,
+                    },
+                )
+            });
+            if let Err(error) = native {
+                eprintln!("Native MRXS conversion failed ({error:#}); falling back to libvips");
+                vips::convert(&input, output, selected_quality, overwrite)?;
+            }
+            return Ok(output.to_path_buf());
+        }
+        "ndpi" | "tif" | "tiff" => {
             let selected_quality = quality.unwrap_or(75);
             vips::convert(&input, output, selected_quality, overwrite)?;
             return Ok(output.to_path_buf());

@@ -98,6 +98,7 @@ pub fn parse(path: &Path) -> Result<Slide> {
         levels,
         associated_images: macrographs.images,
         thumbnail: Some(thumbnail),
+        sources: Vec::new(),
     })
 }
 
