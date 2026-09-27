@@ -1,7 +1,13 @@
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+//! A console build (built without the `gui` feature) keeps the console
+//! subsystem so command-line output stays visible; the GUI build hides it.
+#![cfg_attr(
+    all(target_os = "windows", feature = "gui"),
+    windows_subsystem = "windows"
+)]
 
 mod binary;
 mod dmetrix;
+#[cfg(feature = "gui")]
 mod gui;
 mod hevc;
 mod indexed;
@@ -17,15 +23,29 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// Accepted input formats, shared by both build variants.
+#[cfg(feature = "gui")]
+const INPUT_HELP: &str =
+    "Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.tif/.tiff/.sdpc/.dyqx file. \
+     Omit it to launch the GUI.";
+#[cfg(not(feature = "gui"))]
+const INPUT_HELP: &str =
+    "Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.tif/.tiff/.sdpc/.dyqx file.";
+
+/// Names the build variant so the two distributed executables can be told apart.
+#[cfg(feature = "gui")]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (gui)");
+#[cfg(not(feature = "gui"))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (cli)");
+
 #[derive(Parser, Debug)]
 #[command(
     name = "img2svs",
-    version,
+    version = VERSION,
     about = "Convert supported whole-slide files to Aperio SVS"
 )]
 struct Args {
-    /// Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.tif/.tiff/.sdpc/.dyqx file.
-    /// Omit it to launch the GUI.
+    #[arg(help = INPUT_HELP)]
     input: Option<PathBuf>,
     /// Output .svs file. Defaults to the input path with an .svs extension.
     #[arg(short, long)]
@@ -40,9 +60,11 @@ struct Args {
     #[arg(long)]
     info: bool,
     /// Launch the native Rust GUI.
+    #[cfg(feature = "gui")]
     #[arg(long)]
     gui: bool,
     /// Launch the GUI and close after its first rendered frame (build smoke test).
+    #[cfg(feature = "gui")]
     #[arg(long, hide = true)]
     smoke_test: bool,
 }
@@ -56,12 +78,15 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    #[cfg(feature = "gui")]
     if args.gui || args.smoke_test || args.input.is_none() {
         return gui::run(gui::LaunchOptions {
             smoke_test: args.smoke_test,
         });
     }
-    let input_arg = args.input.expect("input checked above");
+    let Some(input_arg) = args.input else {
+        bail!("no input file given; pass a slide path and see --help");
+    };
     let input = input_arg
         .canonicalize()
         .with_context(|| format!("input not found: {}", input_arg.display()))?;

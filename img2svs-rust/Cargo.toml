@@ -5,13 +5,18 @@ edition = "2021"
 description = "Native Rust whole-slide image to Aperio SVS converter"
 license = "MIT"
 
+[features]
+default = ["gui"]
+# The GUI is optional so a console-only CLI build can skip egui/rfd entirely.
+gui = ["dep:eframe", "dep:rfd"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
 jpeg-encoder = { version = "0.7.1", features = ["simd"] }
-eframe = { version = "0.32", default-features = true }
-rfd = "0.15"
+eframe = { version = "0.32", default-features = true, optional = true }
+rfd = { version = "0.15", optional = true }
 base64 = "0.22"
 quick-xml = "0.38"
 libloading = "0.8"
