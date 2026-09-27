@@ -13,7 +13,7 @@
 | `.csp` | 索引式 JPEG 瓦片 |
 | `.kfb` | KFBio 索引式 JPEG 瓦片、稀疏瓦片布局 |
 | `.mdsx` / `.msdx` / `.mdss` | BKIO 容器，三种扩展名共用同一字节布局 |
-| `.sdpc` / `.dyqx` | JPEG / HEVC 压缩；HEVC 由纯 Rust 的 `rust_h265` 解码 |
+| `.sdpc` / `.dyqx` | JPEG / HEVC 压缩；HEVC 由纯 Rust 的 `rusty_h265` 解码 |
 | `.ndpi` | Hamamatsu 容器：层级为「整条 baseline JPEG 切成的重启区间」，每个区间即一个瓦片 |
 | `.mrxs` | 3DHISTECH Pannoramic：`Index.dat` 页链 + `Data*.dat` 原始 JPEG 字节流 |
 | `.tif` / `.tiff` | 瓦片式或扫描线式 TIFF，保留分辨率与物镜倍率元数据 |
@@ -87,8 +87,8 @@ Rust 实现不依赖任何外部运行库：全部输入格式，包括 HEVC 压
 README，不需要附带目录，也不需要设置任何环境变量。
 
 代价在 HEVC 解码速度上：纯 Rust 解码器比原先动态加载的 FFmpeg
-慢约 1.8 倍（SDPC 样本 15.5s → 27.3s）。非 HEVC 格式不受影响，
-产物与之前逐字节一致。
+慢约 1.2~1.3 倍（SDPC 样本 15.5s → 18.4s、2.3s → 3.1s）。
+非 HEVC 格式不受影响，产物与之前逐字节一致。
 
 ## 性能要点
 

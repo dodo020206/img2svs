@@ -1635,7 +1635,7 @@ dependencies = [
  "memmap2",
  "quick-xml 0.38.4",
  "rfd",
- "rust_h265",
+ "rusty_h265",
  "zune-core",
  "zune-jpeg",
 ]
@@ -2669,12 +2669,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust_h265"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dde60f5842f27ed06f1d84844cacd93d1a159f606365b30a5594c771e6b4eb17"
-
-[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2726,6 +2720,21 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rusty_h265"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "153eb6abc0c03ba508fecda4ce5b4e7b268a2e697b67ce186fb821db25475e85"
+dependencies = [
+ "rusty_h265-accel",
+]
+
+[[package]]
+name = "rusty_h265-accel"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bba7bb825f634907ff7684a14f4abd999d477e8f7b7a9a8ebbf79ba3ffe0b329"
 
 [[package]]
 name = "same-file"

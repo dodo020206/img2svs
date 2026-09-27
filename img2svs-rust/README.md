@@ -30,7 +30,7 @@ JPEG 质量、覆盖/关联图像选项、队列式后台工作线程、进度�
   因此由同一个读取器处理。
 - `.sdpc` / `.dyqx`：JPEG 和 HEVC 压缩的 SDPC 文件，包括非 16 对齐的源瓦片
   （如 `616x880`）；相邻源瓦片会被合成为合法的 TIFF 输出瓦片，
-  最后一行/列用白色填充。HEVC 由纯 Rust 的 `rust_h265` 解码。
+  最后一行/列用白色填充。HEVC 由纯 Rust 的 `rusty_h265` 解码。
 - `.ndpi`：Hamamatsu 容器。每一层是一条被重启区间切开的 baseline JPEG，
   一个重启区间正好是一个瓦片：读取时把 SOF 的高宽改写成区间几何，
   再接上该区间的熵编码数据与 EOI，因此瓦片无需重编码即可直通写出。
@@ -61,10 +61,11 @@ CLI 参数（两个变体共用，`--gui` / `--smoke-test` 仅 GUI 变体）：
 | `--version` | 输出版本并带 `(gui)` / `(cli)` 变体后缀 |
 
 Rust GUI/CLI 支持 JPEG/HEVC 的 SDPC/DYQX 以及上述所有格式。
-两个变体都是自包含的可执行文件：HEVC 解码由 [`rust_h265`]
-(https://crates.io/crates/rust_h265) 完成（纯 Rust，MIT/Apache-2.0，
-零运行时依赖），因此没有任何需要随包分发的运行库，
-也不需要 `FFMPEG_HOME` 之类的环境变量。
+两个变体都是自包含的可执行文件：HEVC 解码由 [`rusty_h265`]
+(https://crates.io/crates/rusty_h265) 完成（纯 Rust，Apache-2.0，
+自带运行时分派的 SSE2/SSE4.1/AVX2 内核，零运行时依赖），
+因此没有任何需要随包分发的运行库，也不需要 `FFMPEG_HOME`
+之类的环境变量。
 
 输出是经典 TIFF，偏移为 32 位：切片大到输出超过 4 GiB 时会直接报错
 （`TIFF exceeds classic 4 GiB offsets`），不会写出损坏的文件。
@@ -75,8 +76,10 @@ Rust GUI/CLI 支持 JPEG/HEVC 的 SDPC/DYQX 以及上述所有格式。
 JPEG 转换默认使用操作系统报告的逻辑 CPU 数量（最多 64 个工作线程）。
 HEVC 保留一个逻辑 CPU，且上限为 32 个工作线程，因为每个工作线程
 独占一个解码器。纯 Rust 的 HEVC 解码比原先动态加载的 FFmpeg 解码器
-慢约 1.8 倍（SDPC 样本实测 15.5s → 27.3s / 2.3s → 4.2s），
-换来的是零运行库依赖。
+慢约 1.2~1.3 倍（SDPC 样本实测 15.5s → 18.4s / 2.3s → 3.1s），
+换来的是零运行库依赖。解码器实例在线程内复用，YUV→RGB 走查表
+BT.601，这两项把纯 Rust 侧的代价从 1.8 倍压到 1.2~1.3 倍；
+产物与 FFmpeg 版逐字节一致。
 在启动 CLI 或 GUI 前设置 `IMG2SVS_THREADS`
 可覆盖检测到的值，例如：
 
