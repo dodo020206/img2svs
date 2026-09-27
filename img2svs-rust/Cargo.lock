@@ -1632,10 +1632,10 @@ dependencies = [
  "flate2",
  "image",
  "jpeg-encoder",
- "libloading",
  "memmap2",
  "quick-xml 0.38.4",
  "rfd",
+ "rust_h265",
  "zune-core",
  "zune-jpeg",
 ]
@@ -2667,6 +2667,12 @@ dependencies = [
  "web-sys",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "rust_h265"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dde60f5842f27ed06f1d84844cacd93d1a159f606365b30a5594c771e6b4eb17"
 
 [[package]]
 name = "rustc-hash"

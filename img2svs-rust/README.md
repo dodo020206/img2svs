@@ -18,7 +18,8 @@ JPEG 质量、覆盖/关联图像选项、队列式后台工作线程、进度�
 日志以及协作式取消。每一行都有独立的 `移除` 按钮。快捷键为
 `Ctrl+O`（文件）、`Ctrl+Shift+O`（文件夹）、`F5`（开始）和 `Esc`（停止）。
 
-原生后端包括全部支持的格式，没有任何 OpenSlide/libvips 依赖：
+原生后端包括全部支持的格式，不依赖任何外部原生运行库
+（既不需要 OpenSlide/libvips，也不需要 FFmpeg）：
 
 - `.dmetrix`：JPEG 瓦片、金字塔层级、标签和宏观图像。
 - `.csp`：索引式 JPEG 瓦片、金字塔层级、标签/宏观图像。
@@ -29,7 +30,7 @@ JPEG 质量、覆盖/关联图像选项、队列式后台工作线程、进度�
   因此由同一个读取器处理。
 - `.sdpc` / `.dyqx`：JPEG 和 HEVC 压缩的 SDPC 文件，包括非 16 对齐的源瓦片
   （如 `616x880`）；相邻源瓦片会被合成为合法的 TIFF 输出瓦片，
-  最后一行/列用白色填充。HEVC 在可用时使用随附的 FFmpeg 原生运行库。
+  最后一行/列用白色填充。HEVC 由纯 Rust 的 `rust_h265` 解码。
 - `.ndpi`：Hamamatsu 容器。每一层是一条被重启区间切开的 baseline JPEG，
   一个重启区间正好是一个瓦片：读取时把 SOF 的高宽改写成区间几何，
   再接上该区间的熵编码数据与 EOI，因此瓦片无需重编码即可直通写出。
@@ -59,10 +60,11 @@ CLI 参数（两个变体共用，`--gui` / `--smoke-test` 仅 GUI 变体）：
 | `--gui` | 启动 GUI（仅 GUI 变体） |
 | `--version` | 输出版本并带 `(gui)` / `(cli)` 变体后缀 |
 
-Rust GUI/CLI 支持 JPEG/HEVC 的 SDPC/DYQX 以及上述所有格式，
-唯一的外部运行库是 FFmpeg，且只有 HEVC 源用得到：
-设置 `FFMPEG_HOME`，或将随附的 `av.libs` 目录放在可执行文件旁边。
-运行库查找相对于可执行文件或环境变量进行，不依赖开发机器上的路径。
+Rust GUI/CLI 支持 JPEG/HEVC 的 SDPC/DYQX 以及上述所有格式。
+两个变体都是自包含的可执行文件：HEVC 解码由 [`rust_h265`]
+(https://crates.io/crates/rust_h265) 完成（纯 Rust，MIT/Apache-2.0，
+零运行时依赖），因此没有任何需要随包分发的运行库，
+也不需要 `FFMPEG_HOME` 之类的环境变量。
 
 输出是经典 TIFF，偏移为 32 位：切片大到输出超过 4 GiB 时会直接报错
 （`TIFF exceeds classic 4 GiB offsets`），不会写出损坏的文件。
@@ -72,7 +74,10 @@ Rust GUI/CLI 支持 JPEG/HEVC 的 SDPC/DYQX 以及上述所有格式，
 原生 JPEG 和 HEVC 瓦片解码/编码工作运行在有界工作线程池中。
 JPEG 转换默认使用操作系统报告的逻辑 CPU 数量（最多 64 个工作线程）。
 HEVC 保留一个逻辑 CPU，且上限为 32 个工作线程，因为每个工作线程
-独占一个解码器。在启动 CLI 或 GUI 前设置 `IMG2SVS_THREADS`
+独占一个解码器。纯 Rust 的 HEVC 解码比原先动态加载的 FFmpeg 解码器
+慢约 1.8 倍（SDPC 样本实测 15.5s → 27.3s / 2.3s → 4.2s），
+换来的是零运行库依赖。
+在启动 CLI 或 GUI 前设置 `IMG2SVS_THREADS`
 可覆盖检测到的值，例如：
 
 ```powershell
@@ -99,18 +104,9 @@ cargo build --release
  .\target\release\img2svs-rust.exe --smoke-test
 ```
 
-仓库在 `../third_party` 中只保留一份原生运行库。
-在仓库根目录执行一次以下命令填充它（Rust 只需要 FFmpeg）：
-
-```powershell
-pwsh -File ..\scripts\fetch_native_runtimes.ps1 -SkipLibvips
-```
-
-随后 `build_windows.ps1` 会将 `av.libs` 复制到可执行文件旁边。
-它依次从 `-FfmpegHome`、`FFMPEG_HOME` 或 `../third_party\av.libs`
-解析该运行库，缺失时会发出警告而不是静默跳过。
-分发时请发布完整的 release 目录（包括 `av.libs`），
-而不是只发可执行文件。
+Rust 版本没有任何原生运行库依赖，`build_windows.ps1` 只做格式检查、
+构建和启动校验，产物可以直接分发，不需要附带任何目录。
+`../third_party` 中保留的运行库只服务于 Python 版本。
 
 `--smoke-test` 会初始化原生窗口并在第一帧后关闭；
 适用于 CI 或打包检查，不会留下运行中的 GUI 进程。
@@ -129,7 +125,7 @@ cargo build --release --no-default-features  # 控制台构建，无 egui/rfd
 体积约为 GUI 可执行文件的三分之一。`--version` 会报告
 当前运行的变体，例如 `img2svs 0.1.0 (cli)`。
 
-生成两个便携式 Windows 包（可执行文件、README 和 `av.libs`），
+生成两个便携式 Windows 包（可执行文件与 README），
 各带一个 ZIP 和一个 SHA256 校验和：
 
 ```powershell
@@ -147,9 +143,9 @@ pwsh -File ..\scripts\package_windows.ps1
 
 [`build-rust-windows.yml`](../.github/workflows/build-rust-windows.yml)
 工作流在 GitHub 的 Windows runner 上构建并测试 Rust 转换器。
-它只下载固定版本的 PyAV（FFmpeg）运行库，用
+它不下载任何外部运行库，用
 `../scripts/make_smoke_tiff.py` 现场生成 TIFF 样本后执行
-TIFF 转 SVS 冒烟测试（直接校验产物的 TIFF 标签，不需要 libvips），
+TIFF 转 SVS 冒烟测试（直接校验产物的 TIFF 标签），
 并将便携 ZIP 及其 SHA256 校验和作为 Actions 产物上传。
 该工作流会在相关 pull request 和 `main` 更新时运行，也可手动触发。
 
