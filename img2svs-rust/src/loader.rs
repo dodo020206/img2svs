@@ -56,6 +56,11 @@ pub(crate) struct Format {
 }
 
 /// Every container the converter reads, in the order the GUI lists them.
+///
+/// `.svs` is deliberately absent: it is what this converter *writes*, so
+/// feeding one back in would not be a conversion. The reader for it is the same
+/// one as for `.tif`/`.tiff`, so a file that has to be inspected can simply be
+/// renamed.
 pub(crate) const SUPPORTED_FORMATS: &[Format] = &[
     Format {
         extension: "csp",
@@ -106,11 +111,6 @@ pub(crate) const SUPPORTED_FORMATS: &[Format] = &[
         extension: "dyqx",
         label: "DYQX",
         reader: Reader::Sdpc,
-    },
-    Format {
-        extension: "svs",
-        label: "SVS",
-        reader: Reader::Tiff,
     },
     Format {
         extension: "tif",
@@ -181,8 +181,31 @@ mod tests {
 
     #[test]
     fn extension_matching_is_case_insensitive() {
-        assert_eq!(extension_of(&PathBuf::from("a/b.SVS")), "svs");
+        assert_eq!(extension_of(&PathBuf::from("a/b.TIF")), "tif");
         assert_eq!(extension_of(&PathBuf::from("a/b")), "");
+    }
+
+    #[test]
+    fn svs_is_not_an_accepted_input() {
+        // This converter writes SVS, so reading one back is not a conversion
+        // and the GUI scan must skip such files.
+        assert!(!SUPPORTED_FORMATS
+            .iter()
+            .any(|format| format.extension == "svs"));
+
+        let path = std::env::temp_dir().join(format!(
+            "img2svs-loader-rejects-svs-{}.svs",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"II\x2a\x00").expect("create the probe file");
+        let error = open_slide(&path).expect_err("a .svs input must be rejected");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported input extension .svs"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(feature = "gui")]
@@ -196,7 +219,7 @@ mod tests {
         let extensions = supported_extensions();
         let unique: HashSet<&str> = extensions.iter().copied().collect();
         assert_eq!(unique.len(), extensions.len());
-        assert_eq!(extensions.len(), 13);
+        assert_eq!(extensions.len(), 12);
     }
 
     #[cfg(feature = "gui")]
@@ -208,7 +231,7 @@ mod tests {
         let labels = supported_labels();
         let unique: HashSet<&str> = labels.iter().copied().collect();
         assert_eq!(unique.len(), labels.len());
-        assert_eq!(labels.len(), 12);
+        assert_eq!(labels.len(), 11);
         assert_eq!(
             labels.iter().filter(|label| **label == "TIF/TIFF").count(),
             1

@@ -1726,4 +1726,12 @@ mod tests {
         assert!(is_supported(Path::new(r"C:\slides\sample.tif")));
         assert!(is_supported(Path::new(r"C:\slides\sample.TIFF")));
     }
+
+    #[test]
+    fn svs_files_are_skipped_by_the_scan() {
+        // SVS is what this converter writes, so a directory scan must not queue
+        // those files back up.
+        assert!(!is_supported(Path::new(r"C:\slides\already.svs")));
+        assert!(!is_supported(Path::new(r"C:\slides\already.SVS")));
+    }
 }

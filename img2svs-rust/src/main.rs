@@ -28,13 +28,14 @@ use std::time::Instant;
 
 /// Accepted input formats, shared by both build variants. Kept in step with
 /// `loader::SUPPORTED_FORMATS`, which is what actually dispatches on them.
+/// `.svs` is not in the list: it is the output format.
 #[cfg(feature = "gui")]
 const INPUT_HELP: &str =
-    "Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.sdpc/.dyqx/.svs/.tif/.tiff file. \
+    "Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.sdpc/.dyqx/.tif/.tiff file. \
      Omit it to launch the GUI.";
 #[cfg(not(feature = "gui"))]
 const INPUT_HELP: &str =
-    "Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.sdpc/.dyqx/.svs/.tif/.tiff file.";
+    "Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.sdpc/.dyqx/.tif/.tiff file.";
 
 /// Names the build variant so the two distributed executables can be told apart.
 #[cfg(feature = "gui")]

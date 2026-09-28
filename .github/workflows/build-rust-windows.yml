@@ -131,7 +131,11 @@ jobs:
           # Two independent checks. The first reads the file back with the
           # converter's own reader; the second parses the TIFF tags directly so
           # a systematic writer mistake cannot hide behind a matching reader.
-          $info = (& $executable $smokeSvs "--info" 2>&1 | Out-String)
+          # The reader is chosen by extension and SVS is output-only, so the
+          # read-back inspects the very same bytes under a `.tif` name.
+          $readback = Join-Path $env:RUNNER_TEMP "img2svs-smoke-readback.tif"
+          Copy-Item -LiteralPath $smokeSvs -Destination $readback -Force
+          $info = (& $executable $readback "--info" 2>&1 | Out-String)
           if ($LASTEXITCODE -ne 0) {
             throw "Reading the converted SVS failed:`n$info"
           }
