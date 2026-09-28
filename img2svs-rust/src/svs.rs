@@ -1,14 +1,15 @@
 use crate::hevc::Decoder as HevcDecoder;
 use crate::jpeg::{
-    decode_image, decode_rgb, encode_jpeg, encode_jpeg_with_capacity, thumbnail as make_thumbnail,
-    transcode_jpeg_to_420, white_image, SOI_MARKER,
+    decode_image, decode_rgb, encode_jpeg, encode_jpeg_with_capacity, merge_jpeg_tables,
+    split_jpeg_tables, thumbnail as make_thumbnail, transcode_jpeg_to_420, white_image, SOI_MARKER,
 };
 use crate::model::{ByteRange, Compression, Level, Slide};
 use anyhow::{anyhow, bail, Context, Result};
 use image::{Rgb, RgbImage};
 use memmap2::MmapOptions;
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -17,9 +18,6 @@ const APERIO_VERSION: &str = "Aperio Image Library v12.4.3";
 /// Micrometres in one centimetre, the scale of the `ResolutionUnit=3` header
 /// fields written into every page.
 const MICROMETRES_PER_CENTIMETRE: f64 = 10_000.0;
-/// Lower bound applied to MPP before conversion, so a missing resolution cannot
-/// turn into a division by zero.
-const MIN_MPP: f64 = 0.000_001;
 
 /// Field type codes written into IFD entries, as defined by the TIFF 6.0
 /// specification and its BigTIFF extension.
@@ -28,7 +26,6 @@ const TIFF_TYPE_SHORT: u16 = 3;
 const TIFF_TYPE_LONG: u16 = 4;
 const TIFF_TYPE_RATIONAL: u16 = 5;
 const TIFF_TYPE_UNDEFINED: u16 = 7;
-const TIFF_TYPE_LONG8: u16 = 16;
 
 /// Field tags written into the pages this writer emits.
 const TAG_NEW_SUBFILE_TYPE: u16 = 254;
@@ -47,7 +44,6 @@ const TAG_X_RESOLUTION: u16 = 282;
 const TAG_Y_RESOLUTION: u16 = 283;
 const TAG_PLANAR_CONFIGURATION: u16 = 284;
 const TAG_RESOLUTION_UNIT: u16 = 296;
-const TAG_SOFTWARE: u16 = 305;
 const TAG_TILE_WIDTH: u16 = 322;
 const TAG_TILE_LENGTH: u16 = 323;
 const TAG_TILE_OFFSETS: u16 = 324;
@@ -92,670 +88,6 @@ pub fn write_slide(slide: &Slide, output: &Path, options: &WriteOptions) -> Resu
     }
 }
 
-/// Append label/macro pages produced by an external decoder to a classic TIFF.
-/// This is used by the OpenSlide/libvips formats after their pyramid is written.
-pub fn append_associated_images(
-    output: &Path,
-    images: &[(String, RgbImage)],
-    mpp: f64,
-    quality: u8,
-) -> Result<()> {
-    if images.is_empty() {
-        return Ok(());
-    }
-    let mut header = [0u8; 4];
-    File::open(output)?.read_exact(&mut header)?;
-    if &header[0..2] != b"II" {
-        bail!("can only append associated images to little-endian TIFF");
-    }
-    if u16::from_le_bytes([header[2], header[3]]) == 43 {
-        let mut writer = BigTiffWriter::open_append(output)?;
-        for (kind, image) in images {
-            writer.write_strip_page(
-                image,
-                quality,
-                MICROMETRES_PER_CENTIMETRE / mpp,
-                Some(&format!("{kind}\r")),
-            )?;
-        }
-        return writer.finish();
-    }
-    let mut writer = TiffWriter::open_append(output)?;
-    for (kind, image) in images {
-        writer.write_strip_page(
-            image,
-            quality,
-            MICROMETRES_PER_CENTIMETRE / mpp,
-            Some(&format!("{kind}\r")),
-        )?;
-    }
-    writer.finish()
-}
-
-/// Add the pages that SVS readers expect immediately after the full-resolution page.
-///
-/// libvips writes a valid pyramidal TIFF, but its CLI does not provide a way to set
-/// the Aperio comment and it writes the thumbnail only when the caller supplies one.
-/// Appending a new first-page IFD lets us keep libvips' streaming tile writer while
-/// presenting the conventional SVS order: level 0, thumbnail, level 1, ... .
-pub fn prepend_compatible_pages(
-    output: &Path,
-    thumbnail: &RgbImage,
-    mpp: f64,
-    app_mag: f64,
-    quality: u8,
-) -> Result<()> {
-    let mut file = OpenOptions::new().read(true).write(true).open(output)?;
-    let mut header = [0u8; 16];
-    file.read_exact(&mut header[..8])?;
-    if &header[0..2] != b"II" {
-        bail!("can only repair little-endian TIFF");
-    }
-    let magic = u16::from_le_bytes([header[2], header[3]]);
-    let source = if magic == 42 {
-        SourcePage::read_classic(&mut file)?
-    } else if magic == 43 {
-        file.seek(SeekFrom::Start(8))?;
-        file.read_exact(&mut header[8..16])?;
-        SourcePage::read_bigtiff(&mut file)?
-    } else {
-        bail!("unsupported TIFF header while preparing SVS");
-    };
-    if source.tile_offsets.is_empty()
-        || source.tile_offsets.len() != source.tile_byte_counts.len()
-        || source.tile_width == 0
-        || source.tile_height == 0
-    {
-        bail!("source TIFF has no valid tiled full-resolution page");
-    }
-
-    let description = format!(
-        "{}\n{}x{} [0,0 {}x{}] ({}x{}) JPEG/RGB Q={}|AppMag = {}|MPP = {:.6}",
-        APERIO_VERSION,
-        source.width,
-        source.height,
-        source.width,
-        source.height,
-        source.tile_width,
-        source.tile_height,
-        quality,
-        if app_mag > 0.0 {
-            format!("{app_mag:.6}")
-        } else {
-            "0".to_owned()
-        },
-        mpp
-    );
-    let resolution = MICROMETRES_PER_CENTIMETRE / mpp.max(MIN_MPP);
-
-    file.seek(SeekFrom::End(0))?;
-    let thumb_offset = file.stream_position()?;
-    let thumb_bytes = encode_jpeg(thumbnail, quality)?;
-    file.write_all(&thumb_bytes)?;
-
-    let (main_ifd, main_next_pointer) = if magic == 42 {
-        write_compatible_classic_main(&mut file, &source, &description, resolution)?
-    } else {
-        write_compatible_big_main(&mut file, &source, &description, resolution)?
-    };
-    let (thumbnail_ifd, thumbnail_next_pointer) = if magic == 42 {
-        write_compatible_classic_thumbnail(
-            &mut file,
-            thumbnail,
-            thumb_offset as u32,
-            u32::try_from(thumb_bytes.len()).context("thumbnail is too large")?,
-            resolution,
-        )?
-    } else {
-        write_compatible_big_thumbnail(
-            &mut file,
-            thumbnail,
-            thumb_offset,
-            thumb_bytes.len() as u64,
-            resolution,
-        )?
-    };
-
-    if magic == 42 {
-        patch_u32_file(&mut file, main_next_pointer, u32::try_from(thumbnail_ifd)?)?;
-        patch_u32_file(
-            &mut file,
-            thumbnail_next_pointer,
-            u32::try_from(source.next_ifd)?,
-        )?;
-        patch_u32_file(&mut file, 4, u32::try_from(main_ifd)?)?;
-    } else {
-        patch_u64_file(&mut file, main_next_pointer, thumbnail_ifd)?;
-        patch_u64_file(&mut file, thumbnail_next_pointer, source.next_ifd)?;
-        patch_u64_file(&mut file, 8, main_ifd)?;
-    }
-    file.flush()?;
-    Ok(())
-}
-
-struct SourcePage {
-    width: u32,
-    height: u32,
-    tile_width: u32,
-    tile_height: u32,
-    bits: [u16; 3],
-    compression: u16,
-    photometric: u16,
-    samples: u16,
-    planar: u16,
-    next_ifd: u64,
-    tile_offsets: Vec<u64>,
-    tile_byte_counts: Vec<u64>,
-    jpeg_tables: Vec<u8>,
-}
-
-impl SourcePage {
-    fn read_classic(file: &mut File) -> Result<Self> {
-        file.seek(SeekFrom::Start(4))?;
-        let first = read_u32(file)? as u64;
-        read_source_page(file, first, false)
-    }
-
-    fn read_bigtiff(file: &mut File) -> Result<Self> {
-        file.seek(SeekFrom::Start(8))?;
-        let first = read_u64(file)?;
-        read_source_page(file, first, true)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct RawTag {
-    kind: u16,
-    count: u64,
-    value: u64,
-}
-
-fn read_source_page(file: &mut File, ifd: u64, big: bool) -> Result<SourcePage> {
-    file.seek(SeekFrom::Start(ifd))?;
-    let count = if big {
-        read_u64(file)?
-    } else {
-        read_u16(file)? as u64
-    };
-    let entry_size = if big { 20 } else { 12 };
-    let mut tags = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let tag = read_u16(file)?;
-        let kind = read_u16(file)?;
-        let (tag_count, value) = if big {
-            (read_u64(file)?, read_u64(file)?)
-        } else {
-            (read_u32(file)? as u64, read_u32(file)? as u64)
-        };
-        tags.push((
-            tag,
-            RawTag {
-                kind,
-                count: tag_count,
-                value,
-            },
-        ));
-    }
-    let count_size = if big { 8 } else { 2 };
-    let next_position = ifd + count_size + count * entry_size;
-    file.seek(SeekFrom::Start(next_position))?;
-    let next_ifd = if big {
-        read_u64(file)?
-    } else {
-        read_u32(file)? as u64
-    };
-    let tag = |code| {
-        tags.iter()
-            .find(|(tag, _)| *tag == code)
-            .map(|(_, value)| *value)
-            .with_context(|| format!("source TIFF is missing tag {code}"))
-    };
-    let width = scalar_tag(file, tag(256)?, big)? as u32;
-    let height = scalar_tag(file, tag(257)?, big)? as u32;
-    let bits_values = array_tag(file, tag(258)?, big)?;
-    let tile_offsets = array_tag(file, tag(324)?, big)?;
-    let tile_byte_counts = array_tag(file, tag(325)?, big)?;
-    let jpeg_tables = tags
-        .iter()
-        .find(|(code, _)| *code == 347)
-        .map(|(_, value)| array_tag(file, *value, big))
-        .transpose()?
-        .unwrap_or_default()
-        .into_iter()
-        .map(|value| u8::try_from(value).context("invalid JPEG table byte"))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(SourcePage {
-        width,
-        height,
-        tile_width: scalar_tag(file, tag(322)?, big)? as u32,
-        tile_height: scalar_tag(file, tag(323)?, big)? as u32,
-        bits: [
-            bits_values.first().copied().unwrap_or(8) as u16,
-            bits_values.get(1).copied().unwrap_or(8) as u16,
-            bits_values.get(2).copied().unwrap_or(8) as u16,
-        ],
-        compression: scalar_tag(file, tag(259)?, big)? as u16,
-        photometric: scalar_tag(file, tag(262)?, big)? as u16,
-        samples: scalar_tag(file, tag(277)?, big)? as u16,
-        planar: scalar_tag(file, tag(284)?, big)? as u16,
-        next_ifd,
-        tile_offsets,
-        tile_byte_counts,
-        jpeg_tables,
-    })
-}
-
-fn scalar_tag(file: &mut File, tag: RawTag, big: bool) -> Result<u64> {
-    Ok(array_tag(file, tag, big)?.first().copied().unwrap_or(0))
-}
-
-fn array_tag(file: &mut File, tag: RawTag, big: bool) -> Result<Vec<u64>> {
-    let unit = match tag.kind {
-        1 | 2 | 6 | 7 => 1,
-        3 | 8 => 2,
-        4 | 9 | 11 => 4,
-        5 | 10 | 12 | 16 => 8,
-        _ => bail!("unsupported TIFF tag type {}", tag.kind),
-    };
-    let total = tag
-        .count
-        .checked_mul(unit)
-        .context("TIFF tag size overflow")?;
-    let inline = if big { 8 } else { 4 };
-    let mut bytes = vec![0u8; usize::try_from(total)?];
-    if total <= inline {
-        let raw = if big {
-            tag.value.to_le_bytes().to_vec()
-        } else {
-            (tag.value as u32).to_le_bytes().to_vec()
-        };
-        let length = bytes.len();
-        bytes.copy_from_slice(&raw[..length]);
-    } else {
-        file.seek(SeekFrom::Start(tag.value))?;
-        file.read_exact(&mut bytes)?;
-    }
-    let mut values = Vec::with_capacity(tag.count as usize);
-    for index in 0..tag.count as usize {
-        let start = index * unit as usize;
-        let value = match tag.kind {
-            1 | 2 | 6 | 7 => bytes[start] as u64,
-            3 => u16::from_le_bytes(bytes[start..start + 2].try_into().unwrap()) as u64,
-            4 => u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as u64,
-            16 => u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap()),
-            _ => 0,
-        };
-        values.push(value);
-    }
-    Ok(values)
-}
-
-fn write_compatible_classic_main(
-    file: &mut File,
-    source: &SourcePage,
-    description: &str,
-    resolution: f64,
-) -> Result<(u64, u64)> {
-    let ifd = align(file.stream_position()?, 2);
-    pad_to(file, ifd)?;
-    let ycbcr = source.photometric == 6 && source.samples == 3;
-    let count = 19u16 + u16::from(!source.jpeg_tables.is_empty()) + 2 * u16::from(ycbcr);
-    let start = ifd + 2 + count as u64 * 12 + 4;
-    let bits = align(start, 2);
-    let offsets = align(bits + 6, 4);
-    let counts = offsets + source.tile_offsets.len() as u64 * 4;
-    let desc = counts + source.tile_byte_counts.len() as u64 * 4;
-    let software = desc + description.len() as u64 + 1;
-    let xres = align(software + 13, 2);
-    let sample_format = xres + 16;
-    let jpeg_tables = sample_format + 6;
-    let reference_bw = align(jpeg_tables + source.jpeg_tables.len() as u64, 4);
-    let mut entries = vec![
-        long(TAG_NEW_SUBFILE_TYPE, 0),
-        long(TAG_IMAGE_WIDTH, source.width),
-        long(TAG_IMAGE_LENGTH, source.height),
-        short_array_at(TAG_BITS_PER_SAMPLE, bits),
-        short(TAG_COMPRESSION, source.compression),
-        short(TAG_PHOTOMETRIC_INTERPRETATION, source.photometric),
-        ascii_at(TAG_IMAGE_DESCRIPTION, desc, description.len() + 1)?,
-        short(TAG_ORIENTATION, 1),
-        short(TAG_SAMPLES_PER_PIXEL, source.samples),
-        rational_at(TAG_X_RESOLUTION, xres),
-        rational_at(TAG_Y_RESOLUTION, xres + 8),
-        short(TAG_PLANAR_CONFIGURATION, source.planar),
-        short(TAG_RESOLUTION_UNIT, 3),
-        long_at(TAG_TILE_WIDTH, source.tile_width),
-        long_at(TAG_TILE_LENGTH, source.tile_height),
-        u64_long_array_at(TAG_TILE_OFFSETS, &source.tile_offsets, offsets)?,
-        u64_long_array_at(TAG_TILE_BYTE_COUNTS, &source.tile_byte_counts, counts)?,
-        ascii_at(TAG_SOFTWARE, software, 13)?,
-        short_array_at(TAG_SAMPLE_FORMAT, sample_format),
-    ];
-    if !source.jpeg_tables.is_empty() {
-        entries.push(undefined_at(
-            TAG_JPEG_TABLES,
-            source.jpeg_tables.len(),
-            jpeg_tables,
-        )?);
-    }
-    if ycbcr {
-        entries.push(short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2));
-        entries.push(rational_array_at(
-            TAG_REFERENCE_BLACK_WHITE,
-            reference_bw,
-            6,
-        )?);
-    }
-    entries.sort_by_key(|entry| entry.tag);
-    file.write_all(&count.to_le_bytes())?;
-    for entry in &entries {
-        file.write_all(&entry.tag.to_le_bytes())?;
-        file.write_all(&entry.kind.to_le_bytes())?;
-        file.write_all(&entry.count.to_le_bytes())?;
-        file.write_all(&entry.value.to_le_bytes())?;
-    }
-    let next_pointer = ifd + 2 + count as u64 * 12;
-    file.write_all(&0u32.to_le_bytes())?;
-    pad_to(file, bits)?;
-    for value in source.bits {
-        file.write_all(&value.to_le_bytes())?;
-    }
-    pad_to(file, offsets)?;
-    for value in &source.tile_offsets {
-        file.write_all(&u32::try_from(*value)?.to_le_bytes())?;
-    }
-    for value in &source.tile_byte_counts {
-        file.write_all(&u32::try_from(*value)?.to_le_bytes())?;
-    }
-    file.write_all(description.as_bytes())?;
-    file.write_all(&[0])?;
-    file.write_all(b"img2svs-rust\0")?;
-    pad_to(file, xres)?;
-    write_rational(file, resolution)?;
-    write_rational(file, resolution)?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&source.jpeg_tables)?;
-    if ycbcr {
-        pad_to(file, reference_bw)?;
-        write_reference_black_white(file)?;
-    }
-    Ok((ifd, next_pointer))
-}
-
-fn write_compatible_classic_thumbnail(
-    file: &mut File,
-    image: &RgbImage,
-    offset: u32,
-    count: u32,
-    resolution: f64,
-) -> Result<(u64, u64)> {
-    let ifd = align(file.stream_position()?, 2);
-    pad_to(file, ifd)?;
-    let entry_count = 16u16;
-    let start = ifd + 2 + entry_count as u64 * 12 + 4;
-    let bits = align(start, 2);
-    let xres = align(bits + 6, 2);
-    let reference_bw = align(xres + 16, 4);
-    let entries = vec![
-        long(TAG_IMAGE_WIDTH, image.width()),
-        long(TAG_IMAGE_LENGTH, image.height()),
-        short_array_at(TAG_BITS_PER_SAMPLE, bits),
-        short(TAG_COMPRESSION, 7),
-        short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
-        long_at(TAG_STRIP_OFFSETS, offset),
-        long_at(TAG_ROWS_PER_STRIP, image.height()),
-        long_at(TAG_STRIP_BYTE_COUNTS, count),
-        short(TAG_ORIENTATION, 1),
-        short(TAG_SAMPLES_PER_PIXEL, 3),
-        rational_at(TAG_X_RESOLUTION, xres),
-        rational_at(TAG_Y_RESOLUTION, xres + 8),
-        short(TAG_PLANAR_CONFIGURATION, 1),
-        short(TAG_RESOLUTION_UNIT, 3),
-        short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
-        rational_array_at(TAG_REFERENCE_BLACK_WHITE, reference_bw, 6)?,
-    ];
-    let mut entries = entries;
-    entries.sort_by_key(|entry| entry.tag);
-    file.write_all(&entry_count.to_le_bytes())?;
-    for entry in &entries {
-        file.write_all(&entry.tag.to_le_bytes())?;
-        file.write_all(&entry.kind.to_le_bytes())?;
-        file.write_all(&entry.count.to_le_bytes())?;
-        file.write_all(&entry.value.to_le_bytes())?;
-    }
-    file.write_all(&0u32.to_le_bytes())?;
-    pad_to(file, bits)?;
-    file.write_all(&[8, 0, 8, 0, 8, 0])?;
-    pad_to(file, xres)?;
-    write_rational(file, resolution)?;
-    write_rational(file, resolution)?;
-    pad_to(file, reference_bw)?;
-    write_reference_black_white(file)?;
-    Ok((ifd, ifd + 2 + entry_count as u64 * 12))
-}
-
-fn write_compatible_big_main(
-    file: &mut File,
-    source: &SourcePage,
-    description: &str,
-    resolution: f64,
-) -> Result<(u64, u64)> {
-    let ifd = align(file.stream_position()?, 8);
-    pad_to(file, ifd)?;
-    let ycbcr = source.photometric == 6 && source.samples == 3;
-    let count = 19u64 + u64::from(!source.jpeg_tables.is_empty()) + 2 * u64::from(ycbcr);
-    let start = ifd + 8 + count * 20 + 8;
-    let bits = align(start, 8);
-    let offsets = align(bits + 6, 8);
-    let counts = offsets + source.tile_offsets.len() as u64 * 8;
-    let desc = counts + source.tile_byte_counts.len() as u64 * 8;
-    let software = desc + description.len() as u64 + 1;
-    let xres = align(software + 13, 8);
-    let sample_format = xres + 16;
-    let jpeg_tables = sample_format + 6;
-    let reference_bw = align(jpeg_tables + source.jpeg_tables.len() as u64, 8);
-    let mut entries = vec![
-        big_long(TAG_NEW_SUBFILE_TYPE, 0),
-        big_long(TAG_IMAGE_WIDTH, source.width),
-        big_long(TAG_IMAGE_LENGTH, source.height),
-        big_short_array(TAG_BITS_PER_SAMPLE, bits),
-        big_short(TAG_COMPRESSION, source.compression),
-        big_short(TAG_PHOTOMETRIC_INTERPRETATION, source.photometric),
-        big_ascii_at(TAG_IMAGE_DESCRIPTION, desc, description.len() + 1)?,
-        big_short(TAG_ORIENTATION, 1),
-        big_short(TAG_SAMPLES_PER_PIXEL, source.samples),
-        big_rational(TAG_X_RESOLUTION, xres),
-        big_rational(TAG_Y_RESOLUTION, xres + 8),
-        big_short(TAG_PLANAR_CONFIGURATION, source.planar),
-        big_short(TAG_RESOLUTION_UNIT, 3),
-        big_long(TAG_TILE_WIDTH, source.tile_width),
-        big_long(TAG_TILE_LENGTH, source.tile_height),
-        big_long8_values_at(TAG_TILE_OFFSETS, &source.tile_offsets, offsets)?,
-        big_long8_values_at(TAG_TILE_BYTE_COUNTS, &source.tile_byte_counts, counts)?,
-        big_ascii_at(TAG_SOFTWARE, software, 13)?,
-        big_short_array(TAG_SAMPLE_FORMAT, sample_format),
-    ];
-    if !source.jpeg_tables.is_empty() {
-        entries.push(big_undefined(
-            TAG_JPEG_TABLES,
-            source.jpeg_tables.len(),
-            jpeg_tables,
-        )?);
-    }
-    if ycbcr {
-        entries.push(big_short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2));
-        entries.push(big_rational_array(
-            TAG_REFERENCE_BLACK_WHITE,
-            reference_bw,
-            6,
-        ));
-    }
-    entries.sort_by_key(|entry| entry.tag);
-    file.write_all(&count.to_le_bytes())?;
-    for entry in &entries {
-        file.write_all(&entry.tag.to_le_bytes())?;
-        file.write_all(&entry.kind.to_le_bytes())?;
-        file.write_all(&entry.count.to_le_bytes())?;
-        file.write_all(&entry.value.to_le_bytes())?;
-    }
-    let next_pointer = ifd + 8 + count * 20;
-    file.write_all(&0u64.to_le_bytes())?;
-    pad_to(file, bits)?;
-    for value in source.bits {
-        file.write_all(&value.to_le_bytes())?;
-    }
-    pad_to(file, offsets)?;
-    for value in &source.tile_offsets {
-        file.write_all(&value.to_le_bytes())?;
-    }
-    for value in &source.tile_byte_counts {
-        file.write_all(&value.to_le_bytes())?;
-    }
-    file.write_all(description.as_bytes())?;
-    file.write_all(&[0])?;
-    file.write_all(b"img2svs-rust\0")?;
-    pad_to(file, xres)?;
-    write_rational(file, resolution)?;
-    write_rational(file, resolution)?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&source.jpeg_tables)?;
-    if ycbcr {
-        pad_to(file, reference_bw)?;
-        write_reference_black_white(file)?;
-    }
-    Ok((ifd, next_pointer))
-}
-
-fn write_compatible_big_thumbnail(
-    file: &mut File,
-    image: &RgbImage,
-    offset: u64,
-    count: u64,
-    resolution: f64,
-) -> Result<(u64, u64)> {
-    let ifd = align(file.stream_position()?, 8);
-    pad_to(file, ifd)?;
-    let entry_count = 16u64;
-    let start = ifd + 8 + entry_count * 20 + 8;
-    let bits = align(start, 8);
-    let xres = align(bits + 6, 8);
-    let reference_bw = align(xres + 16, 8);
-    let mut entries = vec![
-        big_long(TAG_IMAGE_WIDTH, image.width()),
-        big_long(TAG_IMAGE_LENGTH, image.height()),
-        big_short_array(TAG_BITS_PER_SAMPLE, bits),
-        big_short(TAG_COMPRESSION, 7),
-        big_short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
-        BigEntry {
-            tag: TAG_STRIP_OFFSETS,
-            kind: TIFF_TYPE_LONG8,
-            count: 1,
-            value: offset,
-        },
-        big_long(TAG_ROWS_PER_STRIP, image.height()),
-        BigEntry {
-            tag: TAG_STRIP_BYTE_COUNTS,
-            kind: TIFF_TYPE_LONG8,
-            count: 1,
-            value: count,
-        },
-        big_short(TAG_ORIENTATION, 1),
-        big_short(TAG_SAMPLES_PER_PIXEL, 3),
-        big_rational(TAG_X_RESOLUTION, xres),
-        big_rational(TAG_Y_RESOLUTION, xres + 8),
-        big_short(TAG_PLANAR_CONFIGURATION, 1),
-        big_short(TAG_RESOLUTION_UNIT, 3),
-        big_short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
-        big_rational_array(TAG_REFERENCE_BLACK_WHITE, reference_bw, 6),
-    ];
-    entries.sort_by_key(|entry| entry.tag);
-    file.write_all(&entry_count.to_le_bytes())?;
-    for entry in &entries {
-        file.write_all(&entry.tag.to_le_bytes())?;
-        file.write_all(&entry.kind.to_le_bytes())?;
-        file.write_all(&entry.count.to_le_bytes())?;
-        file.write_all(&entry.value.to_le_bytes())?;
-    }
-    file.write_all(&0u64.to_le_bytes())?;
-    pad_to(file, bits)?;
-    file.write_all(&[8, 0, 8, 0, 8, 0])?;
-    pad_to(file, xres)?;
-    write_rational(file, resolution)?;
-    write_rational(file, resolution)?;
-    pad_to(file, reference_bw)?;
-    write_reference_black_white(file)?;
-    Ok((ifd, ifd + 8 + entry_count * 20))
-}
-
-fn big_ascii_at(tag: u16, offset: u64, count: usize) -> Result<BigEntry> {
-    Ok(BigEntry {
-        tag,
-        kind: TIFF_TYPE_ASCII,
-        count: u64::try_from(count)?,
-        value: offset,
-    })
-}
-
-fn big_long8_array(tag: u16, count: usize, offset: u64) -> Result<BigEntry> {
-    Ok(BigEntry {
-        tag,
-        kind: TIFF_TYPE_LONG8,
-        count: u64::try_from(count)?,
-        value: offset,
-    })
-}
-
-fn big_long8_values_at(tag: u16, values: &[u64], offset: u64) -> Result<BigEntry> {
-    if values.len() == 1 {
-        Ok(BigEntry {
-            tag,
-            kind: TIFF_TYPE_LONG8,
-            count: 1,
-            value: values[0],
-        })
-    } else {
-        big_long8_array(tag, values.len(), offset)
-    }
-}
-
-fn read_u16(file: &mut File) -> Result<u16> {
-    let mut bytes = [0u8; 2];
-    file.read_exact(&mut bytes)?;
-    Ok(u16::from_le_bytes(bytes))
-}
-
-fn read_u32(file: &mut File) -> Result<u32> {
-    let mut bytes = [0u8; 4];
-    file.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_u64(file: &mut File) -> Result<u64> {
-    let mut bytes = [0u8; 8];
-    file.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn patch_u32_file(file: &mut File, offset: u64, value: u32) -> Result<()> {
-    let current = file.stream_position()?;
-    file.seek(SeekFrom::Start(offset))?;
-    file.write_all(&value.to_le_bytes())?;
-    file.seek(SeekFrom::Start(current))?;
-    Ok(())
-}
-
-fn patch_u64_file(file: &mut File, offset: u64, value: u64) -> Result<()> {
-    let current = file.stream_position()?;
-    file.seek(SeekFrom::Start(offset))?;
-    file.write_all(&value.to_le_bytes())?;
-    file.seek(SeekFrom::Start(current))?;
-    Ok(())
-}
-
 fn temporary_path(output: &Path) -> PathBuf {
     let mut path = output.to_path_buf();
     let suffix = format!(".{}.tmp", std::process::id());
@@ -768,8 +100,7 @@ fn temporary_path(output: &Path) -> PathBuf {
 }
 
 fn write_slide_inner(slide: &Slide, output: &Path, options: &WriteOptions) -> Result<()> {
-    let mut input =
-        File::open(&slide.path).with_context(|| format!("open input {}", slide.path.display()))?;
+    let mut input = SourceFiles::open(slide)?;
     let mut writer = TiffWriter::create(output)?;
     let mut hevc = if slide.compression == Compression::Hevc {
         Some(HevcDecoder::new()?)
@@ -797,12 +128,14 @@ fn write_slide_inner(slide: &Slide, output: &Path, options: &WriteOptions) -> Re
     }
 
     for associated in &slide.associated_images {
-        let bytes = read_range(&mut input, associated.data.offset, associated.data.length)?;
-        if bytes.is_empty() {
-            continue;
-        }
-        let image = decode_image(&bytes)
-            .with_context(|| format!("decode associated image {}", associated.kind))?;
+        let image = decode_embedded(
+            &mut input,
+            associated.data,
+            &associated.strips,
+            &associated.jpeg_tables,
+            (associated.width, associated.height),
+        )
+        .with_context(|| format!("decode associated image {}", associated.kind))?;
         writer.write_strip_page(
             &image,
             options.jpeg_quality,
@@ -813,19 +146,161 @@ fn write_slide_inner(slide: &Slide, output: &Path, options: &WriteOptions) -> Re
     writer.finish()
 }
 
+/// Decodes one embedded image, whichever way the container stores it.
+///
+/// Vendors either hand us a single self-contained blob (JPEG, PNG or BMP), or
+/// a stripped TIFF page whose strips omit the tables carried once in tag 347.
+/// The stripped form is decoded strip by strip and stacked in raster order,
+/// which needs no extra geometry because every strip is a valid JPEG on its
+/// own once the shared tables are spliced back in.
+fn decode_embedded(
+    input: &mut SourceFiles,
+    data: ByteRange,
+    strips: &[ByteRange],
+    jpeg_tables: &[u8],
+    declared: (u32, u32),
+) -> Result<RgbImage> {
+    if strips.is_empty() {
+        let bytes = input.read_range(data.offset, data.length)?;
+        if bytes.is_empty() {
+            bail!("embedded image has no payload");
+        }
+        return decode_image(&bytes);
+    }
+    let mut pieces = Vec::with_capacity(strips.len());
+    for (index, strip) in strips.iter().enumerate() {
+        let bytes = input.read_range(strip.offset, strip.length)?;
+        let merged = merge_jpeg_tables(jpeg_tables, &bytes)
+            .with_context(|| format!("assemble strip {index}"))?;
+        let piece = decode_rgb(&merged).with_context(|| format!("decode strip {index}"))?;
+        pieces.push(piece);
+    }
+    let stacked = stack_vertically(&pieces).context("stack stripped image")?;
+    Ok(trim_to_declared(stacked, declared))
+}
+
+/// Stacks decoded strips into the page they belong to.
+fn stack_vertically(pieces: &[RgbImage]) -> Result<RgbImage> {
+    let width = pieces
+        .first()
+        .context("stripped image has no strips")?
+        .width();
+    let height: u32 = pieces.iter().map(RgbImage::height).sum();
+    if width == 0 || height == 0 {
+        bail!("stripped image has no pixels");
+    }
+    let mut image = RgbImage::new(width, height);
+    let mut top = 0u32;
+    for piece in pieces {
+        let copy_width = piece.width().min(width);
+        for y in 0..piece.height() {
+            for x in 0..copy_width {
+                image.put_pixel(x, top + y, *piece.get_pixel(x, y));
+            }
+        }
+        top += piece.height();
+    }
+    Ok(image)
+}
+
+/// Crops a stacked page back to the size its directory declares.
+///
+/// A stripped TIFF pads the final strip out to `RowsPerStrip`, so the decoded
+/// pieces together are taller than the page; without this the label and macro
+/// images come out with a band of padding along the bottom.
+fn trim_to_declared(image: RgbImage, declared: (u32, u32)) -> RgbImage {
+    let (width, height) = declared;
+    if width == 0 || height == 0 || (image.width() == width && image.height() == height) {
+        return image;
+    }
+    let width = width.min(image.width());
+    let height = height.min(image.height());
+    if width == 0 || height == 0 {
+        return image;
+    }
+    let mut trimmed = RgbImage::new(width, height);
+    image::imageops::replace(&mut trimmed, &image, 0, 0);
+    trimmed
+}
+
+/// Read handles over the virtual source space of a slide.
+///
+/// Single-file slides hold exactly one entry whose base is zero; multi-file
+/// containers (MRXS `Data*.dat`) hold one handle per backing file and ranges
+/// are resolved by their virtual base offsets.
+struct SourceFiles {
+    files: Vec<(u64, File)>,
+}
+
+impl SourceFiles {
+    fn open(slide: &Slide) -> Result<Self> {
+        if slide.sources.is_empty() {
+            let file = File::open(&slide.path)
+                .with_context(|| format!("open input {}", slide.path.display()))?;
+            return Ok(Self {
+                files: vec![(0, file)],
+            });
+        }
+        let mut files = Vec::with_capacity(slide.sources.len());
+        for source in &slide.sources {
+            let file = File::open(&source.path)
+                .with_context(|| format!("open input {}", source.path.display()))?;
+            files.push((source.base, file));
+        }
+        files.sort_by_key(|(base, _)| *base);
+        Ok(Self { files })
+    }
+
+    /// Reads one tile payload, splicing the level's wrapper around it.
+    ///
+    /// Containers that store complete streams per tile return the bytes as
+    /// they are on disk; the wrapper only exists for levels cut out of a
+    /// single JPEG strip.
+    fn read_tile(&mut self, level: &Level, range: ByteRange) -> Result<Vec<u8>> {
+        if level.tiling.is_plain() || !range.present() {
+            return self.read_range(range.offset, range.length);
+        }
+        let body = self.read_range(range.offset, range.length)?;
+        Ok(splice_tile(
+            &level.tiling.prefix,
+            &body,
+            &level.tiling.suffix,
+        ))
+    }
+
+    fn read_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let size = usize::try_from(length).context("tile is too large for this platform")?;
+        let index = self
+            .files
+            .partition_point(|(base, _)| *base <= offset)
+            .checked_sub(1)
+            .context("source range precedes the first backing file")?;
+        let (base, file) = &mut self.files[index];
+        file.seek(SeekFrom::Start(offset - *base))?;
+        let mut bytes = vec![0; size];
+        std::io::Read::read_exact(file, &mut bytes)?;
+        Ok(bytes)
+    }
+}
+
 fn render_thumbnail(
     slide: &Slide,
-    input: &mut File,
+    input: &mut SourceFiles,
     quality: u8,
     hevc: Option<&mut HevcDecoder>,
 ) -> Result<RgbImage> {
     if let Some(thumbnail) = &slide.thumbnail {
-        let _declared_thumbnail_size = (thumbnail.width, thumbnail.height);
-        let bytes = read_range(input, thumbnail.data.offset, thumbnail.data.length)?;
-        if !bytes.is_empty() {
-            if let Ok(image) = decode_image(&bytes) {
-                return Ok(make_thumbnail(&image, 1024));
-            }
+        if let Ok(image) = decode_embedded(
+            input,
+            thumbnail.data,
+            &thumbnail.strips,
+            &thumbnail.jpeg_tables,
+            (thumbnail.width, thumbnail.height),
+        ) {
+            return Ok(make_thumbnail(&image, 1024));
         }
     }
     let level = slide.levels.last().context("slide has no pyramid levels")?;
@@ -835,17 +310,18 @@ fn render_thumbnail(
 
 fn render_level(
     slide: &Slide,
-    input: &mut File,
+    input: &mut SourceFiles,
     level: &Level,
     _quality: u8,
     mut hevc: Option<&mut HevcDecoder>,
 ) -> Result<RgbImage> {
     let mut canvas = white_image(level.width, level.height);
+    let pitch = level.stored_tile_pitch(slide.tile_width, slide.tile_height);
     for (index, range) in level.tiles.iter().enumerate() {
         if !range.present() {
             continue;
         }
-        let bytes = read_range(input, range.offset, range.length)?;
+        let bytes = input.read_tile(level, *range)?;
         let tile = decode_tile(slide, &bytes, hevc.as_deref_mut())?;
         if let Some(position) = level.tile_positions.get(index) {
             copy_region(
@@ -853,21 +329,34 @@ fn render_level(
                 &tile,
                 position.x,
                 position.y,
+                position.src_x,
+                position.src_y,
                 position.width,
                 position.height,
             );
         } else {
             let row = index as u32 / level.tile_cols;
             let col = index as u32 % level.tile_cols;
-            copy_clipped(
-                &mut canvas,
-                &tile,
-                col * slide.tile_width,
-                row * slide.tile_height,
-            );
+            copy_clipped(&mut canvas, &tile, col * pitch.0, row * pitch.1);
         }
     }
     Ok(canvas)
+}
+
+/// Wraps a tile payload in the header and trailer its level needs.
+///
+/// Only levels stored as restart intervals of one JPEG strip use this; every
+/// other container puts a complete stream on disk and passes `prefix` and
+/// `suffix` empty, in which case the body is returned unchanged.
+fn splice_tile(prefix: &[u8], body: &[u8], suffix: &[u8]) -> Vec<u8> {
+    if prefix.is_empty() && suffix.is_empty() {
+        return body.to_vec();
+    }
+    let mut bytes = Vec::with_capacity(prefix.len() + body.len() + suffix.len());
+    bytes.extend_from_slice(prefix);
+    bytes.extend_from_slice(body);
+    bytes.extend_from_slice(suffix);
+    bytes
 }
 
 fn decode_tile(slide: &Slide, bytes: &[u8], hevc: Option<&mut HevcDecoder>) -> Result<RgbImage> {
@@ -894,37 +383,90 @@ fn copy_clipped(dst: &mut RgbImage, src: &RgbImage, left: u32, top: u32) {
     }
 }
 
-fn copy_region(dst: &mut RgbImage, src: &RgbImage, left: u32, top: u32, width: u32, height: u32) {
+fn copy_region(
+    dst: &mut RgbImage,
+    src: &RgbImage,
+    left: u32,
+    top: u32,
+    src_x: u32,
+    src_y: u32,
+    width: u32,
+    height: u32,
+) {
     if left >= dst.width() || top >= dst.height() {
         return;
     }
-    let width = width.min(src.width()).min(dst.width() - left);
-    let height = height.min(src.height()).min(dst.height() - top);
+    let width = width
+        .min(src.width().saturating_sub(src_x))
+        .min(dst.width() - left);
+    let height = height
+        .min(src.height().saturating_sub(src_y))
+        .min(dst.height() - top);
     for y in 0..height {
         for x in 0..width {
-            dst.put_pixel(left + x, top + y, *src.get_pixel(x, y));
+            dst.put_pixel(left + x, top + y, *src.get_pixel(src_x + x, src_y + y));
         }
     }
 }
 
-fn read_range(input: &mut File, offset: u64, length: u64) -> Result<Vec<u8>> {
-    if length == 0 {
-        return Ok(Vec::new());
-    }
-    let size = usize::try_from(length).context("tile is too large for this platform")?;
-    input.seek(SeekFrom::Start(offset))?;
-    let mut bytes = vec![0; size];
-    std::io::Read::read_exact(input, &mut bytes)?;
-    Ok(bytes)
+/// Memory-mapped view over the virtual source space of a slide.
+struct SourceMaps {
+    maps: Vec<(u64, memmap2::Mmap)>,
 }
 
-fn mapped_range(source: &[u8], range: ByteRange) -> Result<&[u8]> {
-    let start = usize::try_from(range.offset).context("tile offset exceeds this platform")?;
-    let length = usize::try_from(range.length).context("tile length exceeds this platform")?;
-    let end = start.checked_add(length).context("tile range overflow")?;
-    source
-        .get(start..end)
-        .context("tile range exceeds input file")
+impl SourceMaps {
+    fn open(slide: &Slide) -> Result<Self> {
+        let mut maps = Vec::new();
+        if slide.sources.is_empty() {
+            let file = File::open(&slide.path)
+                .with_context(|| format!("open input {}", slide.path.display()))?;
+            // SAFETY: the converter opens the source read-only and never mutates
+            // it while this mapping is alive.
+            let map = unsafe { MmapOptions::new().map(&file)? };
+            maps.push((0, map));
+        } else {
+            for source in &slide.sources {
+                let file = File::open(&source.path)
+                    .with_context(|| format!("open input {}", source.path.display()))?;
+                // SAFETY: same read-only guarantee as the single-file case.
+                let map = unsafe { MmapOptions::new().map(&file)? };
+                maps.push((source.base, map));
+            }
+            maps.sort_by_key(|(base, _)| *base);
+        }
+        Ok(Self { maps })
+    }
+
+    /// Reads one tile payload, splicing the level's wrapper around it.
+    ///
+    /// The common case - a container that stores complete streams - borrows
+    /// from the mapping, so a multi-gigabyte conversion does not copy every
+    /// tile twice.
+    fn read_tile<'a>(&'a self, level: &Level, range: ByteRange) -> Result<Cow<'a, [u8]>> {
+        if level.tiling.is_plain() || !range.present() {
+            return Ok(Cow::Borrowed(self.range(range)?));
+        }
+        let body = self.range(range)?;
+        Ok(Cow::Owned(splice_tile(
+            &level.tiling.prefix,
+            body,
+            &level.tiling.suffix,
+        )))
+    }
+
+    fn range(&self, range: ByteRange) -> Result<&[u8]> {
+        let start = usize::try_from(range.offset).context("tile offset exceeds this platform")?;
+        let length = usize::try_from(range.length).context("tile length exceeds this platform")?;
+        let index = self
+            .maps
+            .partition_point(|(base, _)| *base <= range.offset)
+            .checked_sub(1)
+            .context("tile range precedes the first backing file")?;
+        let (base, map) = &self.maps[index];
+        let local = start - usize::try_from(*base).context("source base overflows")?;
+        let end = local.checked_add(length).context("tile range overflow")?;
+        map.get(local..end).context("tile range exceeds input file")
+    }
 }
 
 struct TiffWriter {
@@ -943,44 +485,6 @@ impl TiffWriter {
             file,
             first_ifd_pointer: None,
             previous_next_pointer: None,
-        })
-    }
-
-    fn open_append(path: &Path) -> Result<Self> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mut header = [0u8; 8];
-        file.read_exact(&mut header)?;
-        if &header[0..2] != b"II" || u16::from_le_bytes([header[2], header[3]]) != 42 {
-            bail!("can only append associated images to classic little-endian TIFF");
-        }
-        let first_ifd = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
-        let mut ifd = first_ifd;
-        if ifd == 0 {
-            bail!("TIFF has no image directory");
-        }
-        let next_pointer = loop {
-            file.seek(SeekFrom::Start(ifd))?;
-            let mut count = [0u8; 2];
-            file.read_exact(&mut count)?;
-            let count = u16::from_le_bytes(count) as u64;
-            let pointer = ifd + 2 + count * 12;
-            file.seek(SeekFrom::Start(pointer))?;
-            let mut next = [0u8; 4];
-            file.read_exact(&mut next)?;
-            let next = u32::from_le_bytes(next) as u64;
-            if next == 0 {
-                break pointer;
-            }
-            if next <= ifd {
-                bail!("invalid TIFF IFD chain");
-            }
-            ifd = next;
-        };
-        file.seek(SeekFrom::End(0))?;
-        Ok(Self {
-            file,
-            first_ifd_pointer: Some(first_ifd),
-            previous_next_pointer: Some(next_pointer),
         })
     }
 
@@ -1014,10 +518,12 @@ impl TiffWriter {
         reduced: bool,
         tile_pool: &TilePool,
     ) -> Result<()> {
-        let merge_cols = 16 / gcd(slide.tile_width, 16);
-        let merge_rows = 16 / gcd(slide.tile_height, 16);
-        let tile_width = slide.tile_width * merge_cols;
-        let tile_height = slide.tile_height * merge_rows;
+        let (pitch_width, pitch_height) =
+            level.stored_tile_pitch(slide.tile_width, slide.tile_height);
+        let merge_cols = 16 / gcd(pitch_width, 16);
+        let merge_rows = 16 / gcd(pitch_height, 16);
+        let tile_width = pitch_width * merge_cols;
+        let tile_height = pitch_height * merge_rows;
         let output_cols = level.tile_cols.div_ceil(merge_cols);
         let output_rows = level.tile_rows.div_ceil(merge_rows);
         let mut offsets = Vec::with_capacity((output_cols * output_rows) as usize);
@@ -1025,6 +531,15 @@ impl TiffWriter {
 
         let total = usize::try_from(output_cols as u64 * output_rows as u64)
             .context("output tile count exceeds this platform")?;
+        // Tiles we re-encode are written as abbreviated streams; the shared
+        // quantization/Huffman tables ride once in the IFD's JPEGTables tag.
+        // Pass-through tiles keep their own embedded tables, which TIFF
+        // Compression=7 permits on a per-tile basis.
+        let jpeg_tables = {
+            let probe = white_image(16, 16);
+            let (tables, _) = split_jpeg_tables(&encode_jpeg(&probe, quality)?)?;
+            tables
+        };
         for batch_start in (0..total).step_by(tile_pool.batch_size()) {
             let batch_end = (batch_start + tile_pool.batch_size()).min(total);
             let tasks: Vec<_> = (batch_start..batch_end)
@@ -1066,6 +581,7 @@ impl TiffWriter {
             description,
             reduced,
             resolution,
+            jpeg_tables: Some(jpeg_tables),
         })
     }
 
@@ -1195,11 +711,7 @@ impl TilePool {
         let (task_sender, task_receiver) = mpsc::channel::<TileTask>();
         let task_receiver = Arc::new(Mutex::new(task_receiver));
         let slide = Arc::new(slide.clone());
-        let source_file = File::open(&slide.path)
-            .with_context(|| format!("open input {}", slide.path.display()))?;
-        // SAFETY: the converter opens the source read-only and never mutates it
-        // while this mapping is alive.
-        let source = Arc::new(unsafe { MmapOptions::new().map(&source_file)? });
+        let source = Arc::new(SourceMaps::open(slide.as_ref())?);
         let mut workers = Vec::with_capacity(worker_count);
 
         for index in 0..worker_count {
@@ -1266,7 +778,7 @@ impl Drop for TilePool {
 
 fn tile_worker(
     slide: Arc<Slide>,
-    source: Arc<memmap2::Mmap>,
+    source: Arc<SourceMaps>,
     tasks: Arc<Mutex<mpsc::Receiver<TileTask>>>,
     results: mpsc::Sender<TileResult>,
 ) {
@@ -1312,7 +824,7 @@ fn tile_worker(
 
 fn encode_output_tile(
     slide: &Slide,
-    source: &[u8],
+    source: &SourceMaps,
     task: TileTask,
     hevc: Option<&mut HevcDecoder>,
 ) -> Result<Vec<u8>> {
@@ -1323,6 +835,9 @@ fn encode_output_tile(
     let passthrough = task.merge_rows == 1
         && task.merge_cols == 1
         && slide.compression == Compression::Jpeg
+        // Wrapped tiles are restart intervals, not streams, so they always
+        // have to be re-encoded rather than copied.
+        && level.tiling.is_plain()
         && level.tile_positions.is_empty()
         && task.quality == slide.metadata.jpeg_quality
         && task.output_row + 1 < level.tile_rows
@@ -1332,352 +847,62 @@ fn encode_output_tile(
             .tiles
             .get((task.output_row * level.tile_cols + task.output_col) as usize)
             .context("invalid source tile index")?;
-        let bytes = mapped_range(source, range)?;
+        let bytes = source.range(range)?;
         if bytes.is_empty() {
-            return encode_jpeg(
+            return encode_tile_image(
                 &compose_tile(slide, source, level, task.placement(), hevc)?,
                 task.quality,
             );
         }
         if !jpeg_is_420(bytes) {
-            return transcode_jpeg_to_420(bytes, task.quality).or_else(|_| {
+            // Lossless transcode keeps the source quantization tables, which
+            // differ from the shared JPEGTables tag — keep the full stream.
+            let encoded = transcode_jpeg_to_420(bytes, task.quality).or_else(|_| {
                 encode_jpeg_with_capacity(&decode_rgb(bytes)?, task.quality, bytes.len())
-            });
+            })?;
+            return Ok(encoded);
         }
         return Ok(bytes.to_vec());
     }
     let image = compose_tile(slide, source, level, task.placement(), hevc)?;
-    encode_jpeg(&image, task.quality)
+    encode_tile_image(&image, task.quality)
 }
 
-struct BigTiffWriter {
-    file: File,
-    previous_next_pointer: u64,
-}
-
-impl BigTiffWriter {
-    fn open_append(path: &Path) -> Result<Self> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mut header = [0u8; 16];
-        file.read_exact(&mut header)?;
-        if &header[0..2] != b"II"
-            || u16::from_le_bytes([header[2], header[3]]) != 43
-            || u16::from_le_bytes([header[4], header[5]]) != 8
-            || u16::from_le_bytes([header[6], header[7]]) != 0
-        {
-            bail!("unsupported BigTIFF header");
+/// Encodes a composed tile, memoizing the output when it is uniformly white.
+///
+/// Slides whose scan area covers a fraction of the canvas (MRXS in
+/// particular) produce hundreds of thousands of identical white tiles; the
+/// JPEG for a given geometry and quality is byte-identical, so it is encoded
+/// once per worker thread instead of once per tile.
+fn encode_tile_image(image: &RgbImage, quality: u8) -> Result<Vec<u8>> {
+    const WHITE: [u8; 3] = [255, 255, 255];
+    if !image
+        .as_raw()
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .all(|&p| p == WHITE)
+    {
+        // Re-encoded tiles are written as abbreviated streams (tables live in
+        // the shared JPEGTables tag), matching Aperio's layout.
+        return Ok(split_jpeg_tables(&encode_jpeg(image, quality)?)?.1);
+    }
+    thread_local! {
+        static WHITE_TILE_CACHE: std::cell::RefCell<
+            std::collections::HashMap<(u8, u32, u32), Vec<u8>>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    WHITE_TILE_CACHE.with(|cache| {
+        let key = (quality, image.width(), image.height());
+        let mut cache = cache.borrow_mut();
+        if let Some(encoded) = cache.get(&key) {
+            return Ok(encoded.clone());
         }
-        let file_size = file.metadata()?.len();
-        let first_ifd = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        if first_ifd == 0 || first_ifd >= file_size {
-            bail!("BigTIFF has no valid image directory");
-        }
-        let mut ifd = first_ifd;
-        let next_pointer = loop {
-            if ifd > file_size.saturating_sub(16) {
-                bail!("invalid BigTIFF IFD chain");
-            }
-            file.seek(SeekFrom::Start(ifd))?;
-            let mut count = [0u8; 8];
-            file.read_exact(&mut count)?;
-            let count = u64::from_le_bytes(count);
-            let pointer = ifd
-                .checked_add(8)
-                .and_then(|value| value.checked_add(count.checked_mul(20)?))
-                .context("BigTIFF IFD is too large")?;
-            if pointer > file_size.saturating_sub(8) {
-                bail!("invalid BigTIFF IFD bounds");
-            }
-            file.seek(SeekFrom::Start(pointer))?;
-            let mut next = [0u8; 8];
-            file.read_exact(&mut next)?;
-            let next = u64::from_le_bytes(next);
-            if next == 0 {
-                break pointer;
-            }
-            if next <= ifd || next >= file_size {
-                bail!("invalid BigTIFF IFD chain");
-            }
-            ifd = next;
-        };
-        file.seek(SeekFrom::End(0))?;
-        Ok(Self {
-            file,
-            previous_next_pointer: next_pointer,
-        })
-    }
-
-    fn write_strip_page(
-        &mut self,
-        image: &RgbImage,
-        quality: u8,
-        resolution: f64,
-        description: Option<&str>,
-    ) -> Result<()> {
-        let encoded = encode_jpeg(image, quality)?;
-        let offset = self.file.stream_position()?;
-        self.file.write_all(&encoded)?;
-        self.write_ifd(BigPage::Strip {
-            width: image.width(),
-            height: image.height(),
-            offset,
-            count: encoded.len() as u64,
-            resolution,
-            description: description.map(str::to_owned),
-        })
-    }
-
-    fn write_ifd(&mut self, page: BigPage) -> Result<()> {
-        let ifd_offset = self.file.stream_position()?;
-        self.patch_u64(self.previous_next_pointer, ifd_offset)?;
-        let entry_count = page.entry_count();
-        let extras_offset = ifd_offset + 8 + entry_count as u64 * 20 + 8;
-        let extra = page.extra_data(extras_offset);
-        let entries = page.entries(&extra);
-        self.file.write_all(&(entries.len() as u64).to_le_bytes())?;
-        for entry in &entries {
-            self.file.write_all(&entry.tag.to_le_bytes())?;
-            self.file.write_all(&entry.kind.to_le_bytes())?;
-            self.file.write_all(&entry.count.to_le_bytes())?;
-            self.file.write_all(&entry.value.to_le_bytes())?;
-        }
-        self.file.write_all(&0u64.to_le_bytes())?;
-        page.write_extra(&mut self.file, &extra)?;
-        self.previous_next_pointer = ifd_offset + 8 + entries.len() as u64 * 20;
-        Ok(())
-    }
-
-    fn patch_u64(&mut self, offset: u64, value: u64) -> Result<()> {
-        let current = self.file.stream_position()?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&value.to_le_bytes())?;
-        self.file.seek(SeekFrom::Start(current))?;
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        self.file.flush()?;
-        Ok(())
-    }
-}
-
-enum BigPage {
-    Strip {
-        width: u32,
-        height: u32,
-        offset: u64,
-        count: u64,
-        resolution: f64,
-        description: Option<String>,
-    },
-}
-
-#[derive(Clone, Copy)]
-struct BigEntry {
-    tag: u16,
-    kind: u16,
-    count: u64,
-    value: u64,
-}
-
-struct BigExtra {
-    bits: u64,
-    desc: u64,
-    xres: u64,
-    yres: u64,
-    sample: u64,
-    reference_bw: u64,
-    desc_text: String,
-}
-
-impl BigPage {
-    fn entry_count(&self) -> usize {
-        match self {
-            Self::Strip { description, .. } => {
-                if description.is_some() {
-                    18
-                } else {
-                    17
-                }
-            }
-        }
-    }
-
-    fn extra_data(&self, start: u64) -> BigExtra {
-        match self {
-            Self::Strip { description, .. } => {
-                let bits = align(start, 2);
-                let desc = if description.is_some() { bits + 6 } else { 0 };
-                let after_desc = bits + 6 + description.as_ref().map_or(0, |v| v.len() + 1) as u64;
-                let xres = align(after_desc, 2);
-                BigExtra {
-                    bits,
-                    desc,
-                    xres,
-                    yres: xres + 8,
-                    sample: xres + 16,
-                    reference_bw: align(xres + 22, 8),
-                    desc_text: description.clone().unwrap_or_default(),
-                }
-            }
-        }
-    }
-
-    fn entries(&self, extra: &BigExtra) -> Vec<BigEntry> {
-        match self {
-            Self::Strip {
-                width,
-                height,
-                offset,
-                count,
-                description,
-                ..
-            } => {
-                let mut entries = vec![
-                    big_long(TAG_IMAGE_WIDTH, *width),
-                    big_long(TAG_IMAGE_LENGTH, *height),
-                    big_short_array(TAG_BITS_PER_SAMPLE, extra.bits),
-                    big_short(TAG_COMPRESSION, 7),
-                    big_short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
-                    big_short(TAG_ORIENTATION, 1),
-                    big_short(TAG_SAMPLES_PER_PIXEL, 3),
-                    big_short(TAG_PLANAR_CONFIGURATION, 1),
-                    big_long(TAG_ROWS_PER_STRIP, *height),
-                    BigEntry {
-                        tag: TAG_STRIP_OFFSETS,
-                        kind: TIFF_TYPE_LONG8,
-                        count: 1,
-                        value: *offset,
-                    },
-                    BigEntry {
-                        tag: TAG_STRIP_BYTE_COUNTS,
-                        kind: TIFF_TYPE_LONG8,
-                        count: 1,
-                        value: *count,
-                    },
-                    big_short(TAG_RESOLUTION_UNIT, 3),
-                    big_rational(TAG_X_RESOLUTION, extra.xres),
-                    big_rational(TAG_Y_RESOLUTION, extra.yres),
-                    big_short_array(TAG_SAMPLE_FORMAT, extra.sample),
-                    big_short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
-                    big_rational_array(TAG_REFERENCE_BLACK_WHITE, extra.reference_bw, 6),
-                ];
-                if description.is_some() {
-                    let value = if extra.desc_text.len() < 8 {
-                        big_ascii_inline(&extra.desc_text)
-                    } else {
-                        extra.desc
-                    };
-                    entries.push(BigEntry {
-                        tag: TAG_IMAGE_DESCRIPTION,
-                        kind: TIFF_TYPE_ASCII,
-                        count: extra.desc_text.len() as u64 + 1,
-                        value,
-                    });
-                }
-                entries.sort_by_key(|entry| entry.tag);
-                entries
-            }
-        }
-    }
-
-    fn write_extra(&self, file: &mut File, extra: &BigExtra) -> Result<()> {
-        match self {
-            Self::Strip {
-                resolution,
-                description,
-                ..
-            } => {
-                pad_to(file, extra.bits)?;
-                file.write_all(&[8, 0, 8, 0, 8, 0])?;
-                if let Some(text) = description {
-                    file.write_all(text.as_bytes())?;
-                    file.write_all(&[0])?;
-                }
-                pad_to(file, extra.xres)?;
-                write_rational(file, *resolution)?;
-                write_rational(file, *resolution)?;
-                file.write_all(&1u16.to_le_bytes())?;
-                file.write_all(&1u16.to_le_bytes())?;
-                file.write_all(&1u16.to_le_bytes())?;
-                let reference_bw = align(file.stream_position()?, 4);
-                pad_to(file, reference_bw)?;
-                write_reference_black_white(file)?;
-                Ok(())
-            }
-        }
-    }
-}
-
-fn big_short(tag: u16, value: u16) -> BigEntry {
-    BigEntry {
-        tag,
-        kind: TIFF_TYPE_SHORT,
-        count: 1,
-        value: value as u64,
-    }
-}
-
-fn big_short_pair(tag: u16, first: u16, second: u16) -> BigEntry {
-    BigEntry {
-        tag,
-        kind: TIFF_TYPE_SHORT,
-        count: 2,
-        value: first as u64 | ((second as u64) << 16),
-    }
-}
-
-fn big_short_array(tag: u16, offset: u64) -> BigEntry {
-    BigEntry {
-        tag,
-        kind: TIFF_TYPE_SHORT,
-        count: 3,
-        value: offset,
-    }
-}
-
-fn big_long(tag: u16, value: u32) -> BigEntry {
-    BigEntry {
-        tag,
-        kind: TIFF_TYPE_LONG,
-        count: 1,
-        value: value as u64,
-    }
-}
-
-fn big_rational(tag: u16, offset: u64) -> BigEntry {
-    BigEntry {
-        tag,
-        kind: TIFF_TYPE_RATIONAL,
-        count: 1,
-        value: offset,
-    }
-}
-
-fn big_rational_array(tag: u16, offset: u64, count: u64) -> BigEntry {
-    BigEntry {
-        tag,
-        kind: TIFF_TYPE_RATIONAL,
-        count,
-        value: offset,
-    }
-}
-
-fn big_undefined(tag: u16, count: usize, offset: u64) -> Result<BigEntry> {
-    Ok(BigEntry {
-        tag,
-        kind: TIFF_TYPE_UNDEFINED,
-        count: u64::try_from(count)?,
-        value: offset,
+        // Cache the abbreviated stream; tables are shared via JPEGTables.
+        let encoded = split_jpeg_tables(&encode_jpeg(image, quality)?)?.1;
+        cache.insert(key, encoded.clone());
+        Ok(encoded)
     })
-}
-
-fn big_ascii_inline(value: &str) -> u64 {
-    let mut bytes = [0u8; 8];
-    let source = value.as_bytes();
-    let length = source.len().min(7);
-    bytes[..length].copy_from_slice(&source[..length]);
-    u64::from_le_bytes(bytes)
 }
 
 enum Page {
@@ -1691,6 +916,7 @@ enum Page {
         description: String,
         reduced: bool,
         resolution: f64,
+        jpeg_tables: Option<Vec<u8>>,
     },
     Strip {
         width: u32,
@@ -1713,7 +939,7 @@ struct Entry {
 impl Page {
     fn entry_count(&self) -> usize {
         match self {
-            Page::Tiled { .. } => 20,
+            Page::Tiled { jpeg_tables, .. } => 20 + usize::from(jpeg_tables.is_some()),
             Page::Strip { description, .. } => {
                 if description.is_some() {
                     18
@@ -1750,6 +976,7 @@ impl Page {
                     yres,
                     sample,
                     reference_bw,
+                    tables: reference_bw + 48,
                     desc_text: description.clone(),
                 }
             }
@@ -1772,6 +999,7 @@ impl Page {
                     yres,
                     sample,
                     reference_bw,
+                    tables: 0,
                     desc_text: description.clone().unwrap_or_default(),
                 }
             }
@@ -1789,29 +1017,42 @@ impl Page {
                 offsets,
                 counts,
                 reduced,
+                jpeg_tables,
                 ..
-            } => vec![
-                long(TAG_NEW_SUBFILE_TYPE, if *reduced { 1 } else { 0 }),
-                long(TAG_IMAGE_WIDTH, *width),
-                long(TAG_IMAGE_LENGTH, *height),
-                short_array_at(TAG_BITS_PER_SAMPLE, extra.bits),
-                short(TAG_COMPRESSION, 7),
-                short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
-                short(TAG_ORIENTATION, 1),
-                short(TAG_SAMPLES_PER_PIXEL, 3),
-                short(TAG_PLANAR_CONFIGURATION, 1),
-                short(TAG_RESOLUTION_UNIT, 3),
-                long_at(TAG_TILE_WIDTH, *tile_width),
-                long_at(TAG_TILE_LENGTH, *tile_height),
-                long_array_at(TAG_TILE_OFFSETS, offsets, extra.tile_offsets)?,
-                long_array_at(TAG_TILE_BYTE_COUNTS, counts, extra.tile_counts)?,
-                rational_at(TAG_X_RESOLUTION, extra.xres),
-                rational_at(TAG_Y_RESOLUTION, extra.yres),
-                short_array_at(TAG_SAMPLE_FORMAT, extra.sample),
-                ascii_at(TAG_IMAGE_DESCRIPTION, extra.desc, extra.desc_text.len() + 1)?,
-                short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
-                rational_array_at(TAG_REFERENCE_BLACK_WHITE, extra.reference_bw, 6)?,
-            ],
+            } => {
+                let mut entries = vec![
+                    long(TAG_NEW_SUBFILE_TYPE, if *reduced { 1 } else { 0 }),
+                    long(TAG_IMAGE_WIDTH, *width),
+                    long(TAG_IMAGE_LENGTH, *height),
+                    short_array_at(TAG_BITS_PER_SAMPLE, extra.bits),
+                    short(TAG_COMPRESSION, 7),
+                    short(TAG_PHOTOMETRIC_INTERPRETATION, 6),
+                    short(TAG_ORIENTATION, 1),
+                    short(TAG_SAMPLES_PER_PIXEL, 3),
+                    short(TAG_PLANAR_CONFIGURATION, 1),
+                    short(TAG_RESOLUTION_UNIT, 3),
+                    long_at(TAG_TILE_WIDTH, *tile_width),
+                    long_at(TAG_TILE_LENGTH, *tile_height),
+                    long_array_at(TAG_TILE_OFFSETS, offsets, extra.tile_offsets)?,
+                    long_array_at(TAG_TILE_BYTE_COUNTS, counts, extra.tile_counts)?,
+                    rational_at(TAG_X_RESOLUTION, extra.xres),
+                    rational_at(TAG_Y_RESOLUTION, extra.yres),
+                    short_array_at(TAG_SAMPLE_FORMAT, extra.sample),
+                    ascii_at(TAG_IMAGE_DESCRIPTION, extra.desc, extra.desc_text.len() + 1)?,
+                    short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
+                    rational_array_at(TAG_REFERENCE_BLACK_WHITE, extra.reference_bw, 6)?,
+                ];
+                if let Some(tables) = jpeg_tables {
+                    entries.push(Entry {
+                        tag: TAG_JPEG_TABLES,
+                        kind: TIFF_TYPE_UNDEFINED,
+                        count: u32::try_from(tables.len()).context("JPEGTables is too large")?,
+                        value: u32::try_from(extra.tables)
+                            .context("TIFF exceeds classic 4 GiB offsets")?,
+                    });
+                }
+                entries
+            }
             Page::Strip {
                 width,
                 height,
@@ -1866,6 +1107,7 @@ impl Page {
                 offsets,
                 counts,
                 description,
+                jpeg_tables,
                 ..
             } => {
                 let tile_offsets = align(bits + 6, 4);
@@ -1896,6 +1138,9 @@ impl Page {
                 let reference_bw = align(file.stream_position()?, 4);
                 pad_to(file, reference_bw)?;
                 write_reference_black_white(file)?;
+                if let Some(tables) = jpeg_tables {
+                    file.write_all(tables)?;
+                }
             }
             Page::Strip { description, .. } => {
                 if let Some(text) = description {
@@ -1931,12 +1176,13 @@ struct Extra {
     yres: u64,
     sample: u64,
     reference_bw: u64,
+    tables: u64,
     desc_text: String,
 }
 
 fn compose_tile(
     slide: &Slide,
-    source: &[u8],
+    source: &SourceMaps,
     level: &Level,
     placement: TilePlacement,
     mut hevc: Option<&mut HevcDecoder>,
@@ -1972,10 +1218,12 @@ fn compose_tile(
             if !range.present() || position.x >= limit_x || position.y >= limit_y {
                 continue;
             }
-            let bytes = mapped_range(source, range)?;
-            let image = decode_tile(slide, bytes, hevc.as_deref_mut())?;
-            let source_width = position.width.min(image.width());
-            let source_height = position.height.min(image.height());
+            let bytes = source.read_tile(level, range)?;
+            let image = decode_tile(slide, bytes.as_ref(), hevc.as_deref_mut())?;
+            let available_width = image.width().saturating_sub(position.src_x);
+            let available_height = image.height().saturating_sub(position.src_y);
+            let source_width = position.width.min(available_width);
+            let source_height = position.height.min(available_height);
             let right = (position.x + source_width).min(limit_x);
             let bottom = (position.y + source_height).min(limit_y);
             let left = origin_x.max(position.x);
@@ -1983,8 +1231,8 @@ fn compose_tile(
             if left >= right || top >= bottom {
                 continue;
             }
-            let src_left = left - position.x;
-            let src_top = top - position.y;
+            let src_left = left - position.x + position.src_x;
+            let src_top = top - position.y + position.src_y;
             for y in 0..(bottom - top) {
                 for x in 0..(right - left) {
                     output.put_pixel(
@@ -2012,13 +1260,15 @@ fn compose_tile(
             if !range.present() {
                 continue;
             }
-            let data = mapped_range(source, range)?;
-            let image = decode_tile(slide, data, hevc.as_deref_mut())?;
+            let data = source.read_tile(level, range)?;
+            let image = decode_tile(slide, data.as_ref(), hevc.as_deref_mut())?;
+            let (pitch_width, pitch_height) =
+                level.stored_tile_pitch(slide.tile_width, slide.tile_height);
             copy_clipped(
                 &mut output,
                 &image,
-                inner_col * slide.tile_width,
-                inner_row * slide.tile_height,
+                inner_col * pitch_width,
+                inner_row * pitch_height,
             );
         }
     }
@@ -2189,14 +1439,6 @@ fn rational_array_at(tag: u16, offset: u64, count: u32) -> Result<Entry> {
         value: u32::try_from(offset).context("TIFF rational array offset overflow")?,
     })
 }
-fn undefined_at(tag: u16, count: usize, offset: u64) -> Result<Entry> {
-    Ok(Entry {
-        tag,
-        kind: TIFF_TYPE_UNDEFINED,
-        count: u32::try_from(count)?,
-        value: u32::try_from(offset).context("TIFF undefined data offset overflow")?,
-    })
-}
 fn array_at(tag: u16, count: usize, offset: u64) -> Result<Entry> {
     Ok(Entry {
         tag,
@@ -2204,13 +1446,6 @@ fn array_at(tag: u16, count: usize, offset: u64) -> Result<Entry> {
         count: u32::try_from(count)?,
         value: u32::try_from(offset).context("TIFF extra data offset overflow")?,
     })
-}
-fn u64_long_array_at(tag: u16, values: &[u64], offset: u64) -> Result<Entry> {
-    if values.len() == 1 {
-        Ok(long(tag, u32::try_from(values[0])?))
-    } else {
-        array_at(tag, values.len(), offset)
-    }
 }
 fn long_array_at(tag: u16, values: &[u32], offset: u64) -> Result<Entry> {
     if values.len() == 1 {
@@ -2294,51 +1529,6 @@ mod tests {
         assert_eq!(&bytes[jpeg..jpeg + 2], &[0xff, 0xd8]);
         Ok(())
     }
-
-    #[test]
-    fn compatible_main_preserves_shared_jpeg_tables() -> Result<()> {
-        let path = temporary_tiff("compatible-jpeg-tables");
-        let mut file = File::create(&path)?;
-        file.write_all(b"II\x2a\x00\x00\x00\x00\x00")?;
-        file.write_all(&[0xff, 0xd8, 0xff, 0xd9])?;
-        let tables = vec![0xff, 0xd8, 0xff, 0xdb, 0x00, 0x04, 0xff, 0xd9];
-        let source = SourcePage {
-            width: 256,
-            height: 256,
-            tile_width: 256,
-            tile_height: 256,
-            bits: [8, 8, 8],
-            compression: 7,
-            photometric: 6,
-            samples: 3,
-            planar: 1,
-            next_ifd: 0,
-            tile_offsets: vec![8],
-            tile_byte_counts: vec![4],
-            jpeg_tables: tables.clone(),
-        };
-        let (ifd, _) = write_compatible_classic_main(
-            &mut file,
-            &source,
-            "Aperio Image Library test",
-            40_000.0,
-        )?;
-        patch_u32_file(&mut file, 4, u32::try_from(ifd)?)?;
-        drop(file);
-
-        let bytes = fs::read(&path)?;
-        fs::remove_file(&path)?;
-        let entries = classic_entries(&bytes);
-        let jpeg_tables = entries[&347];
-        assert_eq!(jpeg_tables.kind, 7);
-        assert_eq!(jpeg_tables.count as usize, tables.len());
-        let offset = jpeg_tables.value as usize;
-        assert_eq!(&bytes[offset..offset + tables.len()], tables);
-        assert_eq!(entries[&530].value, 0x0002_0002);
-        assert_eq!(entries[&532].count, 6);
-        Ok(())
-    }
-
     #[test]
     fn jpeg_sampling_check_accepts_only_420_data() -> Result<()> {
         let encoded = encode_jpeg(&RgbImage::from_pixel(8, 8, Rgb([1, 2, 3])), 75)?;
@@ -2367,6 +1557,7 @@ mod tests {
             description: "test".to_owned(),
             reduced: true,
             resolution: 1.0,
+            jpeg_tables: None,
         })?;
         writer.finish()?;
         drop(writer);
@@ -2423,9 +1614,11 @@ mod tests {
                 tiles: ranges,
                 tile_positions: Vec::new(),
                 tile_groups: Vec::new(),
+                tiling: Default::default(),
             }],
             associated_images: Vec::new(),
             thumbnail: None,
+            sources: Vec::new(),
         };
         let pool = TilePool::with_worker_count(&slide, 4)?;
         let tasks: Vec<_> = (0..4)
@@ -2445,8 +1638,23 @@ mod tests {
         drop(pool);
         fs::remove_file(path)?;
 
+        // Re-encoded tiles come back as abbreviated streams; rejoin them with
+        // the shared tables (as a TIFF reader would via JPEGTables) to decode.
+        let (tables, _) = split_jpeg_tables(&encode_jpeg(
+            &RgbImage::from_pixel(16, 16, Rgb([255, 255, 255])),
+            75,
+        )?)?;
+        let has_dqt = |data: &[u8]| data.windows(2).any(|w| w == [0xff, 0xdb]);
         for (data, expected) in encoded.iter().zip(colors) {
-            let image = decode_rgb(data)?;
+            let full = if has_dqt(data) {
+                data.clone()
+            } else {
+                let mut joined = tables.clone();
+                joined.truncate(joined.len() - 2);
+                joined.extend_from_slice(&data[2..]);
+                joined
+            };
+            let image = decode_rgb(&full)?;
             let pixel = image.get_pixel(8, 8);
             for channel in pixel.0 {
                 assert!((channel as i16 - expected as i16).abs() <= 3);

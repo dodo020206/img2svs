@@ -1629,6 +1629,7 @@ dependencies = [
  "base64",
  "clap",
  "eframe",
+ "flate2",
  "image",
  "jpeg-encoder",
  "libloading",

@@ -7,9 +7,14 @@
     directory shipped inside the PyAV wheel) are placed in
     <repository root>\third_party.
 
+    img2svs-rust decodes every format itself, so it only needs FFmpeg, and only
+    for HEVC-compressed SDPC/DYQX sources.  libvips is still downloaded for the
+    legacy img2svs-python project; pass -SkipLibvips when only the Rust converter
+    is being prepared.
+
     That directory is not tracked by git, so a fresh clone must run this script
-    once before NDPI/MRXS support (libvips) or HEVC-compressed SDPC/DYQX support
-    (FFmpeg) becomes available.
+    once before HEVC-compressed SDPC/DYQX support (FFmpeg) or the Python
+    converter (libvips) becomes available.
 
     Both projects read the runtimes from this single location, so nothing is
     duplicated inside the repository.
@@ -22,11 +27,18 @@
     Directory that receives vips\ and av.libs\. Defaults to third_party\ in the
     repository root.
 
+.PARAMETER SkipLibvips
+    Leave third_party\vips alone. Use this for Rust-only builds, where no
+    OpenSlide/libvips runtime is involved.
+
 .PARAMETER Force
     Re-download and replace runtimes that are already present.
 
 .EXAMPLE
     pwsh -File scripts\fetch_native_runtimes.ps1
+
+.EXAMPLE
+    pwsh -File scripts\fetch_native_runtimes.ps1 -SkipLibvips
 
 .EXAMPLE
     pwsh -File scripts\fetch_native_runtimes.ps1 -Force
@@ -39,6 +51,7 @@ param(
     [string]$Destination,
     [string]$LibvipsVersion = $env:LIBVIPS_VERSION,
     [string]$PyAvVersion = $env:PYAV_VERSION,
+    [switch]$SkipLibvips,
     [switch]$Force
 )
 
@@ -164,7 +177,11 @@ function Install-AvLibsRuntime {
 }
 
 Write-Host "Native runtimes -> $Destination"
-Install-LibvipsRuntime
+if ($SkipLibvips) {
+    Write-Host "[skip] libvips (requested with -SkipLibvips)"
+} else {
+    Install-LibvipsRuntime
+}
 Install-AvLibsRuntime
 
 # Only the installed runtimes are kept; the extracted trees and the wheels
@@ -175,7 +192,7 @@ if (Test-Path -LiteralPath $downloadDirectory) {
 
 Write-Host ""
 Write-Host "Done. Consumers pick these up automatically:"
-Write-Host "  img2svs-rust\build_windows.ps1            copies both next to the executable"
+Write-Host "  img2svs-rust\build_windows.ps1            copies av.libs next to the executable"
 Write-Host "  img2svs-python\build_windows_exe.bat      uses third_party\vips as VIPS_HOME"
-Write-Host "  .github\workflows\build-rust-windows.yml  packages both into the release ZIP"
+Write-Host "  .github\workflows\build-rust-windows.yml  packages av.libs into the release ZIP"
 Write-Host "Point elsewhere with -Destination, VIPS_HOME or FFMPEG_HOME."

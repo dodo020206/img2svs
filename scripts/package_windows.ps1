@@ -7,22 +7,18 @@
     `--no-default-features`, which drops the optional `gui` feature (egui/rfd)
     and keeps the console subsystem so command-line output stays visible.
 
-    Each package contains the executable, the README and the two native
-    runtimes, so it can be copied to a machine without Rust or Python:
+    Every input format is decoded by this repository, so the only native runtime
+    a package needs is FFmpeg, and only for HEVC-compressed SDPC/DYQX sources:
 
-      dist\PathologySVSConverter-rust-gui\   img2svs-rust.exe + vips\ + av.libs\
-      dist\PathologySVSConverter-rust-cli\   img2svs-cli.exe  + vips\ + av.libs\
+      dist\PathologySVSConverter-rust-gui\   img2svs-rust.exe + av.libs\
+      dist\PathologySVSConverter-rust-cli\   img2svs-cli.exe  + av.libs\
 
     Both directories are zipped and accompanied by a SHA256 checksum.
 
     Runtime lookup order, first match wins:
-      1. -VipsHome / -FfmpegHome
-      2. VIPS_HOME / FFMPEG_HOME environment variable
-      3. <repository root>\third_party\vips and \third_party\av.libs
-      4. %USERPROFILE%\vips
-
-.PARAMETER VipsHome
-    libvips root that contains bin\, lib\ and share\.
+      1. -FfmpegHome
+      2. FFMPEG_HOME environment variable
+      3. <repository root>\third_party\av.libs
 
 .PARAMETER FfmpegHome
     Directory that contains the FFmpeg DLLs (av.libs).
@@ -35,11 +31,10 @@
     pwsh -File scripts\package_windows.ps1
 
 .EXAMPLE
-    pwsh -File scripts\package_windows.ps1 -VipsHome D:\vips -FfmpegHome D:\av.libs
+    pwsh -File scripts\package_windows.ps1 -FfmpegHome D:\av.libs
 #>
 [CmdletBinding()]
 param(
-    [string]$VipsHome,
     [string]$FfmpegHome,
     [string]$OutputDirectory
 )
@@ -78,20 +73,9 @@ function Resolve-Runtime {
     return $null
 }
 
-$vips = Resolve-Runtime -Explicit $VipsHome -EnvironmentVariable "VIPS_HOME" `
-    -SharedCandidates @(
-        (Join-Path $repositoryRoot "third_party\vips"),
-        (Join-Path $env:USERPROFILE "vips")
-    ) -Name "libvips runtime"
-
 $ffmpeg = Resolve-Runtime -Explicit $FfmpegHome -EnvironmentVariable "FFMPEG_HOME" `
     -SharedCandidates @((Join-Path $repositoryRoot "third_party\av.libs")) -Name "FFmpeg runtime"
 
-if (-not $vips) {
-    Write-Warning "libvips runtime not found; NDPI/MRXS/TIFF will be unavailable in the packages."
-} else {
-    Write-Host "[ok  ] libvips       -> $vips"
-}
 if (-not $ffmpeg) {
     Write-Warning "FFmpeg runtime not found; HEVC SDPC/DYQX will be unavailable in the packages."
 } else {
@@ -127,9 +111,6 @@ try {
             -Destination (Join-Path $packageRoot $variant.Executable) -Force
         Copy-Item -LiteralPath "README.md" -Destination $packageRoot -Force
 
-        if ($vips) {
-            Copy-Item -LiteralPath $vips -Destination (Join-Path $packageRoot "vips") -Recurse -Force
-        }
         if ($ffmpeg) {
             Copy-Item -LiteralPath $ffmpeg -Destination (Join-Path $packageRoot "av.libs") -Recurse -Force
         }

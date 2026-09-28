@@ -155,6 +155,7 @@ fn parse_csp(path: &Path) -> Result<Slide> {
         levels,
         associated_images: associated,
         thumbnail: None,
+        sources: Vec::new(),
     })
 }
 
@@ -216,6 +217,7 @@ fn build_csp_levels(tail: &[u8], stream_start: u64, file_size: u64) -> Result<Ve
             tiles: level.tiles,
             tile_positions: Vec::new(),
             tile_groups: Vec::new(),
+            tiling: Default::default(),
         });
     }
     Ok(levels)
@@ -329,6 +331,7 @@ fn parse_csp_associated(
         .map(|(index, (_, _, data))| AssociatedImage {
             kind: if index == 0 { "label" } else { "macro" }.to_owned(),
             data,
+            ..Default::default()
         })
         .collect())
 }
@@ -428,6 +431,7 @@ fn parse_kfb(path: &Path) -> Result<Slide> {
         levels,
         associated_images: associated,
         thumbnail,
+        sources: Vec::new(),
     })
 }
 
@@ -500,6 +504,7 @@ fn build_kfb_levels(header: &KfbHeader) -> Vec<Level> {
                 tiles: Vec::new(),
                 tile_positions: Vec::new(),
                 tile_groups: Vec::new(),
+                tiling: Default::default(),
             }
         })
         .collect()
@@ -558,6 +563,8 @@ fn read_kfb_tiles(
             y: y as u32,
             width: width as u32,
             height: height as u32,
+            src_x: 0,
+            src_y: 0,
         });
     }
     Ok(())
@@ -615,6 +622,7 @@ fn read_kfb_image(
     Ok(AssociatedImage {
         kind: kind.to_owned(),
         data: image.data,
+        ..Default::default()
     })
 }
 
@@ -625,6 +633,7 @@ fn read_kfb_thumbnail(reader: &mut Reader, offset: u64, file_size: u64) -> Resul
         width: image.width,
         height: image.height,
         data: image.data,
+        ..Default::default()
     })
 }
 
@@ -693,6 +702,7 @@ fn parse_mdsx(path: &Path) -> Result<Slide> {
         .map(|(kind, data)| AssociatedImage {
             kind: kind.to_owned(),
             data,
+            ..Default::default()
         })
         .collect();
     Ok(Slide {
@@ -710,6 +720,7 @@ fn parse_mdsx(path: &Path) -> Result<Slide> {
         levels,
         associated_images,
         thumbnail: None,
+        sources: Vec::new(),
     })
 }
 
@@ -778,6 +789,7 @@ fn read_mdsx_levels(reader: &mut Reader, matrix: &Matrix) -> Result<Vec<Level>> 
             tiles,
             tile_positions: Vec::new(),
             tile_groups: Vec::new(),
+            tiling: Default::default(),
         });
     }
     Ok(levels)

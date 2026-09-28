@@ -23,6 +23,7 @@ libloading = "0.8"
 memmap2 = "0.9"
 zune-core = "0.5.3"
 zune-jpeg = "0.5.15"
+flate2 = "1"
 
 [profile.release]
 lto = false

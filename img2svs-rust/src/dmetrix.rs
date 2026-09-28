@@ -119,6 +119,7 @@ pub fn parse(path: &Path) -> Result<Slide> {
         levels,
         associated_images: associated,
         thumbnail: None,
+        sources: Vec::new(),
     })
 }
 
@@ -180,6 +181,7 @@ fn build_levels(
             tiles: tiles.clone(),
             tile_positions: Vec::new(),
             tile_groups: Vec::new(),
+            tiling: Default::default(),
         });
     }
     Ok(levels)
@@ -250,6 +252,7 @@ fn read_associated(
             data.map(|data| AssociatedImage {
                 kind: kind.to_owned(),
                 data,
+                ..Default::default()
             })
         })
         .collect())

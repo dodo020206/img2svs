@@ -5,18 +5,22 @@
 
 ## 支持的输入格式
 
-| 格式 | 后端 | 备注 |
-| --- | --- | --- |
-| `.dmetrix` | 原生 | JPEG 瓦片、金字塔层级、标签/宏观图像 |
-| `.csp` | 原生 | 索引式 JPEG 瓦片 |
-| `.kfb` | 原生 | KFBio 索引式 JPEG 瓦片、稀疏瓦片布局 |
-| `.mdsx` / `.msdx` / `.mdss` | 原生 | BKIO 容器，三种扩展名共用同一字节布局 |
-| `.sdpc` / `.dyqx` | 原生 | JPEG / HEVC 压缩；HEVC 需要 FFmpeg 运行库 |
-| `.ndpi` / `.mrxs` | OpenSlide/libvips | 流式加载，不物化整图；需要 libvips 运行库 |
-| `.tif` / `.tiff` | libvips | 瓦片式或扫描线式 TIFF，保留分辨率与物镜倍率元数据 |
+所有格式都由本仓库自己解析，不存在 OpenSlide/libvips 依赖。
 
-输出统一为金字塔 JPEG SVS（尽可能经典 TIFF，必要时 BigTIFF），
-含 Aperio 描述页与缩略图页。
+| 格式 | 备注 |
+| --- | --- |
+| `.dmetrix` | JPEG 瓦片、金字塔层级、标签/宏观图像 |
+| `.csp` | 索引式 JPEG 瓦片 |
+| `.kfb` | KFBio 索引式 JPEG 瓦片、稀疏瓦片布局 |
+| `.mdsx` / `.msdx` / `.mdss` | BKIO 容器，三种扩展名共用同一字节布局 |
+| `.sdpc` / `.dyqx` | JPEG / HEVC 压缩；HEVC 需要 FFmpeg 运行库 |
+| `.ndpi` | Hamamatsu 容器：层级为「整条 baseline JPEG 切成的重启区间」，每个区间即一个瓦片 |
+| `.mrxs` | 3DHISTECH Pannoramic：`Index.dat` 页链 + `Data*.dat` 原始 JPEG 字节流 |
+| `.tif` / `.tiff` | 瓦片式或扫描线式 TIFF，保留分辨率与物镜倍率元数据 |
+
+输出统一为金字塔 JPEG SVS（经典 TIFF，含 Aperio 描述页与缩略图页）。
+经典 TIFF 的偏移是 32 位，因此单个输出超过 4 GiB 时会直接报错，
+而不是写出损坏的文件。
 
 ## 仓库结构
 
@@ -24,14 +28,14 @@
 | --- | --- |
 | `img2svs-rust\` | 原生 Rust 实现（GUI + CLI），当前主力，持续开发 |
 | `img2svs-python\` | 早期 Python 实现，保留作为参考基线，不再更新 |
-| `scripts\` | 共用脚本：运行库下载、Windows 打包 |
-| `third_party\` | 共用的原生运行库（vips、av.libs），不入版本库 |
+| `scripts\` | 共用脚本：运行库下载、Windows 打包、冒烟样本生成 |
+| `third_party\` | 共用的原生运行库（av.libs），不入版本库 |
 
 两套实现互不引用源码，只共用 `third_party\` 下的原生运行库。
 
 ## 首次准备
 
-克隆之后运行一次获取脚本，`libvips` 与 `FFmpeg`（PyAV）会被下载到 `third_party\`：
+克隆之后运行一次获取脚本：
 
 ```powershell
 pwsh -File scripts\fetch_native_runtimes.ps1
@@ -39,8 +43,14 @@ pwsh -File scripts\fetch_native_runtimes.ps1
 
 `third_party\` 不入版本库。缺了它也能构建，只是这些能力不可用：
 
-- 需要 libvips：`.ndpi` / `.mrxs` / `.tif` 输入
 - 需要 FFmpeg：HEVC 压缩的 `.sdpc` / `.dyqx` 输入
+- 需要 libvips：只有 `img2svs-python` 基线用得到，Rust 实现不需要
+
+因此只做 Rust 开发时可以跳过 libvips 下载：
+
+```powershell
+pwsh -File scripts\fetch_native_runtimes.ps1 -SkipLibvips
+```
 
 ## 构建与打包（Rust，Windows）
 
@@ -58,7 +68,7 @@ cargo build --release --no-default-features  # CLI 版：纯控制台，体积�
 
 `--version` 输出带 `(gui)` / `(cli)` 后缀以区分变体。
 
-一键构建两个变体并打便携包（含 README、vips、av.libs，各附 ZIP + SHA256）：
+一键构建两个变体并打便携包（含 README、av.libs，各附 ZIP + SHA256）：
 
 ```powershell
 pwsh -File scripts\package_windows.ps1
@@ -78,15 +88,14 @@ GUI 特性：多文件选择、递归文件夹扫描、拖放、JPEG 质量、�
 
 ## 运行库解析顺序
 
-构建时按以下顺序查找，先命中先用：
+构建时按以下顺序查找 FFmpeg，先命中先用：
 
-1. 构建脚本参数：`-VipsHome` / `-FfmpegHome`
-2. 环境变量：`VIPS_HOME` / `FFMPEG_HOME`
-3. 仓库共享目录：`third_party\vips`、`third_party\av.libs`
-4. `%USERPROFILE%\vips`（仅 Rust 构建脚本）
+1. 构建脚本参数：`-FfmpegHome`
+2. 环境变量：`FFMPEG_HOME`
+3. 仓库共享目录：`third_party\av.libs`
 
-运行时（非构建时）由可执行文件自行发现：设置 `VIPS_HOME` / `FFMPEG_HOME`，
-或把 `vips` 与 `av.libs` 放在可执行文件旁边。不依赖开发机器路径。
+运行时（非构建时）由可执行文件自行发现：设置 `FFMPEG_HOME`，
+或把 `av.libs` 放在可执行文件旁边。不依赖开发机器路径。
 
 ## 性能要点
 
@@ -97,7 +106,8 @@ GUI 特性：多文件选择、递归文件夹扫描、拖放、JPEG 质量、�
 
 ## Python 基线
 
-`img2svs-python\` 不再更新，仅作对照。打包 EXE（需 Python 3.11）：
+`img2svs-python\` 不再更新，仅作对照。它仍然依赖 libvips，
+打包 EXE（需 Python 3.11）：
 
 ```bat
 cd img2svs-python
@@ -108,7 +118,8 @@ build_windows_exe.bat
 
 ## CI 与发布
 
-`.github\workflows\build-rust-windows.yml` 只构建 Rust：调用同一个
-`scripts\fetch_native_runtimes.ps1` 组装运行库，执行 GUI 与 TIFF 转 SVS
-冒烟测试，产出便携 ZIP 与 SHA256 校验和并上传为 Actions 产物。
+`.github\workflows\build-rust-windows.yml` 只构建 Rust：调用
+`scripts\fetch_native_runtimes.ps1 -SkipLibvips` 只组装 FFmpeg 运行库，
+用 `scripts\make_smoke_tiff.py` 现场生成 TIFF 样本后执行
+TIFF 转 SVS 冒烟测试，产出便携 ZIP 与 SHA256 校验和并上传为 Actions 产物。
 推送 `v*` 标签时额外创建 GitHub Release。

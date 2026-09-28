@@ -13,10 +13,12 @@ mod hevc;
 mod indexed;
 mod jpeg;
 mod model;
+mod mrxs;
+mod ndpi;
 mod report;
 mod sdpc;
 mod svs;
-mod vips;
+mod tiff;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -26,11 +28,11 @@ use std::time::Instant;
 /// Accepted input formats, shared by both build variants.
 #[cfg(feature = "gui")]
 const INPUT_HELP: &str =
-    "Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.tif/.tiff/.sdpc/.dyqx file. \
+    "Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.sdpc/.dyqx/.svs/.tif/.tiff file. \
      Omit it to launch the GUI.";
 #[cfg(not(feature = "gui"))]
 const INPUT_HELP: &str =
-    "Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.tif/.tiff/.sdpc/.dyqx file.";
+    "Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.sdpc/.dyqx/.svs/.tif/.tiff file.";
 
 /// Names the build variant so the two distributed executables can be told apart.
 #[cfg(feature = "gui")]
@@ -99,19 +101,9 @@ fn run() -> Result<()> {
         "dmetrix" => dmetrix::parse(&input)?,
         "sdpc" | "dyqx" => sdpc::parse(&input)?,
         "csp" | "kfb" | "mdss" | "mdsx" | "msdx" => indexed::parse(&input)?,
-        "ndpi" | "mrxs" | "tif" | "tiff" => {
-            let output = args
-                .output
-                .clone()
-                .unwrap_or_else(|| with_extension(&input, "svs"));
-            let quality = validate_quality(args.jpeg_quality.unwrap_or(75))?;
-            if args.info {
-                return vips::print_info(&input);
-            }
-            vips::convert(&input, &output, quality, args.overwrite)?;
-            println!("Output: {}", output.display());
-            return Ok(());
-        }
+        "mrxs" => mrxs::parse(&input)?,
+        "tif" | "tiff" | "svs" => tiff::parse(&input)?,
+        "ndpi" => ndpi::parse(&input)?,
         other => bail!("unsupported input extension .{other}"),
     };
     report::print_slide(&slide);

@@ -29,7 +29,6 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     env:
-      LIBVIPS_VERSION: "8.18.1"
       PYAV_VERSION: "18.1.0"
 
     steps:
@@ -40,6 +39,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install fixture dependency
+        # scripts/make_smoke_tiff.py builds the smoke fixture with Pillow, so the
+        # smoke test needs no external imaging tool.
+        run: python -m pip install --disable-pip-version-check pillow
 
       - name: Check formatting
         working-directory: img2svs-rust
@@ -65,16 +74,19 @@ jobs:
           Copy-Item -LiteralPath "img2svs-rust\README.md" -Destination $packageRoot
 
           # Same acquisition path the local developer workflow uses, so the
-          # runtime versions and layout stay in one place.
-          # LIBVIPS_VERSION / PYAV_VERSION come from the job environment.
-          & "scripts\fetch_native_runtimes.ps1" -Destination $runtimeRoot
+          # runtime versions and layout stay in one place. Every input format is
+          # decoded by this repository, so only FFmpeg is needed.
+          # PYAV_VERSION comes from the job environment.
+          & "scripts\fetch_native_runtimes.ps1" -Destination $runtimeRoot -SkipLibvips
 
-          foreach ($runtime in @("vips", "av.libs")) {
-            $source = Join-Path $runtimeRoot $runtime
-            if (-not (Test-Path -LiteralPath $source)) {
-              throw "The runtime acquisition script did not produce: $source"
-            }
-            Copy-Item -LiteralPath $source -Destination (Join-Path $packageRoot $runtime) -Recurse
+          $runtime = Join-Path $runtimeRoot "av.libs"
+          if (-not (Test-Path -LiteralPath $runtime)) {
+            throw "The runtime acquisition script did not produce: $runtime"
+          }
+          Copy-Item -LiteralPath $runtime -Destination (Join-Path $packageRoot "av.libs") -Recurse
+
+          if (Test-Path -LiteralPath (Join-Path $packageRoot "vips")) {
+            throw "The package still bundles a libvips runtime"
           }
 
       - name: Smoke-test portable package
@@ -85,29 +97,83 @@ jobs:
           $executable = Join-Path $packageRoot "img2svs-rust.exe"
           # GitHub-hosted Windows runners do not provide an interactive desktop,
           # so validate process startup through clap before exercising the real
-          # packaged TIFF conversion below.
+          # packaged conversion below.
           $smoke = Start-Process -FilePath $executable -ArgumentList "--version" -Wait -PassThru
           if ($smoke.ExitCode -ne 0) {
             throw "Packaged executable startup failed with exit code $($smoke.ExitCode)"
           }
 
+          # Fixture and verification both come from this repository, so the smoke
+          # test no longer depends on an OpenSlide/libvips runtime.
           $smokeTiff = Join-Path $env:RUNNER_TEMP "img2svs-smoke.tif"
           $smokeSvs = Join-Path $env:RUNNER_TEMP "img2svs-smoke.svs"
-          $vips = Join-Path $packageRoot "vips\bin\vips.exe"
-          $vipsHeader = Join-Path $packageRoot "vips\bin\vipsheader.exe"
-          & $vips black $smokeTiff 512 384 --bands 3
+          & python "scripts\make_smoke_tiff.py" $smokeTiff 512 384
           if ($LASTEXITCODE -ne 0) {
             throw "Could not create the TIFF smoke fixture"
           }
+
           $convert = Start-Process -FilePath $executable -ArgumentList @($smokeTiff, "-o", $smokeSvs, "--overwrite") -Wait -PassThru
           if ($convert.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $smokeSvs)) {
             throw "TIFF-to-SVS smoke conversion failed"
           }
-          $levels = & $vipsHeader -f "openslide.level-count" $smokeSvs
-          if ($LASTEXITCODE -ne 0 -or [int]$levels -lt 1) {
-            throw "Generated SVS did not pass the OpenSlide/libvips metadata check"
+
+          # Two independent checks. The first reads the file back with the
+          # converter's own reader; the second parses the TIFF tags directly so
+          # a systematic writer mistake cannot hide behind a matching reader.
+          $info = (& $executable $smokeSvs "--info" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Reading the converted SVS failed:`n$info"
           }
-          Write-Host "TIFF-to-SVS smoke test passed with $levels pyramid levels"
+          foreach ($expected in @(
+              "Image : 512x384, tile=256x256",
+              "L0=512x384 (2x2 tiles)"
+            )) {
+            if ($info -notmatch [regex]::Escape($expected)) {
+              throw "Converted SVS does not report '$expected':`n$info"
+            }
+          }
+
+          $bytes = [System.IO.File]::ReadAllBytes($smokeSvs)
+          if ($bytes[0] -ne 0x49 -or $bytes[1] -ne 0x49 -or [BitConverter]::ToUInt16($bytes, 2) -ne 42) {
+            throw "The generated SVS is not a little-endian classic TIFF"
+          }
+          $ifd = [BitConverter]::ToUInt32($bytes, 4)
+          $entryCount = [BitConverter]::ToUInt16($bytes, $ifd)
+          # Keys are cast to Int32: a hashtable keyed by UInt16 does not match an
+          # Int32 index, and the lookups below would silently return nothing.
+          $tags = @{}
+          for ($index = 0; $index -lt $entryCount; $index++) {
+            $at = $ifd + 2 + $index * 12
+            $tag = [int][BitConverter]::ToUInt16($bytes, $at)
+            $kind = [BitConverter]::ToUInt16($bytes, $at + 2)
+            $count = [BitConverter]::ToUInt32($bytes, $at + 4)
+            $value = [BitConverter]::ToUInt32($bytes, $at + 8)
+            if ($kind -eq 3 -and $count -eq 1) { $value = $value -band 0xffff }
+            $tags[$tag] = @{ Count = $count; Value = $value }
+          }
+          $expectations = @(
+            @{ Tag = 256; Field = "Value"; Expected = 512; Name = "ImageWidth" },
+            @{ Tag = 257; Field = "Value"; Expected = 384; Name = "ImageLength" },
+            @{ Tag = 259; Field = "Value"; Expected = 7; Name = "Compression" },
+            @{ Tag = 322; Field = "Value"; Expected = 256; Name = "TileWidth" },
+            @{ Tag = 323; Field = "Value"; Expected = 256; Name = "TileLength" },
+            @{ Tag = 324; Field = "Count"; Expected = 4; Name = "TileOffsets" }
+          )
+          foreach ($check in $expectations) {
+            if (-not $tags.ContainsKey([int]$check.Tag)) {
+              throw "Tag $($check.Tag) ($($check.Name)) is missing from the generated SVS"
+            }
+            $actual = $tags[[int]$check.Tag][$check.Field]
+            if ($actual -ne $check.Expected) {
+              throw "Tag $($check.Name) is $actual, expected $($check.Expected)"
+            }
+          }
+          $description = [System.Text.Encoding]::ASCII.GetString($bytes, $tags[270].Value, 11)
+          if ($description -ne "Aperio Imag") {
+            throw "ImageDescription does not start with the Aperio header: '$description'"
+          }
+          Write-Host "TIFF-to-SVS smoke test passed: 512x384, 2x2 tiles of 256, Aperio header present"
+          Write-Host $info
 
       - name: Create ZIP and checksum
         shell: pwsh

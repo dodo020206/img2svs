@@ -98,6 +98,7 @@ pub fn parse(path: &Path) -> Result<Slide> {
         levels,
         associated_images: macrographs.images,
         thumbnail: Some(thumbnail),
+        sources: Vec::new(),
     })
 }
 
@@ -158,6 +159,7 @@ fn read_macrographs(reader: &mut Reader, count: u32, start: u64) -> Result<Macro
             }
             .to_owned(),
             data,
+            ..Default::default()
         });
         current = next;
     }
@@ -179,6 +181,7 @@ fn thumbnail_from(head: &PicHead, info: &PicInfo, block_offset: u64) -> Result<T
             offset: block_offset + u64::from(info.info_size),
             length: info.layer_size,
         },
+        ..Default::default()
     })
 }
 
@@ -207,6 +210,7 @@ fn read_levels(reader: &mut Reader, head: &PicHead, start: u64) -> Result<Vec<Le
             tiles,
             tile_positions: Vec::new(),
             tile_groups: Vec::new(),
+            tiling: Default::default(),
         });
         current = info.next_layer_offset;
     }
