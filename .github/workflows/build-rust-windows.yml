@@ -58,6 +58,17 @@ jobs:
         working-directory: img2svs-rust
         run: cargo test --locked
 
+      - name: Check the console (CLI) variant
+        # The packages ship two variants built from one source. The console one
+        # drops the `gui` feature, which leaves a different set of items unused,
+        # so it has to be compiled on its own or its warnings go unnoticed.
+        # `cargo check` writes to target\debug, so the release executable built
+        # below - which is the one that gets packaged - is left alone.
+        working-directory: img2svs-rust
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --locked --all-targets --no-default-features
+
       - name: Build release executable
         working-directory: img2svs-rust
         run: cargo build --release --locked

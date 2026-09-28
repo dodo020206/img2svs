@@ -1674,7 +1674,7 @@ fn is_supported(path: &Path) -> bool {
         .is_some_and(|value| {
             SUPPORTED_FORMATS
                 .iter()
-                .any(|(extension, _)| value.eq_ignore_ascii_case(extension))
+                .any(|format| value.eq_ignore_ascii_case(format.extension))
         })
 }
 
