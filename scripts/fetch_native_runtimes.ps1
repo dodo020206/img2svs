@@ -1,22 +1,23 @@
 <#
 .SYNOPSIS
-    Download the native runtimes used by the img2svs-python baseline.
+    Download the native runtimes shared by img2svs-rust and img2svs-python.
 
 .DESCRIPTION
     libvips (with its OpenSlide module) and the FFmpeg runtime (the av.libs
     directory shipped inside the PyAV wheel) are placed in
     <repository root>\third_party.
 
-    Only the legacy img2svs-python project needs them.  img2svs-rust decodes
-    every format itself - HEVC-compressed SDPC/DYQX sources included - and has
-    no native runtime dependency at all, so a Rust-only checkout can skip this
-    script entirely.
+    img2svs-rust decodes every format itself, so it only needs FFmpeg, and only
+    for HEVC-compressed SDPC/DYQX sources.  libvips is still downloaded for the
+    legacy img2svs-python project; pass -SkipLibvips when only the Rust converter
+    is being prepared.
 
-    That directory is not tracked by git, so the Python converter needs this
-    script to run once before its runtimes become available.
+    That directory is not tracked by git, so a fresh clone must run this script
+    once before HEVC-compressed SDPC/DYQX support (FFmpeg) or the Python
+    converter (libvips) becomes available.
 
-    Both runtimes live in this single location, so nothing is duplicated inside
-    the repository.
+    Both projects read the runtimes from this single location, so nothing is
+    duplicated inside the repository.
 
     The script is idempotent: an already installed runtime is skipped unless
     -Force is given. Versions default to LIBVIPS_VERSION / PYAV_VERSION and fall
@@ -27,7 +28,8 @@
     repository root.
 
 .PARAMETER SkipLibvips
-    Leave third_party\vips alone when only the FFmpeg runtime is wanted.
+    Leave third_party\vips alone. Use this for Rust-only builds, where no
+    OpenSlide/libvips runtime is involved.
 
 .PARAMETER Force
     Re-download and replace runtimes that are already present.

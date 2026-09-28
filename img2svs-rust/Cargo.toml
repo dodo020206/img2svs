@@ -19,7 +19,7 @@ eframe = { version = "0.32", default-features = true, optional = true }
 rfd = { version = "0.15", optional = true }
 base64 = "0.22"
 quick-xml = "0.38"
-rusty_h265 = "0.6"
+libloading = "0.8"
 memmap2 = "0.9"
 zune-core = "0.5.3"
 zune-jpeg = "0.5.15"

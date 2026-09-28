@@ -28,6 +28,8 @@ jobs:
   build-windows:
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      PYAV_VERSION: "18.1.0"
 
     steps:
       - name: Check out source
@@ -60,22 +62,31 @@ jobs:
         working-directory: img2svs-rust
         run: cargo build --release --locked
 
-      - name: Assemble portable package
+      - name: Assemble portable runtime
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $packageRoot = Join-Path $env:GITHUB_WORKSPACE "dist\PathologySVSConverter-rust"
+          $runtimeRoot = Join-Path $env:RUNNER_TEMP "img2svs-runtimes"
           New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 
-          # Every input format, HEVC-compressed sources included, is decoded by
-          # this repository, so the package is the executable plus its README and
-          # no native runtime has to be fetched or shipped.
           Copy-Item -LiteralPath "img2svs-rust\target\release\img2svs-rust.exe" -Destination $packageRoot
           Copy-Item -LiteralPath "img2svs-rust\README.md" -Destination $packageRoot
 
-          $unexpected = Get-ChildItem -LiteralPath $packageRoot -Directory
-          if ($unexpected) {
-            throw "The package contains unexpected directories: $($unexpected.Name -join ', ')"
+          # Same acquisition path the local developer workflow uses, so the
+          # runtime versions and layout stay in one place. Every input format is
+          # decoded by this repository, so only FFmpeg is needed.
+          # PYAV_VERSION comes from the job environment.
+          & "scripts\fetch_native_runtimes.ps1" -Destination $runtimeRoot -SkipLibvips
+
+          $runtime = Join-Path $runtimeRoot "av.libs"
+          if (-not (Test-Path -LiteralPath $runtime)) {
+            throw "The runtime acquisition script did not produce: $runtime"
+          }
+          Copy-Item -LiteralPath $runtime -Destination (Join-Path $packageRoot "av.libs") -Recurse
+
+          if (Test-Path -LiteralPath (Join-Path $packageRoot "vips")) {
+            throw "The package still bundles a libvips runtime"
           }
 
       - name: Smoke-test portable package
@@ -93,7 +104,7 @@ jobs:
           }
 
           # Fixture and verification both come from this repository, so the smoke
-          # test needs no imaging tool beyond Pillow.
+          # test no longer depends on an OpenSlide/libvips runtime.
           $smokeTiff = Join-Path $env:RUNNER_TEMP "img2svs-smoke.tif"
           $smokeSvs = Join-Path $env:RUNNER_TEMP "img2svs-smoke.svs"
           & python "scripts\make_smoke_tiff.py" $smokeTiff 512 384

@@ -7,13 +7,21 @@
     `--no-default-features`, which drops the optional `gui` feature (egui/rfd)
     and keeps the console subsystem so command-line output stays visible.
 
-    Every input format, including HEVC-compressed SDPC/DYQX, is decoded by this
-    repository, so a package is just the executable plus its README:
+    Every input format is decoded by this repository, so the only native runtime
+    a package needs is FFmpeg, and only for HEVC-compressed SDPC/DYQX sources:
 
-      dist\PathologySVSConverter-rust-gui\   img2svs-rust.exe
-      dist\PathologySVSConverter-rust-cli\   img2svs-cli.exe
+      dist\PathologySVSConverter-rust-gui\   img2svs-rust.exe + av.libs\
+      dist\PathologySVSConverter-rust-cli\   img2svs-cli.exe  + av.libs\
 
     Both directories are zipped and accompanied by a SHA256 checksum.
+
+    Runtime lookup order, first match wins:
+      1. -FfmpegHome
+      2. FFMPEG_HOME environment variable
+      3. <repository root>\third_party\av.libs
+
+.PARAMETER FfmpegHome
+    Directory that contains the FFmpeg DLLs (av.libs).
 
 .PARAMETER OutputDirectory
     Directory that receives the two package folders and the ZIPs.
@@ -21,9 +29,13 @@
 
 .EXAMPLE
     pwsh -File scripts\package_windows.ps1
+
+.EXAMPLE
+    pwsh -File scripts\package_windows.ps1 -FfmpegHome D:\av.libs
 #>
 [CmdletBinding()]
 param(
+    [string]$FfmpegHome,
     [string]$OutputDirectory
 )
 
@@ -33,6 +45,42 @@ $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repositoryRoot = Split-Path -Parent $scriptDirectory
 $rustRoot = Join-Path $repositoryRoot "img2svs-rust"
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repositoryRoot "dist" }
+
+function Resolve-Runtime {
+    param(
+        [string]$Explicit,
+        [string]$EnvironmentVariable,
+        [string[]]$SharedCandidates,
+        [string]$Name
+    )
+
+    if ($Explicit) {
+        if (-not (Test-Path -LiteralPath $Explicit)) { throw "$Name not found: $Explicit" }
+        return (Resolve-Path -LiteralPath $Explicit).Path
+    }
+    if ($EnvironmentVariable) {
+        $fromEnvironment = [Environment]::GetEnvironmentVariable($EnvironmentVariable)
+        if ($fromEnvironment) {
+            if (-not (Test-Path -LiteralPath $fromEnvironment)) {
+                throw "$EnvironmentVariable points at a missing directory: $fromEnvironment"
+            }
+            return (Resolve-Path -LiteralPath $fromEnvironment).Path
+        }
+    }
+    foreach ($candidate in $SharedCandidates) {
+        if (Test-Path -LiteralPath $candidate) { return (Resolve-Path -LiteralPath $candidate).Path }
+    }
+    return $null
+}
+
+$ffmpeg = Resolve-Runtime -Explicit $FfmpegHome -EnvironmentVariable "FFMPEG_HOME" `
+    -SharedCandidates @((Join-Path $repositoryRoot "third_party\av.libs")) -Name "FFmpeg runtime"
+
+if (-not $ffmpeg) {
+    Write-Warning "FFmpeg runtime not found; HEVC SDPC/DYQX will be unavailable in the packages."
+} else {
+    Write-Host "[ok  ] FFmpeg        -> $ffmpeg"
+}
 
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
@@ -62,6 +110,10 @@ try {
         Copy-Item -LiteralPath "target\release\img2svs-rust.exe" `
             -Destination (Join-Path $packageRoot $variant.Executable) -Force
         Copy-Item -LiteralPath "README.md" -Destination $packageRoot -Force
+
+        if ($ffmpeg) {
+            Copy-Item -LiteralPath $ffmpeg -Destination (Join-Path $packageRoot "av.libs") -Recurse -Force
+        }
 
         $executablePath = Join-Path $packageRoot $variant.Executable
         $reported = (& $executablePath --version 2>&1 | Out-String).Trim()
