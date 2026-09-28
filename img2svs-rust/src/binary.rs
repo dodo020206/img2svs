@@ -5,12 +5,50 @@
 //! read takes a short `context` label that ends up in the error message, which
 //! is what makes a truncated or corrupt container diagnosable.
 
+use crate::model::ByteRange;
 use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
 /// Size of the read-ahead buffer kept in front of the file handle.
 const READ_BUFFER_SIZE: usize = 256 * 1024;
+
+/// A scalar that can be read from a fixed-width little-endian slice.
+///
+/// Implemented by the integer widths the container indexes use, so a reader
+/// can ask for `le_at::<u32>` without spelling out the width.
+pub trait LittleEndian: Sized {
+    /// Width in bytes.
+    const WIDTH: usize;
+    /// Decodes `slice`, which is guaranteed to be exactly [`Self::WIDTH`] long.
+    fn from_le_bytes(slice: &[u8]) -> Self;
+}
+
+macro_rules! impl_little_endian {
+    ($($type:ty),* $(,)?) => {
+        $(impl LittleEndian for $type {
+            const WIDTH: usize = std::mem::size_of::<$type>();
+            fn from_le_bytes(slice: &[u8]) -> Self {
+                let bytes: [u8; std::mem::size_of::<$type>()] =
+                    slice.try_into().expect("slice length is checked by le_at");
+                <$type>::from_le_bytes(bytes)
+            }
+        })*
+    };
+}
+impl_little_endian!(u16, u32, u64, i32, i64);
+
+/// Reads a little-endian `T` at `offset` of an in-memory buffer.
+///
+/// Readers that keep a whole index table in memory use this where [`Reader`]
+/// is used for a file. `context` names the structure, so a truncated table
+/// reports which one ran out.
+pub fn le_at<T: LittleEndian>(data: &[u8], offset: usize, context: &str) -> Result<T> {
+    let slice = data
+        .get(offset..offset + T::WIDTH)
+        .with_context(|| format!("truncated {context}"))?;
+    Ok(T::from_le_bytes(slice))
+}
 
 /// A buffered file handle with the scalar and random-access helpers the
 /// container parsers need.
@@ -62,7 +100,10 @@ impl Reader {
     /// Unlike [`Reader::bytes`] this rejects ranges that fall outside the file,
     /// so callers can use it directly on offsets taken from an index.
     pub fn range(&mut self, offset: u64, length: u64, context: &str) -> Result<Vec<u8>> {
-        if offset == 0 || length == 0 || offset >= self.len || length > self.len - offset {
+        // Reuses the model's range test so a byte range means the same thing
+        // whether it is read here or validated before being stored.
+        let range = ByteRange { offset, length };
+        if !range.fits(self.len) {
             bail!("invalid byte range for {context}: offset={offset}, length={length}");
         }
         self.seek(offset)?;
@@ -70,6 +111,11 @@ impl Reader {
             usize::try_from(length).context("byte range is too large for this platform")?,
             context,
         )
+    }
+
+    /// Reads a little-endian `i64` at the cursor.
+    pub fn i64(&mut self) -> Result<i64> {
+        Ok(i64::from_le_bytes(self.array("i64")?))
     }
 
     /// Reads one unsigned byte at the cursor.

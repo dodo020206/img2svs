@@ -20,6 +20,10 @@ type Packet = c_void;
 type Dictionary = c_void;
 type SwsContext = c_void;
 
+/// The leading fields of `AVFrame`, up to the last one this module reads.
+///
+/// Declared field by field instead of binding all of `AVFrame`, so the layout
+/// that matters is visible; everything behind `format` stays unread.
 #[repr(C)]
 struct FramePrefix {
     data: [*mut u8; 8],
@@ -71,7 +75,10 @@ type SwsScale = unsafe extern "C" fn(
 ) -> c_int;
 type SwsFreeContext = unsafe extern "C" fn(*mut SwsContext);
 
+/// `AV_PIX_FMT_RGB24` from `libavutil/pixfmt.h` (FFmpeg 8 / PyAV 18.1).
 const PIX_FMT_RGB24: c_int = 2;
+/// `SWS_BILINEAR` from `libswscale/swscale.h`, the scaler's default in FFmpeg
+/// and the flag the bundled runtime is built with.
 const SWS_BILINEAR: c_int = 2;
 
 pub struct Decoder {
@@ -331,6 +338,7 @@ fn locate_ffmpeg_dir() -> Option<PathBuf> {
 }
 
 fn find_dll(directory: &Path, prefix: &str) -> Result<PathBuf> {
+    let prefix = prefix.to_ascii_lowercase();
     let entries =
         fs::read_dir(directory).with_context(|| format!("scan {}", directory.display()))?;
     entries
@@ -342,9 +350,8 @@ fn find_dll(directory: &Path, prefix: &str) -> Result<PathBuf> {
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| {
-                        name.to_ascii_lowercase()
-                            .starts_with(&prefix.to_ascii_lowercase())
-                            && name.to_ascii_lowercase().ends_with(".dll")
+                        let name = name.to_ascii_lowercase();
+                        name.starts_with(&prefix) && name.ends_with(".dll")
                     })
         })
         .with_context(|| format!("{} DLL not found in {}", prefix, directory.display()))

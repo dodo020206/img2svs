@@ -40,6 +40,9 @@ JPEG 质量、覆盖/关联图像选项、队列式后台工作线程、进度�
 - `.tif` / `.tiff`：瓦片式或扫描线式 TIFF 输入，TIFF 分辨率和物镜倍率
   元数据会带入金字塔 JPEG SVS。同时支持经典 TIFF 与 BigTIFF 头。
 
+`.svs` 是**输出**格式，不作为输入：它本身就是一个 TIFF，喂回转换器没有意义，
+GUI 的目录扫描也会跳过 `.svs` 文件。确需查看产物时把文件改成 `.tif` 即可用 `--info` 读。
+
 CLI 和输出布局有意与可用的 Python 版本保持一致：
 
 ```text
@@ -51,7 +54,7 @@ CLI 参数（两个变体共用，`--gui` / `--smoke-test` 仅 GUI 变体）：
 
 | 参数 | 说明 |
 | --- | --- |
-| `<输入文件>` | 支持 `.csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.tif/.tiff/.svs/.sdpc/.dyqx`；GUI 变体省略时启动界面 |
+| `<输入文件>` | 支持 `.csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.tif/.tiff/.sdpc/.dyqx`；GUI 变体省略时启动界面 |
 | `-o, --output <路径>` | 输出 `.svs` 路径，默认为输入路径改扩展名 |
 | `--jpeg-quality <1-100>` | 输出 JPEG 质量；默认沿用源文件元数据 |
 | `--overwrite` | 覆盖已存在的输出文件 |

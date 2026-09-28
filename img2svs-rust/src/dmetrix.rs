@@ -6,7 +6,7 @@
 //! so `parse` walks them in reverse to recover the real image size.
 
 use crate::binary::Reader;
-use crate::jpeg::{decode_image, SOI_MARKER};
+use crate::jpeg::decode_image;
 use crate::model::{AssociatedImage, ByteRange, Compression, Level, Metadata, Slide};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -98,12 +98,11 @@ pub fn parse(path: &Path) -> Result<Slide> {
     let descriptors = read_descriptors(&mut reader)?;
     let associated = read_associated(&mut reader, descriptors[0].index_offset, file_size)?;
     let raw_levels = read_tile_indexes(&mut reader, &descriptors, file_size)?;
-    let tile_size = discover_tile_size(&mut reader, first_tile(&raw_levels)?)?;
-    let levels = build_levels(&mut reader, &descriptors, &raw_levels, tile_size)?;
+    let smallest_tile = first_tile(&raw_levels)?;
+    let tile_size = discover_tile_size(&mut reader, smallest_tile)?;
+    let levels = build_levels(&mut reader, &descriptors, raw_levels, tile_size)?;
 
     let top = levels.first().context("missing DMetrix levels")?;
-    let jpeg_quality =
-        estimate_quality(&mut reader, first_tile(&raw_levels)?).unwrap_or(DEFAULT_JPEG_QUALITY);
     Ok(Slide {
         path: PathBuf::from(path),
         metadata: Metadata {
@@ -111,7 +110,9 @@ pub fn parse(path: &Path) -> Result<Slide> {
             height: top.height,
             mpp: scan.mpp(),
             app_mag: f64::from(scan.app_mag),
-            jpeg_quality,
+            // The container carries no quality field, and every tile is a plain
+            // JPEG whose tables the reference Python reader also ignores.
+            jpeg_quality: DEFAULT_JPEG_QUALITY,
         },
         tile_width: tile_size,
         tile_height: tile_size,
@@ -150,15 +151,14 @@ fn read_scan_metadata(reader: &mut Reader) -> Result<ScanMetadata> {
 fn build_levels(
     reader: &mut Reader,
     descriptors: &[Descriptor],
-    raw_levels: &[Vec<ByteRange>],
+    raw_levels: Vec<Vec<ByteRange>>,
     tile_size: u32,
 ) -> Result<Vec<Level>> {
     if descriptors.len() != raw_levels.len() {
         bail!("DMetrix level descriptor/index count mismatch");
     }
     let mut levels = Vec::with_capacity(descriptors.len());
-    for (index, (descriptor, tiles)) in descriptors.iter().zip(raw_levels.iter()).rev().enumerate()
-    {
+    for (index, (descriptor, tiles)) in descriptors.iter().zip(raw_levels).rev().enumerate() {
         let edge = tiles[descriptor.slot(descriptor.max_x, descriptor.max_y)];
         let image = decode_image(&reader.range(edge.offset, edge.length, "DMetrix edge tile")?)?;
         if image.width() == 0
@@ -178,10 +178,8 @@ fn build_levels(
             downsample: 2f64.powi(index as i32),
             tile_cols: descriptor.cols(),
             tile_rows: descriptor.rows(),
-            tiles: tiles.clone(),
-            tile_positions: Vec::new(),
-            tile_groups: Vec::new(),
-            tiling: Default::default(),
+            tiles,
+            ..Level::new(index)
         });
     }
     Ok(levels)
@@ -338,24 +336,6 @@ fn discover_tile_size(reader: &mut Reader, range: ByteRange) -> Result<u32> {
     Ok(image.width())
 }
 
-/// Source JPEG quality for the given tile, when it can be determined.
-///
-/// DMetrix stores plain JPEG tiles with no quality field, and the reference
-/// Python implementation derives the value from the quantization tables. Until
-/// that is ported, JPEG tiles report [`DEFAULT_JPEG_QUALITY`] and non-JPEG
-/// payloads report `None` so the caller can apply its own default.
-fn estimate_quality(reader: &mut Reader, range: ByteRange) -> Option<u8> {
-    let data = reader
-        .range(range.offset, range.length, "DMetrix JPEG")
-        .ok()?;
-    is_jpeg(&data).then_some(DEFAULT_JPEG_QUALITY)
-}
-
-/// Whether `data` starts with the JPEG start-of-image marker.
-fn is_jpeg(data: &[u8]) -> bool {
-    data.starts_with(&SOI_MARKER)
-}
-
 /// First tile of the smallest pyramid level.
 fn first_tile(raw_levels: &[Vec<ByteRange>]) -> Result<ByteRange> {
     raw_levels
@@ -404,12 +384,5 @@ mod tests {
         drop(reader);
         fs::remove_file(path)?;
         Ok(())
-    }
-
-    #[test]
-    fn jpeg_marker_detection_requires_the_full_soi() {
-        assert!(is_jpeg(&[0xff, 0xd8, 0xff, 0xe0]));
-        assert!(!is_jpeg(&[0xff]));
-        assert!(!is_jpeg(b"\x89PNG"));
     }
 }

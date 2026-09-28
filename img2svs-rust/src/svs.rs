@@ -225,29 +225,42 @@ fn trim_to_declared(image: RgbImage, declared: (u32, u32)) -> RgbImage {
 
 /// Read handles over the virtual source space of a slide.
 ///
+/// Backing files of a slide, ordered by the virtual offset of their first
+/// byte.
+///
 /// Single-file slides hold exactly one entry whose base is zero; multi-file
-/// containers (MRXS `Data*.dat`) hold one handle per backing file and ranges
-/// are resolved by their virtual base offsets.
+/// containers (MRXS `Data*.dat`) hold one entry per file, and byte ranges are
+/// resolved against those virtual base offsets.
+fn backing_files(slide: &Slide) -> Vec<(u64, PathBuf)> {
+    if slide.sources.is_empty() {
+        return vec![(0, slide.path.clone())];
+    }
+    let mut files: Vec<(u64, PathBuf)> = slide
+        .sources
+        .iter()
+        .map(|source| (source.base, source.path.clone()))
+        .collect();
+    files.sort_by_key(|(base, _)| *base);
+    files
+}
+
+/// Opens a file, naming it in the error so a missing `Data*.dat` of a
+/// multi-file container is identifiable.
+fn open_backing_file(path: &Path) -> Result<File> {
+    File::open(path).with_context(|| format!("open input {}", path.display()))
+}
+
+/// Seeking readers over the backing files of a slide.
 struct SourceFiles {
     files: Vec<(u64, File)>,
 }
 
 impl SourceFiles {
     fn open(slide: &Slide) -> Result<Self> {
-        if slide.sources.is_empty() {
-            let file = File::open(&slide.path)
-                .with_context(|| format!("open input {}", slide.path.display()))?;
-            return Ok(Self {
-                files: vec![(0, file)],
-            });
-        }
-        let mut files = Vec::with_capacity(slide.sources.len());
-        for source in &slide.sources {
-            let file = File::open(&source.path)
-                .with_context(|| format!("open input {}", source.path.display()))?;
-            files.push((source.base, file));
-        }
-        files.sort_by_key(|(base, _)| *base);
+        let files = backing_files(slide)
+            .into_iter()
+            .map(|(base, path)| Ok((base, open_backing_file(&path)?)))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self { files })
     }
 
@@ -292,6 +305,8 @@ fn render_thumbnail(
     quality: u8,
     hevc: Option<&mut HevcDecoder>,
 ) -> Result<RgbImage> {
+    // An unusable embedded thumbnail is not fatal: falling through to rendering
+    // the smallest level costs time but always yields an image.
     if let Some(thumbnail) = &slide.thumbnail {
         if let Ok(image) = decode_embedded(
             input,
@@ -337,7 +352,16 @@ fn render_level(
         } else {
             let row = index as u32 / level.tile_cols;
             let col = index as u32 % level.tile_cols;
-            copy_clipped(&mut canvas, &tile, col * pitch.0, row * pitch.1);
+            copy_region(
+                &mut canvas,
+                &tile,
+                col * pitch.0,
+                row * pitch.1,
+                0,
+                0,
+                tile.width(),
+                tile.height(),
+            );
         }
     }
     Ok(canvas)
@@ -370,19 +394,10 @@ fn decode_tile(slide: &Slide, bytes: &[u8], hevc: Option<&mut HevcDecoder>) -> R
     }
 }
 
-fn copy_clipped(dst: &mut RgbImage, src: &RgbImage, left: u32, top: u32) {
-    if left >= dst.width() || top >= dst.height() {
-        return;
-    }
-    let width = src.width().min(dst.width() - left);
-    let height = src.height().min(dst.height() - top);
-    for y in 0..height {
-        for x in 0..width {
-            dst.put_pixel(left + x, top + y, *src.get_pixel(x, y));
-        }
-    }
-}
-
+/// Copies a rectangle of `src` into `dst`, clipping to both images.
+///
+/// `src_x`/`src_y` select the top-left corner inside `src`; the copy stops at
+/// whichever edge - source or destination - is reached first.
 fn copy_region(
     dst: &mut RgbImage,
     src: &RgbImage,
@@ -416,24 +431,16 @@ struct SourceMaps {
 
 impl SourceMaps {
     fn open(slide: &Slide) -> Result<Self> {
-        let mut maps = Vec::new();
-        if slide.sources.is_empty() {
-            let file = File::open(&slide.path)
-                .with_context(|| format!("open input {}", slide.path.display()))?;
-            // SAFETY: the converter opens the source read-only and never mutates
-            // it while this mapping is alive.
-            let map = unsafe { MmapOptions::new().map(&file)? };
-            maps.push((0, map));
-        } else {
-            for source in &slide.sources {
-                let file = File::open(&source.path)
-                    .with_context(|| format!("open input {}", source.path.display()))?;
-                // SAFETY: same read-only guarantee as the single-file case.
+        let maps = backing_files(slide)
+            .into_iter()
+            .map(|(base, path)| {
+                let file = open_backing_file(&path)?;
+                // SAFETY: the converter opens the source read-only and never
+                // mutates it while this mapping is alive.
                 let map = unsafe { MmapOptions::new().map(&file)? };
-                maps.push((source.base, map));
-            }
-            maps.sort_by_key(|(base, _)| *base);
-        }
+                Ok((base, map))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self { maps })
     }
 
@@ -471,7 +478,8 @@ impl SourceMaps {
 
 struct TiffWriter {
     file: File,
-    first_ifd_pointer: Option<u64>,
+    /// Position of the 4-byte next-directory pointer of the previous IFD,
+    /// patched once the following directory has been written.
     previous_next_pointer: Option<u64>,
 }
 
@@ -483,25 +491,19 @@ impl TiffWriter {
         file.write_all(&0u32.to_le_bytes())?;
         Ok(Self {
             file,
-            first_ifd_pointer: None,
             previous_next_pointer: None,
         })
     }
 
     fn begin_ifd(&mut self) -> Result<u64> {
         let offset = self.file.stream_position()?;
-        if let Some(pointer) = self.previous_next_pointer {
-            self.patch_u32(
-                pointer,
-                u32::try_from(offset).context("TIFF exceeds classic 4 GiB offsets")?,
-            )?;
-        } else {
-            self.patch_u32(
-                4,
-                u32::try_from(offset).context("TIFF exceeds classic 4 GiB offsets")?,
-            )?;
-            self.first_ifd_pointer = Some(offset);
-        }
+        // The header's own pointer is at byte 4; later directories are chained
+        // through the previous directory's next-pointer slot.
+        let pointer = self.previous_next_pointer.unwrap_or(4);
+        self.patch_u32(
+            pointer,
+            u32::try_from(offset).context("TIFF exceeds classic 4 GiB offsets")?,
+        )?;
         Ok(offset)
     }
 
@@ -520,6 +522,9 @@ impl TiffWriter {
     ) -> Result<()> {
         let (pitch_width, pitch_height) =
             level.stored_tile_pitch(slide.tile_width, slide.tile_height);
+        // The SVS tile payload has to start on a multiple of 16 in both axes,
+        // so tiles are merged until the pitch is one. Reading (rather than
+        // scaling) keeps the pixels identical to the source.
         let merge_cols = 16 / gcd(pitch_width, 16);
         let merge_rows = 16 / gcd(pitch_height, 16);
         let tile_width = pitch_width * merge_cols;
@@ -546,12 +551,14 @@ impl TiffWriter {
                 .map(|index| TileTask {
                     slot: index - batch_start,
                     level_index: level.index,
-                    output_row: index as u32 / output_cols,
-                    output_col: index as u32 % output_cols,
-                    merge_rows,
-                    merge_cols,
-                    output_width: tile_width,
-                    output_height: tile_height,
+                    placement: TilePlacement {
+                        output_row: index as u32 / output_cols,
+                        output_col: index as u32 % output_cols,
+                        merge_rows,
+                        merge_cols,
+                        output_width: tile_width,
+                        output_height: tile_height,
+                    },
                     quality,
                 })
                 .collect();
@@ -608,7 +615,7 @@ impl TiffWriter {
     fn write_ifd(&mut self, page: Page) -> Result<()> {
         let ifd_offset = self.begin_ifd()?;
         let entry_count = page.entry_count();
-        let extras_offset = ifd_offset + 2 + entry_count as u64 * 12 + 4;
+        let extras_offset = ifd_offset + page.ifd_size();
         let entries = page.entries(extras_offset)?;
         self.file.write_all(&(entry_count as u16).to_le_bytes())?;
         for entry in &entries {
@@ -636,12 +643,7 @@ impl TiffWriter {
 struct TileTask {
     slot: usize,
     level_index: usize,
-    output_row: u32,
-    output_col: u32,
-    merge_rows: u32,
-    merge_cols: u32,
-    output_width: u32,
-    output_height: u32,
+    placement: TilePlacement,
     quality: u8,
 }
 
@@ -654,19 +656,6 @@ struct TilePlacement {
     merge_cols: u32,
     output_width: u32,
     output_height: u32,
-}
-
-impl TileTask {
-    fn placement(&self) -> TilePlacement {
-        TilePlacement {
-            output_row: self.output_row,
-            output_col: self.output_col,
-            merge_rows: self.merge_rows,
-            merge_cols: self.merge_cols,
-            output_width: self.output_width,
-            output_height: self.output_height,
-        }
-    }
 }
 
 struct TileResult {
@@ -686,6 +675,9 @@ impl TilePool {
         let available = thread::available_parallelism()
             .map(|count| count.get())
             .unwrap_or(1);
+        // Measured limits on the reference machine: JPEG decoding scales to all
+        // cores, the HEVC decoder holds more state per worker so it is capped
+        // lower and leaves one core to the writer.
         let worker_limit = if slide.compression == Compression::Jpeg {
             64
         } else {
@@ -746,7 +738,7 @@ impl TilePool {
         for task in tasks {
             sender.send(*task).context("send tile task")?;
         }
-        let mut ordered: Vec<Option<Vec<u8>>> = (0..tasks.len()).map(|_| None).collect();
+        let mut ordered: Vec<Option<Vec<u8>>> = vec![None; tasks.len()];
         let mut first_error = None;
         for _ in tasks {
             let result = self.results.recv().context("receive encoded tile")?;
@@ -832,25 +824,26 @@ fn encode_output_tile(
         .levels
         .get(task.level_index)
         .context("invalid pyramid level")?;
-    let passthrough = task.merge_rows == 1
-        && task.merge_cols == 1
+    let place = task.placement;
+    let passthrough = place.merge_rows == 1
+        && place.merge_cols == 1
         && slide.compression == Compression::Jpeg
         // Wrapped tiles are restart intervals, not streams, so they always
         // have to be re-encoded rather than copied.
         && level.tiling.is_plain()
         && level.tile_positions.is_empty()
         && task.quality == slide.metadata.jpeg_quality
-        && task.output_row + 1 < level.tile_rows
-        && task.output_col + 1 < level.tile_cols;
+        && place.output_row + 1 < level.tile_rows
+        && place.output_col + 1 < level.tile_cols;
     if passthrough {
         let range = *level
             .tiles
-            .get((task.output_row * level.tile_cols + task.output_col) as usize)
+            .get((place.output_row * level.tile_cols + place.output_col) as usize)
             .context("invalid source tile index")?;
         let bytes = source.range(range)?;
         if bytes.is_empty() {
             return encode_tile_image(
-                &compose_tile(slide, source, level, task.placement(), hevc)?,
+                &compose_tile(slide, source, level, place, hevc)?,
                 task.quality,
             );
         }
@@ -864,7 +857,7 @@ fn encode_output_tile(
         }
         return Ok(bytes.to_vec());
     }
-    let image = compose_tile(slide, source, level, task.placement(), hevc)?;
+    let image = compose_tile(slide, source, level, place, hevc)?;
     encode_tile_image(&image, task.quality)
 }
 
@@ -950,8 +943,19 @@ impl Page {
         }
     }
 
-    fn extra_data(&self, ifd_offset: u64) -> Extra {
-        let start = ifd_offset + 2 + self.entry_count() as u64 * 12 + 4;
+    /// Bytes the directory itself occupies: entry count, entries, and the
+    /// next-directory pointer. Everything the entries point at lives behind it.
+    fn ifd_size(&self) -> u64 {
+        2 + self.entry_count() as u64 * 12 + 4
+    }
+
+    /// Offsets of the payload the directory's entries point at.
+    ///
+    /// `extras_offset` is the position right behind the directory, which is
+    /// where [`Self::write_extra`] starts writing and what
+    /// [`Self::entries`] has to agree with.
+    fn extra_data(&self, extras_offset: u64) -> Extra {
+        let start = extras_offset;
         match self {
             Page::Tiled {
                 offsets,
@@ -977,7 +981,7 @@ impl Page {
                     sample,
                     reference_bw,
                     tables: reference_bw + 48,
-                    desc_text: description.clone(),
+                    desc_len: description.len(),
                 }
             }
             Page::Strip { description, .. } => {
@@ -1000,15 +1004,15 @@ impl Page {
                     sample,
                     reference_bw,
                     tables: 0,
-                    desc_text: description.clone().unwrap_or_default(),
+                    desc_len: description.as_ref().map_or(0, String::len),
                 }
             }
         }
     }
 
     fn entries(&self, extra_offset: u64) -> Result<Vec<Entry>> {
-        let extra = self.extra_data(extra_offset - 2 - self.entry_count() as u64 * 12 - 4);
-        let e = match self {
+        let extra = self.extra_data(extra_offset);
+        let mut e = match self {
             Page::Tiled {
                 width,
                 height,
@@ -1031,14 +1035,14 @@ impl Page {
                     short(TAG_SAMPLES_PER_PIXEL, 3),
                     short(TAG_PLANAR_CONFIGURATION, 1),
                     short(TAG_RESOLUTION_UNIT, 3),
-                    long_at(TAG_TILE_WIDTH, *tile_width),
-                    long_at(TAG_TILE_LENGTH, *tile_height),
+                    long(TAG_TILE_WIDTH, *tile_width),
+                    long(TAG_TILE_LENGTH, *tile_height),
                     long_array_at(TAG_TILE_OFFSETS, offsets, extra.tile_offsets)?,
                     long_array_at(TAG_TILE_BYTE_COUNTS, counts, extra.tile_counts)?,
                     rational_at(TAG_X_RESOLUTION, extra.xres),
                     rational_at(TAG_Y_RESOLUTION, extra.yres),
                     short_array_at(TAG_SAMPLE_FORMAT, extra.sample),
-                    ascii_at(TAG_IMAGE_DESCRIPTION, extra.desc, extra.desc_text.len() + 1)?,
+                    ascii_at(TAG_IMAGE_DESCRIPTION, extra.desc, extra.desc_len + 1)?,
                     short_pair(TAG_YCBCR_SUB_SAMPLING, 2, 2),
                     rational_array_at(TAG_REFERENCE_BLACK_WHITE, extra.reference_bw, 6)?,
                 ];
@@ -1070,9 +1074,9 @@ impl Page {
                     short(TAG_ORIENTATION, 1),
                     short(TAG_SAMPLES_PER_PIXEL, 3),
                     short(TAG_PLANAR_CONFIGURATION, 1),
-                    long_at(TAG_ROWS_PER_STRIP, *height),
-                    long_at(TAG_STRIP_OFFSETS, *offset),
-                    long_at(TAG_STRIP_BYTE_COUNTS, *count),
+                    long(TAG_ROWS_PER_STRIP, *height),
+                    long(TAG_STRIP_OFFSETS, *offset),
+                    long(TAG_STRIP_BYTE_COUNTS, *count),
                     short(TAG_RESOLUTION_UNIT, 3),
                     rational_at(TAG_X_RESOLUTION, extra.xres),
                     rational_at(TAG_Y_RESOLUTION, extra.yres),
@@ -1084,23 +1088,27 @@ impl Page {
                     v.push(ascii_at(
                         TAG_IMAGE_DESCRIPTION,
                         extra.desc,
-                        extra.desc_text.len() + 1,
+                        extra.desc_len + 1,
                     )?);
                 }
                 v
             }
         };
-        let mut e = e;
+        // TIFF requires the directory to be sorted by tag.
         e.sort_by_key(|entry| entry.tag);
         Ok(e)
     }
 
+    /// Writes the payload every entry in this page points at.
+    ///
+    /// The layout comes from [`Self::extra_data`], the same source the IFD
+    /// entries are built from, so the offsets stored in the directory cannot
+    /// drift away from the bytes written here. `stream_position` is the end of
+    /// the directory, which is exactly where `extra_data` starts counting.
     fn write_extra(&self, file: &mut File) -> Result<()> {
-        let ifd = file.stream_position()?;
-        // The actual offsets are recomputed from the current IFD layout.
-        let start = ifd;
-        let bits = align(start, 2);
-        pad_to(file, bits)?;
+        let extra = self.extra_data(file.stream_position()?);
+        // BITS_PER_SAMPLE: three 8-bit samples, hence the 6 bytes.
+        pad_to(file, extra.bits)?;
         file.write_all(&[8, 0, 8, 0, 8, 0])?;
         match self {
             Page::Tiled {
@@ -1108,58 +1116,44 @@ impl Page {
                 counts,
                 description,
                 jpeg_tables,
+                resolution,
                 ..
             } => {
-                let tile_offsets = align(bits + 6, 4);
-                pad_to(file, tile_offsets)?;
+                pad_to(file, extra.tile_offsets)?;
                 for value in offsets {
                     file.write_all(&value.to_le_bytes())?;
                 }
                 for value in counts {
                     file.write_all(&value.to_le_bytes())?;
                 }
+                // The description is NUL terminated, which is the +1 in
+                // `extra.xres`.
                 file.write_all(description.as_bytes())?;
                 file.write_all(&[0])?;
-                let after_desc = tile_offsets
-                    + offsets.len() as u64 * 4
-                    + counts.len() as u64 * 4
-                    + description.len() as u64
-                    + 1;
-                pad_to(file, align(after_desc, 2))?;
-                let resolution = match self {
-                    Page::Tiled { resolution, .. } => *resolution,
-                    _ => unreachable!(),
-                };
-                write_rational(file, resolution)?;
-                write_rational(file, resolution)?;
-                file.write_all(&1u16.to_le_bytes())?;
-                file.write_all(&1u16.to_le_bytes())?;
-                file.write_all(&1u16.to_le_bytes())?;
-                let reference_bw = align(file.stream_position()?, 4);
-                pad_to(file, reference_bw)?;
+                pad_to(file, extra.xres)?;
+                write_rational(file, *resolution)?;
+                write_rational(file, *resolution)?;
+                write_sample_format(file)?;
+                pad_to(file, extra.reference_bw)?;
                 write_reference_black_white(file)?;
                 if let Some(tables) = jpeg_tables {
                     file.write_all(tables)?;
                 }
             }
-            Page::Strip { description, .. } => {
+            Page::Strip {
+                description,
+                resolution,
+                ..
+            } => {
                 if let Some(text) = description {
                     file.write_all(text.as_bytes())?;
                     file.write_all(&[0])?;
                 }
-                let after_desc = bits + 6 + description.as_ref().map_or(0, |v| v.len() + 1) as u64;
-                pad_to(file, align(after_desc, 2))?;
-                let resolution = match self {
-                    Page::Strip { resolution, .. } => *resolution,
-                    _ => unreachable!(),
-                };
-                write_rational(file, resolution)?;
-                write_rational(file, resolution)?;
-                file.write_all(&1u16.to_le_bytes())?;
-                file.write_all(&1u16.to_le_bytes())?;
-                file.write_all(&1u16.to_le_bytes())?;
-                let reference_bw = align(file.stream_position()?, 4);
-                pad_to(file, reference_bw)?;
+                pad_to(file, extra.xres)?;
+                write_rational(file, *resolution)?;
+                write_rational(file, *resolution)?;
+                write_sample_format(file)?;
+                pad_to(file, extra.reference_bw)?;
                 write_reference_black_white(file)?;
             }
         }
@@ -1177,7 +1171,8 @@ struct Extra {
     sample: u64,
     reference_bw: u64,
     tables: u64,
-    desc_text: String,
+    /// Length of the image description in bytes, without its NUL terminator.
+    desc_len: usize,
 }
 
 fn compose_tile(
@@ -1233,15 +1228,16 @@ fn compose_tile(
             }
             let src_left = left - position.x + position.src_x;
             let src_top = top - position.y + position.src_y;
-            for y in 0..(bottom - top) {
-                for x in 0..(right - left) {
-                    output.put_pixel(
-                        left - origin_x + x,
-                        top - origin_y + y,
-                        *image.get_pixel(src_left + x, src_top + y),
-                    );
-                }
-            }
+            copy_region(
+                &mut output,
+                &image,
+                left - origin_x,
+                top - origin_y,
+                src_left,
+                src_top,
+                right - left,
+                bottom - top,
+            );
         }
         return Ok(output);
     }
@@ -1264,17 +1260,28 @@ fn compose_tile(
             let image = decode_tile(slide, data.as_ref(), hevc.as_deref_mut())?;
             let (pitch_width, pitch_height) =
                 level.stored_tile_pitch(slide.tile_width, slide.tile_height);
-            copy_clipped(
+            copy_region(
                 &mut output,
                 &image,
                 inner_col * pitch_width,
                 inner_row * pitch_height,
+                0,
+                0,
+                image.width(),
+                image.height(),
             );
         }
     }
     Ok(output)
 }
 
+/// Builds the Aperio image description.
+///
+/// The shape - a first line with the library version, then
+/// `WxH [origin WxH] (tile WxH) codec/space Q=…|AppMag = …|MPP = …` - is
+/// Aperio's own format, not a free-form string: OpenSlide and other SVS
+/// readers parse the `|`-separated fields to recover magnification and
+/// microns-per-pixel.
 fn aperio_description(
     slide: &Slide,
     level: &Level,
@@ -1306,6 +1313,12 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a
 }
 
+/// Whether a JPEG stream already carries 4:2:0 sampling.
+///
+/// Pass-through tiles are only copied when they are already in the sampling
+/// the SVS header declares (`YCbCrSubSampling = 2,2`); anything else has to be
+/// transcoded. The check walks the marker chain to the frame header and reads
+/// the three components' sampling factors: luma `0x22`, chroma `0x11`.
 fn jpeg_is_420(data: &[u8]) -> bool {
     if !data.starts_with(&SOI_MARKER) {
         return false;
@@ -1324,6 +1337,7 @@ fn jpeg_is_420(data: &[u8]) -> bool {
         }
         let marker = data[offset];
         offset += 1;
+        // SOI, EOI and the restart markers carry no length field.
         if marker == 0xd8 || marker == 0xd9 || (0xd0..=0xd7).contains(&marker) {
             continue;
         }
@@ -1388,6 +1402,14 @@ fn write_reference_black_white(file: &mut File) -> Result<()> {
     }
     Ok(())
 }
+/// SAMPLE_FORMAT for three unsigned samples.
+fn write_sample_format(file: &mut File) -> Result<()> {
+    for _ in 0..3 {
+        file.write_all(&1u16.to_le_bytes())?;
+    }
+    Ok(())
+}
+
 fn short(tag: u16, value: u16) -> Entry {
     Entry {
         tag,
@@ -1419,9 +1441,6 @@ fn long(tag: u16, value: u32) -> Entry {
         count: 1,
         value,
     }
-}
-fn long_at(tag: u16, value: u32) -> Entry {
-    long(tag, value)
 }
 fn rational_at(tag: u16, offset: u64) -> Entry {
     Entry {
@@ -1625,12 +1644,14 @@ mod tests {
             .map(|index| TileTask {
                 slot: index,
                 level_index: 0,
-                output_row: index as u32 / 2,
-                output_col: index as u32 % 2,
-                merge_rows: 1,
-                merge_cols: 1,
-                output_width: 16,
-                output_height: 16,
+                placement: TilePlacement {
+                    output_row: index as u32 / 2,
+                    output_col: index as u32 % 2,
+                    merge_rows: 1,
+                    merge_cols: 1,
+                    output_width: 16,
+                    output_height: 16,
+                },
                 quality: 75,
             })
             .collect();

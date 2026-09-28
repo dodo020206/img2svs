@@ -24,7 +24,9 @@ const PIC_INFO_FLAG: u16 = 0x4649;
 const PIC_HEAD_VERSION_SIZE: usize = 16;
 /// Colour-model fields that follow the JPEG quality byte.
 const PIC_HEAD_COLOR_FIELDS_SIZE: usize = 3;
-/// Reserved bytes after the person-info flag and size.
+/// Reserved bytes after the person-info flag and size. The sum spells out the
+/// SDK struct field by field - fixed-length strings and scratch buffers - so
+/// the total can be checked against its definition instead of a magic number.
 const PERSON_INFO_HEADER_SIZE: usize =
     64 + 64 + 1 + 1 + 64 + 64 + 1024 + 2048 + 2048 + 64 + 64 + 1024;
 /// Reserved bytes between the person-info next-offset and the next block.
@@ -67,7 +69,9 @@ const MACROGRAPH_DATA_OFFSET: usize = MACROGRAPH_FLAG_SIZE
 /// Width of one entry in a level's tile length table.
 const TILE_LENGTH_SIZE: u64 = 4;
 
-/// Slice-format codes of [`PicHead::slice_fmt`].
+/// Slice-format codes of [`PicHead::slice_fmt`]. The scanners this converter
+/// targets emit only JPEG (0) and HEVC (4); any other code is rejected rather
+/// than guessed at.
 const SLICE_FORMAT_JPEG: u8 = 0;
 const SLICE_FORMAT_HEVC: u8 = 4;
 

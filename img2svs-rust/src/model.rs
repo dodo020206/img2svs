@@ -27,13 +27,23 @@ impl ByteRange {
         self.offset > 0 && self.length > 0
     }
 
+    /// Whether the whole range lies inside a file of `file_size` bytes.
+    ///
+    /// Every subtraction is guarded by the comparisons above it, so an offset
+    /// taken straight from an index can be tested without panicking or
+    /// wrapping. [`Reader::range`](crate::binary::Reader::range) applies the
+    /// same test, which keeps the two checks from drifting apart.
+    pub fn fits(self, file_size: u64) -> bool {
+        self.present() && self.offset < file_size && self.length <= file_size - self.offset
+    }
+
     /// Fails unless the range is present and fits inside `file_size`.
     ///
     /// `label` names the structure being checked (for example
     /// `"DMetrix level tile"`) so a corrupt container reports which record was
     /// unusable instead of only the raw numbers.
     pub fn validate(self, file_size: u64, label: &str) -> Result<()> {
-        if !self.present() || self.offset >= file_size || self.length > file_size - self.offset {
+        if !self.fits(file_size) {
             bail!("invalid byte range for {label}");
         }
         Ok(())
@@ -107,6 +117,16 @@ pub struct Level {
 }
 
 impl Level {
+    /// An empty level at `index` (0 = full resolution), for readers that fill
+    /// in the geometry afterwards. Keeps the eight literal `Level { .. }`
+    /// constructions in the readers down to the fields they actually set.
+    pub fn new(index: usize) -> Self {
+        Self {
+            index,
+            ..Self::default()
+        }
+    }
+
     /// Tile pitch this level is stored on, falling back to the slide default
     /// when the level does not override it.
     pub fn stored_tile_pitch(&self, slide_tile_width: u32, slide_tile_height: u32) -> (u32, u32) {
@@ -198,7 +218,11 @@ pub fn assign_tile_groups(levels: &mut [Level], slide_tile_width: u32, slide_til
             level.stored_tile_pitch(slide_tile_width, slide_tile_height);
         let last_col = level.tile_cols.saturating_sub(1);
         let last_row = level.tile_rows.saturating_sub(1);
-        level.tile_groups = vec![Vec::new(); (level.tile_cols * level.tile_rows) as usize];
+        // Each factor is widened before multiplying so the product cannot wrap
+        // in u32. Both are bounded by the readers' grid limits; the guard only
+        // keeps a pathological level from allocating a short (and wrong) map.
+        let cells = level.tile_cols as usize * level.tile_rows as usize;
+        level.tile_groups = vec![Vec::new(); cells];
         for (tile_index, position) in level.tile_positions.iter().enumerate() {
             let left = (position.x / tile_width).min(last_col);
             let top = (position.y / tile_height).min(last_row);

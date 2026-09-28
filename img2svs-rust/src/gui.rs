@@ -1,29 +1,19 @@
-use crate::{dmetrix, indexed, mrxs, ndpi, sdpc, svs, tiff};
-use anyhow::{bail, Context, Result};
+use crate::loader::{self, SUPPORTED_FORMATS};
+use crate::svs;
+use anyhow::Result;
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, RichText,
     Shadow, Stroke, TextStyle, Vec2,
 };
 use eframe::{App, CreationContext, Frame, NativeOptions};
 use rfd::FileDialog;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
-
-const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "csp", "dmetrix", "kfb", "mdss", "mdsx", "msdx", "mrxs", "ndpi", "sdpc", "dyqx", "svs", "tif",
-    "tiff",
-];
-
-/// Display names for the format strip in the header.
-const FORMAT_LABELS: &[&str] = &[
-    "CSP", "DMETRIX", "KFB", "MDSS", "MDSX", "MSDX", "MRXS", "NDPI", "SDPC", "DYQX", "SVS",
-    "TIF/TIFF",
-];
 
 /// Design tokens for the view layer.
 ///
@@ -70,6 +60,25 @@ mod theme {
     };
     pub const CARD_MARGIN: Margin = Margin::symmetric(18, 16);
     pub const RAIL_WIDTH: f32 = 340.0;
+    /// Page insets of the three outer panels, all on the same 20px gutter.
+    pub const HEADER_MARGIN: Margin = Margin {
+        left: 20,
+        right: 20,
+        top: 18,
+        bottom: 0,
+    };
+    pub const STATUS_MARGIN: Margin = Margin {
+        left: 20,
+        right: 20,
+        top: 0,
+        bottom: 0,
+    };
+    pub const LOGS_MARGIN: Margin = Margin {
+        left: 20,
+        right: 20,
+        top: 6,
+        bottom: 6,
+    };
 }
 
 pub struct LaunchOptions {
@@ -167,35 +176,27 @@ const QUEUE_MIN_PATH_WIDTH: f32 = 120.0;
 /// Column widths derived from the width available to the queue list.
 ///
 /// The header band and every row share one instance so the three columns line
-/// up pixel for pixel.
+/// up pixel for pixel. The status and action columns are fixed; only the path
+/// column absorbs whatever width is left over.
 struct QueueColumns {
-    row_padding: f32,
-    status_width: f32,
     path_width: f32,
-    action_width: f32,
     spacing: f32,
 }
 
 impl QueueColumns {
     fn new(ui: &egui::Ui) -> Self {
-        let row_padding = QUEUE_ROW_INSET;
-        let status_width = QUEUE_STATUS_WIDTH;
-        let action_width = QUEUE_ACTION_WIDTH;
         let spacing = ui.spacing().item_spacing.x;
         // Leading inset + status + path + action, plus the item spacing egui
         // inserts between them, plus a right inset.
         let path_width = (ui.available_width()
-            - row_padding
-            - status_width
-            - action_width
+            - QUEUE_ROW_INSET
+            - QUEUE_STATUS_WIDTH
+            - QUEUE_ACTION_WIDTH
             - spacing * 3.0
             - QUEUE_RIGHT_INSET)
             .max(QUEUE_MIN_PATH_WIDTH);
         Self {
-            row_padding,
-            status_width,
             path_width,
-            action_width,
             spacing,
         }
     }
@@ -224,11 +225,11 @@ fn queue_header_band(ui: &mut egui::Ui, columns: &QueueColumns) {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 let _ = ui.allocate_exact_size(
-                    Vec2::new(columns.row_padding, QUEUE_HEADER_HEIGHT),
+                    Vec2::new(QUEUE_ROW_INSET, QUEUE_HEADER_HEIGHT),
                     egui::Sense::hover(),
                 );
                 let (status_rect, _) = ui.allocate_exact_size(
-                    Vec2::new(columns.status_width, QUEUE_HEADER_HEIGHT),
+                    Vec2::new(QUEUE_STATUS_WIDTH, QUEUE_HEADER_HEIGHT),
                     egui::Sense::hover(),
                 );
                 let (path_rect, _) = ui.allocate_exact_size(
@@ -236,7 +237,7 @@ fn queue_header_band(ui: &mut egui::Ui, columns: &QueueColumns) {
                     egui::Sense::hover(),
                 );
                 let action_center = egui::pos2(
-                    path_rect.right() + columns.spacing + columns.action_width / 2.0,
+                    path_rect.right() + columns.spacing + QUEUE_ACTION_WIDTH / 2.0,
                     status_rect.center().y,
                 );
                 let painter = ui.painter();
@@ -279,11 +280,11 @@ fn queue_row(
     let mut removed = false;
     ui.horizontal(|ui| {
         let _ = ui.allocate_exact_size(
-            Vec2::new(columns.row_padding, QUEUE_ROW_HEIGHT),
+            Vec2::new(QUEUE_ROW_INSET, QUEUE_ROW_HEIGHT),
             egui::Sense::hover(),
         );
         let (status_rect, _) = ui.allocate_exact_size(
-            Vec2::new(columns.status_width, QUEUE_ROW_HEIGHT),
+            Vec2::new(QUEUE_STATUS_WIDTH, QUEUE_ROW_HEIGHT),
             egui::Sense::hover(),
         );
         let painter = ui.painter();
@@ -316,7 +317,7 @@ fn queue_row(
             .add_enabled(
                 modify_enabled,
                 egui::Button::new("移除")
-                    .min_size(Vec2::new(columns.action_width, QUEUE_ACTION_HEIGHT)),
+                    .min_size(Vec2::new(QUEUE_ACTION_WIDTH, QUEUE_ACTION_HEIGHT)),
             )
             .clicked()
         {
@@ -362,6 +363,12 @@ struct SvsGui {
     logs_collapsed: bool,
     /// Screen rect of the output-path field, used to route folder drops.
     output_field_rect: Option<egui::Rect>,
+    /// Last location used by the input dialogs. Kept apart from
+    /// `last_output_dir` so browsing for slides and browsing for a destination
+    /// no longer share one folder memory.
+    last_input_dir: Option<PathBuf>,
+    /// Last location used by the output dialog.
+    last_output_dir: Option<PathBuf>,
 }
 
 impl SvsGui {
@@ -387,6 +394,8 @@ impl SvsGui {
             last_message: "等待添加切片".to_owned(),
             logs_collapsed: true,
             output_field_rect: None,
+            last_input_dir: None,
+            last_output_dir: None,
         }
     }
 
@@ -401,47 +410,49 @@ impl SvsGui {
         let mut duplicate = 0;
         let mut candidates = Vec::new();
         for path in paths {
+            // Dropped and dialog-picked inputs both feed the input memory.
+            self.note_input_dir(&path);
             if path.is_dir() {
                 collect_supported_files(&path, &mut candidates);
             } else {
                 candidates.push(path);
             }
         }
-        let existing: HashSet<String> = self
+        // One canonicalisation per queued path: resolving a duplicate would
+        // otherwise re-canonicalise the whole queue for every new path.
+        let mut queued: HashMap<String, usize> = self
             .items
             .iter()
-            .map(|item| normalize_path(&item.path))
+            .enumerate()
+            .map(|(index, item)| (normalize_path(&item.path), index))
             .collect();
-        let mut seen = existing;
         for path in candidates {
             if !is_supported(&path) {
                 ignored += 1;
                 continue;
             }
             let key = normalize_path(&path);
-            if seen.contains(&key) {
-                if let Some(item) = self
-                    .items
-                    .iter_mut()
-                    .find(|item| normalize_path(&item.path) == key)
-                {
-                    if item.state != ItemState::Waiting {
+            match queued.get(&key) {
+                // Already queued: put it back in line, or count it as a repeat
+                // when it never left.
+                Some(&index) => {
+                    let item = &mut self.items[index];
+                    if item.state == ItemState::Waiting {
+                        duplicate += 1;
+                    } else {
                         item.state = ItemState::Waiting;
                         refreshed += 1;
-                    } else {
-                        duplicate += 1;
                     }
-                } else {
-                    duplicate += 1;
                 }
-                continue;
+                None => {
+                    queued.insert(key, self.items.len());
+                    self.items.push(InputItem {
+                        path,
+                        state: ItemState::Waiting,
+                    });
+                    added += 1;
+                }
             }
-            seen.insert(key);
-            self.items.push(InputItem {
-                path,
-                state: ItemState::Waiting,
-            });
-            added += 1;
         }
         self.last_message = format!(
             "新增 {added} 项，重新加入 {refreshed} 项，重复 {duplicate} 项，忽略 {ignored} 项"
@@ -449,13 +460,17 @@ impl SvsGui {
         if added > 0 || refreshed > 0 {
             self.completed = 0;
             self.failed = 0;
-            self.batch_total = self
-                .items
-                .iter()
-                .filter(|item| item.state == ItemState::Waiting)
-                .count();
+            self.batch_total = self.waiting_count();
         }
         self.log(format!("{}。", self.last_message));
+    }
+
+    /// Queued slides that still have to be converted.
+    fn waiting_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.state == ItemState::Waiting)
+            .count()
     }
 
     fn log(&mut self, message: String) {
@@ -465,24 +480,90 @@ impl SvsGui {
         }
     }
 
+    /// Directory an input dialog should open in: the last input location, or
+    /// the folder of the newest queued slide. Never the output location.
+    fn input_start_dir(&self) -> Option<PathBuf> {
+        self.last_input_dir
+            .clone()
+            .filter(|path| path.is_dir())
+            .or_else(|| {
+                self.items
+                    .last()
+                    .and_then(|item| item.path.parent())
+                    .filter(|path| path.is_dir())
+                    .map(Path::to_path_buf)
+            })
+    }
+
+    /// Directory the output dialog should open in: the last output location,
+    /// or the directory currently typed into the field. Never an input
+    /// location, so picking slides cannot move the destination memory.
+    fn output_start_dir(&self) -> Option<PathBuf> {
+        self.last_output_dir
+            .clone()
+            .filter(|path| path.is_dir())
+            .or_else(|| {
+                let typed = PathBuf::from(self.options.output_dir.trim());
+                (!typed.as_os_str().is_empty() && typed.is_dir()).then_some(typed)
+            })
+    }
+
+    /// Records `path` (or its parent) as the latest input location.
+    fn note_input_dir(&mut self, path: &Path) {
+        // A picked file contributes its folder; a picked or dropped folder
+        // contributes itself.
+        let directory = if path.is_dir() {
+            path
+        } else if let Some(parent) = path.parent() {
+            parent
+        } else {
+            return;
+        };
+        if directory.is_dir() {
+            self.last_input_dir = Some(directory.to_path_buf());
+        }
+    }
+
+    /// Records `directory` as the latest output location.
+    fn note_output_dir(&mut self, directory: &Path) {
+        if directory.is_dir() {
+            self.last_output_dir = Some(directory.to_path_buf());
+        }
+    }
+
     fn choose_files(&mut self, parent: &Frame) {
-        if let Some(paths) = FileDialog::new()
-            .add_filter("Whole-slide files", SUPPORTED_EXTENSIONS)
-            .set_parent(parent)
-            .pick_files()
-        {
+        let mut dialog = FileDialog::new()
+            .add_filter("Whole-slide files", &loader::supported_extensions())
+            .set_parent(parent);
+        if let Some(start) = self.input_start_dir() {
+            dialog = dialog.set_directory(start);
+        }
+        if let Some(paths) = dialog.pick_files() {
+            if let Some(first) = paths.first() {
+                self.note_input_dir(first);
+            }
             self.add_paths(paths);
         }
     }
 
     fn choose_folder(&mut self, parent: &Frame) {
-        if let Some(path) = FileDialog::new().set_parent(parent).pick_folder() {
+        let mut dialog = FileDialog::new().set_parent(parent);
+        if let Some(start) = self.input_start_dir() {
+            dialog = dialog.set_directory(start);
+        }
+        if let Some(path) = dialog.pick_folder() {
+            self.note_input_dir(&path);
             self.add_paths([path]);
         }
     }
 
     fn choose_output(&mut self, parent: &Frame) {
-        if let Some(path) = FileDialog::new().set_parent(parent).pick_folder() {
+        let mut dialog = FileDialog::new().set_parent(parent);
+        if let Some(start) = self.output_start_dir() {
+            dialog = dialog.set_directory(start);
+        }
+        if let Some(path) = dialog.pick_folder() {
+            self.note_output_dir(&path);
             self.options.output_dir = path.display().to_string();
         }
     }
@@ -493,11 +574,7 @@ impl SvsGui {
         }
         if index < self.items.len() {
             self.items.remove(index);
-            self.batch_total = self
-                .items
-                .iter()
-                .filter(|item| item.state == ItemState::Waiting)
-                .count();
+            self.batch_total = self.waiting_count();
         }
     }
 
@@ -506,9 +583,7 @@ impl SvsGui {
             return;
         }
         if self.items.is_empty() {
-            if self.items.is_empty() {
-                self.last_message = "请先添加切片文件".to_owned();
-            }
+            self.last_message = "请先添加切片文件".to_owned();
             return;
         }
         let pending_indices: Vec<usize> = self
@@ -536,6 +611,10 @@ impl SvsGui {
         };
         let output_dir = (!self.options.output_dir.trim().is_empty())
             .then(|| PathBuf::from(self.options.output_dir.trim()));
+        // A directory typed by hand counts as an output location too.
+        if let Some(directory) = &output_dir {
+            self.note_output_dir(directory);
+        }
         let jobs = plan_jobs(
             pending_indices
                 .iter()
@@ -578,35 +657,23 @@ impl SvsGui {
         for event in events {
             match event {
                 WorkerEvent::Started { index } => {
-                    if let Some(item_index) = self.active_indices.get(index).copied() {
-                        if let Some(item) = self.items.get_mut(item_index) {
-                            item.state = ItemState::Running;
-                        }
-                    }
+                    self.set_active_state(index, ItemState::Running);
                 }
                 WorkerEvent::Log(message) => self.log(message),
                 WorkerEvent::Finished { index, elapsed } => {
-                    if let Some(item_index) = self.active_indices.get(index).copied() {
-                        let path = self.items[item_index].path.display().to_string();
-                        self.items[item_index].state = ItemState::Done;
+                    if let Some(path) = self.set_active_state(index, ItemState::Done) {
                         self.completed += 1;
                         self.log(format!("完成：{path}（{elapsed:.1}s）"));
                     }
                 }
                 WorkerEvent::Failed { index, message } => {
-                    if let Some(item_index) = self.active_indices.get(index).copied() {
-                        let path = self.items[item_index].path.display().to_string();
-                        self.items[item_index].state = ItemState::Failed;
+                    if let Some(path) = self.set_active_state(index, ItemState::Failed) {
                         self.failed += 1;
                         self.log(format!("失败：{path}：{message}"));
                     }
                 }
                 WorkerEvent::Cancelled { index } => {
-                    if let Some(item_index) = self.active_indices.get(index).copied() {
-                        if let Some(item) = self.items.get_mut(item_index) {
-                            item.state = ItemState::Cancelled;
-                        }
-                    }
+                    self.set_active_state(index, ItemState::Cancelled);
                 }
                 WorkerEvent::Complete { cancelled } => {
                     self.running = false;
@@ -625,6 +692,18 @@ impl SvsGui {
                 }
             }
         }
+    }
+
+    /// Applies `state` to the queue item a worker event refers to and returns
+    /// that item's path.
+    ///
+    /// The index is chosen by the worker, so a stale or out-of-range one is
+    /// ignored instead of panicking on the UI thread.
+    fn set_active_state(&mut self, index: usize, state: ItemState) -> Option<String> {
+        let item_index = self.active_indices.get(index).copied()?;
+        let item = self.items.get_mut(item_index)?;
+        item.state = state;
+        Some(item.path.display().to_string())
     }
 }
 
@@ -718,6 +797,37 @@ fn card() -> egui::Frame {
         })
 }
 
+/// A flat panel with the standard border, for boxes nested inside a card.
+fn surface_box(radius: u8, inner_margin: Margin) -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::SURFACE)
+        .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+        .corner_radius(CornerRadius::same(radius))
+        .inner_margin(inner_margin)
+}
+
+/// One of the header's primary actions.
+///
+/// A disabled button keeps its label but drops to the muted foreground and the
+/// sunken fill, which is the only difference between the two states.
+fn toolbar_button(
+    label: &str,
+    enabled: bool,
+    fg: Color32,
+    bg: Color32,
+    width: f32,
+) -> egui::Button<'_> {
+    let (fg, bg) = if enabled {
+        (fg, bg)
+    } else {
+        (theme::TEXT_DISABLED, theme::SUNKEN)
+    };
+    egui::Button::new(RichText::new(label).size(15.0).color(fg))
+        .fill(bg)
+        .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
+        .min_size(Vec2::new(width, 40.0))
+}
+
 /// A small rounded pill, used for counters and format names.
 fn chip(ui: &mut egui::Ui, text: impl Into<String>, fg: Color32, bg: Color32) {
     egui::Frame::new()
@@ -738,6 +848,8 @@ fn empty_state(ui: &mut egui::Ui) {
         .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
         .inner_margin(Margin::symmetric(16, 16))
         .show(ui, |ui| {
+            // 34 = the frame's 16px top and bottom margins plus its stroke;
+            // 46 centres the two lines of text inside what is left.
             let inner_height = (height - 34.0).max(120.0);
             ui.set_min_height(inner_height);
             ui.vertical_centered(|ui| {
@@ -836,12 +948,11 @@ impl App for SvsGui {
         // same four rounded corners and page margin as the workspace cards.
         egui::TopBottomPanel::top("header")
             .show_separator_line(false)
-            .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin {
-                left: 20,
-                right: 20,
-                top: 18,
-                bottom: 0,
-            }))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::CANVAS)
+                    .inner_margin(theme::HEADER_MARGIN),
+            )
             .show(ctx, |ui| self.header(ui));
 
         egui::TopBottomPanel::bottom("status_bar")
@@ -849,24 +960,18 @@ impl App for SvsGui {
             .frame(
                 egui::Frame::new()
                     .fill(theme::SURFACE)
-                    .inner_margin(Margin {
-                        left: 20,
-                        right: 20,
-                        top: 0,
-                        bottom: 0,
-                    }),
+                    .inner_margin(theme::STATUS_MARGIN),
             )
             .show(ctx, |ui| self.status_bar(ui));
 
         egui::TopBottomPanel::bottom("logs")
             .show_separator_line(false)
             .exact_height(if self.logs_collapsed { 54.0 } else { 232.0 })
-            .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin {
-                left: 20,
-                right: 20,
-                top: 6,
-                bottom: 6,
-            }))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::CANVAS)
+                    .inner_margin(theme::LOGS_MARGIN),
+            )
             .show(ctx, |ui| self.logs_panel(ui));
 
         egui::CentralPanel::default()
@@ -926,6 +1031,7 @@ impl SvsGui {
         });
         if dropped_on_field {
             if let Some(directory) = paths.iter().find(|path| path.is_dir()) {
+                self.note_output_dir(directory);
                 self.options.output_dir = directory.display().to_string();
                 self.last_message = format!("输出目录：{}", directory.display());
                 self.log(format!("输出目录已设置为 {}。", directory.display()));
@@ -984,42 +1090,36 @@ impl SvsGui {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let stop_enabled = self.running;
-                    let stop = if stop_enabled {
-                        egui::Button::new(
-                            RichText::new("停止").size(15.0).color(theme::TEXT_PRIMARY),
+                    if ui
+                        .add_enabled(
+                            stop_enabled,
+                            toolbar_button(
+                                "停止",
+                                stop_enabled,
+                                theme::TEXT_PRIMARY,
+                                theme::SURFACE,
+                                96.0,
+                            ),
                         )
-                        .fill(theme::SURFACE)
-                    } else {
-                        egui::Button::new(
-                            RichText::new("停止").size(15.0).color(theme::TEXT_DISABLED),
-                        )
-                        .fill(theme::SUNKEN)
-                    }
-                    .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
-                    .min_size(Vec2::new(96.0, 40.0));
-                    if ui.add_enabled(stop_enabled, stop).clicked() {
+                        .clicked()
+                    {
                         self.stop();
                     }
 
                     let start_enabled = !self.running;
-                    let start = if start_enabled {
-                        egui::Button::new(
-                            RichText::new("开始转换  F5")
-                                .size(15.0)
-                                .color(Color32::WHITE),
+                    if ui
+                        .add_enabled(
+                            start_enabled,
+                            toolbar_button(
+                                "开始转换  F5",
+                                start_enabled,
+                                Color32::WHITE,
+                                theme::PRIMARY,
+                                150.0,
+                            ),
                         )
-                        .fill(theme::PRIMARY)
-                    } else {
-                        egui::Button::new(
-                            RichText::new("开始转换  F5")
-                                .size(15.0)
-                                .color(theme::TEXT_DISABLED),
-                        )
-                        .fill(theme::SUNKEN)
-                    }
-                    .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
-                    .min_size(Vec2::new(150.0, 40.0));
-                    if ui.add_enabled(start_enabled, start).clicked() {
+                        .clicked()
+                    {
                         self.start();
                     }
                 });
@@ -1032,8 +1132,8 @@ impl SvsGui {
                         .color(theme::TEXT_SECONDARY),
                 );
                 ui.add_space(2.0);
-                for label in FORMAT_LABELS {
-                    chip(ui, *label, theme::TEXT_SECONDARY, theme::SUNKEN);
+                for label in loader::supported_labels() {
+                    chip(ui, label, theme::TEXT_SECONDARY, theme::SUNKEN);
                 }
             });
         });
@@ -1070,11 +1170,7 @@ impl SvsGui {
         } else {
             processed as f32 / total as f32
         };
-        let waiting = self
-            .items
-            .iter()
-            .filter(|item| item.state == ItemState::Waiting)
-            .count();
+        let waiting = self.waiting_count();
         let running = self.running;
         let completed = self.completed;
         let failed = self.failed;
@@ -1156,23 +1252,18 @@ impl SvsGui {
                 return;
             }
 
-            egui::Frame::new()
-                .fill(theme::SURFACE)
-                .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
-                .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
-                .inner_margin(Margin::ZERO)
-                .show(ui, |ui| {
-                    let columns = QueueColumns::new(ui);
-                    queue_header_band(ui, &columns);
+            surface_box(theme::RADIUS_CONTROL, Margin::ZERO).show(ui, |ui| {
+                let columns = QueueColumns::new(ui);
+                queue_header_band(ui, &columns);
 
-                    egui::ScrollArea::vertical()
-                        .id_salt("queue_scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            self.queue_rows(ui, &columns);
-                        });
-                });
+                egui::ScrollArea::vertical()
+                    .id_salt("queue_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        self.queue_rows(ui, &columns);
+                    });
+            });
         });
     }
 
@@ -1288,6 +1379,7 @@ impl SvsGui {
                 .color(theme::TEXT_PRIMARY),
         );
         ui.add_space(6.0);
+        // The field takes whatever is left after the fixed-size browse button.
         let browse_width = 68.0;
         let item_spacing = ui.spacing().item_spacing.x;
         let input_width = (ui.available_width() - browse_width - item_spacing).max(120.0);
@@ -1314,6 +1406,7 @@ impl SvsGui {
                     bottom: 0,
                 })
                 .show(ui, |ui| {
+                    // The 20px keeps the text off the frame's 10px margins.
                     ui.add_sized(
                         [input_width - 20.0, 36.0],
                         egui::TextEdit::singleline(&mut self.options.output_dir)
@@ -1433,30 +1526,25 @@ impl SvsGui {
 
         ui.add_space(6.0);
         let body_height = (ui.available_height() - 6.0).max(80.0);
-        egui::Frame::new()
-            .fill(theme::SURFACE)
-            .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
-            .corner_radius(CornerRadius::same(theme::RADIUS_CONTROL))
-            .inner_margin(Margin::symmetric(12, 10))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                egui::ScrollArea::vertical()
-                    .id_salt("logs_scroll")
-                    .auto_shrink([false, false])
-                    .max_height((body_height - 24.0).max(40.0))
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        for line in &self.logs {
-                            ui.label(
-                                RichText::new(line)
-                                    .monospace()
-                                    .size(12.0)
-                                    .color(theme::TEXT_SECONDARY),
-                            );
-                        }
-                    });
-            });
+        surface_box(theme::RADIUS_CONTROL, Margin::symmetric(12, 10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .id_salt("logs_scroll")
+                .auto_shrink([false, false])
+                .max_height((body_height - 24.0).max(40.0))
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    for line in &self.logs {
+                        ui.label(
+                            RichText::new(line)
+                                .monospace()
+                                .size(12.0)
+                                .color(theme::TEXT_SECONDARY),
+                        );
+                    }
+                });
+        });
     }
 }
 
@@ -1502,23 +1590,7 @@ fn convert_one(
     quality: Option<u8>,
     overwrite: bool,
 ) -> Result<PathBuf> {
-    let input = input
-        .canonicalize()
-        .with_context(|| format!("input not found: {}", input.display()))?;
-    let extension = input
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let slide = match extension.as_str() {
-        "dmetrix" => dmetrix::parse(&input)?,
-        "sdpc" | "dyqx" => sdpc::parse(&input)?,
-        "csp" | "kfb" | "mdss" | "mdsx" | "msdx" => indexed::parse(&input)?,
-        "mrxs" => mrxs::parse(&input)?,
-        "tif" | "tiff" | "svs" => tiff::parse(&input)?,
-        "ndpi" => ndpi::parse(&input)?,
-        other => bail!("unsupported input extension .{other}"),
-    };
+    let slide = loader::open_slide(input)?;
     let selected_quality = quality.unwrap_or(slide.metadata.jpeg_quality);
     svs::write_slide(
         &slide,
@@ -1554,6 +1626,10 @@ fn output_path_for(input: &Path, output_dir: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| input.with_file_name(name))
 }
 
+/// Adds a `_2`, `_3`, ... suffix until the path is free.
+///
+/// `reserved` holds every path handed out for this batch, so two inputs with
+/// the same file name in one output directory do not overwrite each other.
 fn unique_output_path(base: PathBuf, reserved: &mut HashSet<String>) -> PathBuf {
     if reserved.insert(normalize_path(&base)) {
         return base;
@@ -1569,7 +1645,7 @@ fn unique_output_path(base: PathBuf, reserved: &mut HashSet<String>) -> PathBuf 
     for suffix in 2.. {
         let candidate = base
             .parent()
-            .unwrap_or_else(|| Path::new("."))
+            .unwrap_or(Path::new("."))
             .join(format!("{stem}_{suffix}.{extension}"));
         if reserved.insert(normalize_path(&candidate)) {
             return candidate;
@@ -1595,12 +1671,11 @@ fn collect_supported_files(directory: &Path, output: &mut Vec<PathBuf>) {
 fn is_supported(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
-        .map(|value| {
-            SUPPORTED_EXTENSIONS
+        .is_some_and(|value| {
+            SUPPORTED_FORMATS
                 .iter()
-                .any(|extension| value.eq_ignore_ascii_case(extension))
+                .any(|format| value.eq_ignore_ascii_case(format.extension))
         })
-        .unwrap_or(false)
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -1650,5 +1725,13 @@ mod tests {
     fn tiff_extensions_are_supported_case_insensitively() {
         assert!(is_supported(Path::new(r"C:\slides\sample.tif")));
         assert!(is_supported(Path::new(r"C:\slides\sample.TIFF")));
+    }
+
+    #[test]
+    fn svs_files_are_skipped_by_the_scan() {
+        // SVS is what this converter writes, so a directory scan must not queue
+        // those files back up.
+        assert!(!is_supported(Path::new(r"C:\slides\already.svs")));
+        assert!(!is_supported(Path::new(r"C:\slides\already.SVS")));
     }
 }

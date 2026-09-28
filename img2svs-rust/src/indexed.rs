@@ -5,9 +5,10 @@
 //! The BKIO container is shared by Motic's `.mdsx`, `.msdx` and `.mdss` slides,
 //! so [`parse`] routes all three extensions to the same reader.
 
-use crate::binary::Reader;
+use crate::binary::{le_at, Reader};
 use crate::model::{
-    AssociatedImage, ByteRange, Compression, Level, Metadata, Slide, Thumbnail, TilePlacement,
+    assign_tile_groups, AssociatedImage, ByteRange, Compression, Level, Metadata, Slide, Thumbnail,
+    TilePlacement,
 };
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -17,6 +18,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// Signature at the start of a CSP file.
 const CSP_SIGNATURE: &[u8] = b"MEDIC";
@@ -26,15 +28,19 @@ const CSP_HEADER_SIZE: usize = 4096;
 const CSP_TAIL_OFFSET_FIELD: usize = 0x1e;
 /// Marker that locates the first JPEG tile payload.
 const CSP_JPEG_STREAM_MARKER: &[u8] = b"\xff\xd8\xff\xe0";
-/// Fixed marker repeated at the start of every tile record in the tail.
+/// Fixed 22-byte marker repeated at the start of every tile record in the
+/// tail. Its fields are constant across CSP slides, so it is matched verbatim
+/// to locate records rather than decoded.
 const CSP_TILE_RECORD_MARKER: &[u8] =
     b"\x02\x00\x25\x00\x0f\x00\x07\x00\x00\x00\x00\x00\x00\x00\x24\x00\x00\x00\x00\x00\x00\x00";
-/// Bytes between a tile record marker and its payload fields.
+/// Length of [`CSP_TILE_RECORD_MARKER`], i.e. the offset from a marker to the
+/// first payload field.
 const CSP_RECORD_HEADER_SIZE: usize = 22;
-/// Payload bytes of a tile record; the remainder of the stride is padding.
+/// Payload bytes of a tile record. Header plus payload is exactly
+/// [`CSP_RECORD_STRIDE`], so records follow each other without padding.
 const CSP_RECORD_PAYLOAD_SIZE: usize = 36;
-/// Distance between two records belonging to the same level.
-const CSP_RECORD_STRIDE: usize = 58;
+/// Distance between two consecutive records.
+const CSP_RECORD_STRIDE: usize = CSP_RECORD_HEADER_SIZE + CSP_RECORD_PAYLOAD_SIZE;
 /// Field offsets inside a CSP tile record.
 const CSP_FIELD_TILE_WIDTH: usize = 0;
 const CSP_FIELD_TILE_HEIGHT: usize = 4;
@@ -44,7 +50,8 @@ const CSP_FIELD_TILE_X: usize = 24;
 const CSP_FIELD_TILE_Y: usize = 28;
 /// Tile edge length of the CSP level grid.
 const CSP_TILE_SIZE: u32 = 256;
-/// Tail metadata items that carry the micrometres-per-pixel and objective.
+/// Tail metadata items that carry the micrometres-per-pixel and objective,
+/// addressed as `(group, item)` in the tail's item table.
 const CSP_ITEM_MPP: (u16, u16) = (4, 10);
 const CSP_ITEM_APP_MAG: (u16, u16) = (4, 9);
 /// Records scanned for associated images, i.e. the number of items in a record.
@@ -73,7 +80,6 @@ const KFB_EMBEDDED_DATA_OFFSET: usize = KFB_EMBEDDED_HEADER_SIZE
 /// Fixed gaps inside a KFB tile entry.
 const KFB_TILE_LEADING_RESERVED_SIZE: usize = 4;
 const KFB_TILE_MID_RESERVED_SIZE: usize = 8;
-const KFB_TILE_OFFSET_SIZE: usize = 8;
 const KFB_TILE_TAIL_SIZE: usize = 20;
 /// Magic of the BKIO container used by `.mdsx`, `.msdx` and `.mdss`.
 const MDSX_MAGIC: &[u8] = b"BKIO";
@@ -172,7 +178,8 @@ fn read_csp_sections(path: &Path, file_size: u64) -> Result<CspSections> {
         .windows(CSP_JPEG_STREAM_MARKER.len())
         .position(|window| window == CSP_JPEG_STREAM_MARKER)
         .context("could not locate CSP JPEG stream start")? as u64;
-    let tail_start = u64_at(&header, CSP_TAIL_OFFSET_FIELD).context("CSP header is too small")?;
+    let tail_start = le_at::<u64>(&header, CSP_TAIL_OFFSET_FIELD, "CSP header")
+        .context("CSP header is too small")?;
     if tail_start == 0 || tail_start >= file_size {
         bail!("invalid CSP tail offset");
     }
@@ -257,14 +264,23 @@ fn read_csp_level(
         if record + CSP_RECORD_PAYLOAD_SIZE > tail.len() {
             bail!("truncated CSP tile record");
         }
-        let tile_width = u32_at(tail, record + CSP_FIELD_TILE_WIDTH)?;
-        let tile_height = u32_at(tail, record + CSP_FIELD_TILE_HEIGHT)?;
+        let tile_width = le_at::<u32>(tail, record + CSP_FIELD_TILE_WIDTH, "CSP tile record")?;
+        let tile_height = le_at::<u32>(tail, record + CSP_FIELD_TILE_HEIGHT, "CSP tile record")?;
         let data = ByteRange {
-            offset: stream_start + u64::from(u32_at(tail, record + CSP_FIELD_DATA_OFFSET)?),
-            length: u64::from(u32_at(tail, record + CSP_FIELD_DATA_LENGTH)?),
+            offset: stream_start
+                + u64::from(le_at::<u32>(
+                    tail,
+                    record + CSP_FIELD_DATA_OFFSET,
+                    "CSP tile record",
+                )?),
+            length: u64::from(le_at::<u32>(
+                tail,
+                record + CSP_FIELD_DATA_LENGTH,
+                "CSP tile record",
+            )?),
         };
-        let x = u32_at(tail, record + CSP_FIELD_TILE_X)?;
-        let y = u32_at(tail, record + CSP_FIELD_TILE_Y)?;
+        let x = le_at::<u32>(tail, record + CSP_FIELD_TILE_X, "CSP tile record")?;
+        let y = le_at::<u32>(tail, record + CSP_FIELD_TILE_Y, "CSP tile record")?;
         data.validate(file_size, "CSP tile")?;
         entries.entry((x, y)).or_insert(data);
         width = width.max(x.checked_add(tile_width).context("CSP width overflow")?);
@@ -405,7 +421,11 @@ fn parse_kfb(path: &Path) -> Result<Slide> {
     let header = read_kfb_header(&mut reader)?;
     let mut levels = build_kfb_levels(&header);
     read_kfb_tiles(&mut reader, &header, &mut levels, file_size)?;
-    assign_kfb_tile_groups(&mut levels, header.tile_size);
+    assign_tile_groups(
+        &mut levels,
+        header.tile_size as u32,
+        header.tile_size as u32,
+    );
     let associated = read_kfb_associated(&mut reader, &header, file_size)?;
     let thumbnail = if header.preview_offset == 0 {
         None
@@ -537,23 +557,19 @@ fn read_kfb_tiles(
         }
         reader.skip(KFB_TILE_MID_RESERVED_SIZE, "KFB tile reserved")?;
         let length = reader.i32()?;
-        let relative_bytes = reader.bytes(KFB_TILE_OFFSET_SIZE, "KFB tile offset")?;
-        let relative = i64::from_le_bytes(
-            relative_bytes
-                .as_slice()
-                .try_into()
-                .context("truncated KFB tile offset")?,
-        );
+        // Offsets in the tile table are relative to the start of the tile
+        // block, so a negative one points before the file even begins.
+        let relative = reader.i64()?;
         reader.skip(KFB_TILE_TAIL_SIZE, "KFB tile tail")?;
         if length < 0 {
             bail!("invalid KFB tile range");
         }
         let absolute = i128::from(header.tiles_offset) + i128::from(relative);
-        if absolute < 0 || absolute > u64::MAX as i128 {
+        if absolute < 0 || absolute > i128::from(u64::MAX) {
             bail!("invalid KFB tile offset");
         }
         let data = ByteRange {
-            offset: absolute as u64,
+            offset: u64::try_from(absolute).context("KFB tile offset out of range")?,
             length: length as u64,
         };
         data.validate(file_size, "KFB tile")?;
@@ -568,31 +584,6 @@ fn read_kfb_tiles(
         });
     }
     Ok(())
-}
-
-/// Maps each level's sparse placements onto its dense output grid.
-///
-/// A placement may cover several output cells, so every cell collects the list
-/// of tiles that can contribute to it.
-fn assign_kfb_tile_groups(levels: &mut [Level], tile_size: i32) {
-    let tile_size = tile_size as u32;
-    for level in levels {
-        let last_col = level.tile_cols.saturating_sub(1);
-        let last_row = level.tile_rows.saturating_sub(1);
-        level.tile_groups = vec![Vec::new(); (level.tile_cols * level.tile_rows) as usize];
-        for (tile_index, position) in level.tile_positions.iter().enumerate() {
-            let left = (position.x / tile_size).min(last_col);
-            let top = (position.y / tile_size).min(last_row);
-            let right = ((position.x + position.width.saturating_sub(1)) / tile_size).min(last_col);
-            let bottom =
-                ((position.y + position.height.saturating_sub(1)) / tile_size).min(last_row);
-            for row in top..=bottom {
-                for col in left..=right {
-                    level.tile_groups[(row * level.tile_cols + col) as usize].push(tile_index);
-                }
-            }
-        }
-    }
 }
 
 /// Reads the macro and label images referenced by the header offsets.
@@ -801,21 +792,21 @@ fn read_mdsx_metadata(
     property_values: &HashMap<String, String>,
 ) -> Result<(f64, f64, u8)> {
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let info = read_ini(base_dir.join("info.ini"));
-    let meta = read_ini(base_dir.join("meta"));
-    let mpp = first_float([
+    let info = read_ini(&base_dir.join("info.ini"));
+    let meta = read_ini(&base_dir.join("meta"));
+    let mpp = first_parse(&[
         meta.get("property.scale"),
         info.get("info.scale"),
         property_values.get("Scale"),
     ])
     .context("missing MDSX scale")?;
-    let app_mag = first_float([
+    let app_mag = first_parse(&[
         meta.get("property.scanobjective"),
         info.get("info.scanlens"),
         property_values.get("ScanObjective"),
     ])
     .context("missing MDSX objective")?;
-    let jpeg_quality = first_int([
+    let jpeg_quality = first_parse(&[
         meta.get("property.compressquality"),
         property_values.get("CompressQuality"),
     ])
@@ -988,7 +979,12 @@ fn parse_matrix(xml: &str) -> Result<Matrix> {
     Ok(matrix)
 }
 
-fn read_ini(path: PathBuf) -> HashMap<String, String> {
+/// Parses an ini file into `section.key` entries, both lower-cased.
+///
+/// MDSX ships metadata as two optional sidecars plus embedded XML, so a
+/// missing or unreadable file is not an error: the caller falls through to the
+/// next source and only fails if no source has the value.
+fn read_ini(path: &Path) -> HashMap<String, String> {
     let Ok(text) = fs::read_to_string(path) else {
         return HashMap::new();
     };
@@ -1010,44 +1006,26 @@ fn read_ini(path: PathBuf) -> HashMap<String, String> {
     values
 }
 
-fn first_float(values: [Option<&String>; 3]) -> Option<f64> {
-    values
-        .into_iter()
-        .flatten()
-        .find_map(|value| value.parse().ok())
-}
-fn first_int(values: [Option<&String>; 2]) -> Option<i32> {
-    values
-        .into_iter()
-        .flatten()
-        .find_map(|value| value.parse().ok())
+/// First of `values` that parses as `T`.
+///
+/// The same number appears under several keys across the MDSX sources, so the
+/// caller lists them best-first and takes the first usable one.
+fn first_parse<T: FromStr>(values: &[Option<&String>]) -> Option<T> {
+    values.iter().flatten().find_map(|value| value.parse().ok())
 }
 
-fn u32_at(data: &[u8], offset: usize) -> Result<u32> {
-    Ok(u32::from_le_bytes(
-        data.get(offset..offset + 4)
-            .context("truncated binary value")?
-            .try_into()
-            .unwrap(),
-    ))
-}
-fn u64_at(data: &[u8], offset: usize) -> Result<u64> {
-    Ok(u64::from_le_bytes(
-        data.get(offset..offset + 8)
-            .context("truncated binary value")?
-            .try_into()
-            .unwrap(),
-    ))
-}
+/// Every position of `needle` inside `data`.
 fn find_all(data: &[u8], needle: &[u8]) -> Vec<usize> {
-    if needle.is_empty() {
-        return Vec::new();
+    let mut matches = Vec::new();
+    let mut start = 0;
+    while let Some(found) = find_subslice(&data[start..], needle) {
+        start += found;
+        matches.push(start);
+        start += 1;
     }
-    data.windows(needle.len())
-        .enumerate()
-        .filter_map(|(index, window)| (window == needle).then_some(index))
-        .collect()
+    matches
 }
+
 /// First position of `needle` inside `data`.
 fn find_subslice(data: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {

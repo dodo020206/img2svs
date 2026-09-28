@@ -24,6 +24,14 @@ pub const SOI_MARKER: [u8; 2] = [0xff, 0xd8];
 /// End-of-image marker that closes every JPEG stream.
 pub const EOI_MARKER: [u8; 2] = [0xff, 0xd9];
 
+/// Whether `data` opens with [`SOI_MARKER`].
+///
+/// Readers use this to tell a JPEG payload from a PNG or BMP one before
+/// deciding which decoder to hand it to.
+pub fn starts_with_soi(data: &[u8]) -> bool {
+    data.starts_with(&SOI_MARKER)
+}
+
 /// Joins a TIFF `JPEGTables` stream with one strip's abbreviated stream.
 ///
 /// TIFF Compression=7 lets a stripped page keep quantization and Huffman
@@ -36,13 +44,13 @@ pub fn merge_jpeg_tables(tables: &[u8], strip: &[u8]) -> Result<Vec<u8>> {
     if tables.is_empty() {
         return Ok(strip.to_vec());
     }
-    if !tables.starts_with(&SOI_MARKER) {
+    if !starts_with_soi(tables) {
         bail!("TIFF JPEGTables stream does not start with SOI");
     }
     let tables = tables.strip_suffix(&EOI_MARKER).unwrap_or(tables);
     let body = strip.strip_prefix(&SOI_MARKER).unwrap_or(strip);
     let mut merged = Vec::with_capacity(tables.len() + body.len() + 2);
-    merged.extend_from_slice(&tables[..]);
+    merged.extend_from_slice(tables);
     merged.extend_from_slice(body);
     if !merged.ends_with(&EOI_MARKER) {
         merged.extend_from_slice(&EOI_MARKER);
@@ -60,7 +68,7 @@ pub fn merge_jpeg_tables(tables: &[u8], strip: &[u8]) -> Result<Vec<u8>> {
 /// re-encode in one run shares the same tables. Tiles passed through from the
 /// source container keep their own embedded tables and stay full streams.
 pub fn split_jpeg_tables(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-    if !data.starts_with(&SOI_MARKER) {
+    if !starts_with_soi(data) {
         bail!("JPEG stream does not start with SOI");
     }
     let mut tables = Vec::with_capacity(640);
@@ -80,6 +88,7 @@ pub fn split_jpeg_tables(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
             break;
         }
         if marker == 0xd8 || marker == 0xd9 || (0xd0..=0xd7).contains(&marker) {
+            // Standalone markers: name only, no length payload to skip.
             abbreviated.extend_from_slice(&data[cursor..cursor + 2]);
             cursor += 2;
             continue;
@@ -96,10 +105,10 @@ pub fn split_jpeg_tables(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         }
         cursor = end;
     }
-    if !abbreviated.ends_with(&[0xff, 0xd9]) {
+    if !abbreviated.ends_with(&EOI_MARKER) {
         bail!("JPEG stream is missing its entropy data");
     }
-    tables.extend_from_slice(&[0xff, 0xd9]);
+    tables.extend_from_slice(&EOI_MARKER);
     Ok((tables, abbreviated))
 }
 
@@ -234,5 +243,12 @@ mod tests {
         let actual = decode_rgb(&rejoined)?;
         assert_eq!(expected.as_raw(), actual.as_raw());
         Ok(())
+    }
+
+    #[test]
+    fn soi_detection_requires_the_full_marker() {
+        assert!(starts_with_soi(&[0xff, 0xd8, 0xff, 0xe0]));
+        assert!(!starts_with_soi(&[0xff]));
+        assert!(!starts_with_soi(b"\x89PNG"));
     }
 }

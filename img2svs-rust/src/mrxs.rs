@@ -21,6 +21,7 @@
 //! variants are rejected), and tiles missing from the index are filled with
 //! white regardless of `IMAGE_FILL_COLOR_BGR`.
 
+use crate::binary::{le_at, Reader};
 use crate::model::{
     assign_tile_groups, AssociatedImage, ByteRange, Compression, Level, Metadata, Slide,
     SlideSource, Thumbnail, TilePlacement,
@@ -225,15 +226,14 @@ fn ini_i32(ini: &HashMap<String, String>, key: &str) -> Option<i32> {
 /// Locates the "Slide zoom level" hierarchy and reads each level's section.
 fn read_zoom_sections(ini: &HashMap<String, String>) -> Result<Vec<ZoomSection>> {
     let hier_count = ini_u32(ini, "hierarchical.hier_count").context("missing HIER_COUNT")?;
-    let mut zoom_hier = None;
-    for index in 0..hier_count {
-        let name = ini_text(ini, &format!("hierarchical.hier_{index}_name")).unwrap_or_default();
-        if name == "Slide zoom level" {
-            zoom_hier = Some(index);
-            break;
-        }
-    }
-    let hier = zoom_hier.unwrap_or(0);
+    // Falls back to hierarchy 0: a slide without the named hierarchy still
+    // stores its pyramid there.
+    let hier = (0..hier_count)
+        .find(|&index| {
+            ini_text(ini, &format!("hierarchical.hier_{index}_name")).unwrap_or_default()
+                == "Slide zoom level"
+        })
+        .unwrap_or(0);
     let zoom_levels = ini_u32(ini, &format!("hierarchical.hier_{hier}_count"))
         .context("missing zoom level count")?;
     let mut sections = Vec::with_capacity(zoom_levels as usize);
@@ -309,15 +309,6 @@ fn read_index(data_dir: &Path, ini: &HashMap<String, String>, slide_id: &str) ->
     Ok(index)
 }
 
-fn i32_at(data: &[u8], offset: usize) -> Result<i32> {
-    Ok(i32::from_le_bytes(
-        data.get(offset..offset + 4)
-            .context("truncated Index.dat")?
-            .try_into()
-            .unwrap(),
-    ))
-}
-
 /// Finds the record number of a named non-hierarchical value.
 fn nonhier_recordno(
     ini: &HashMap<String, String>,
@@ -347,33 +338,30 @@ fn nonhier_recordno(
 }
 
 /// Follows the pointer chain of a non-hierarchical record to its payload.
-fn read_nonhier_record(
-    index: &[u8],
-    slide_id: &str,
-    recordno: usize,
-) -> Result<Option<(usize, u64, u64)>> {
+fn read_nonhier_record(index: &[u8], slide_id: &str, recordno: usize) -> Result<(usize, u64, u64)> {
     let nonhier_root = INDEX_VERSION.len() + slide_id.len() + 4;
-    let table = i32_at(index, nonhier_root)? as usize;
-    let record_pointer = i32_at(index, table + 4 * recordno)?;
+    let table = le_at::<i32>(index, nonhier_root, "Index.dat")? as usize;
+    let record_pointer = le_at::<i32>(index, table + 4 * recordno, "Index.dat")?;
     if record_pointer < 0 {
         bail!("invalid non-hierarchical record pointer");
     }
     let mut cursor = record_pointer as usize;
-    if i32_at(index, cursor)? != 0 {
+    if le_at::<i32>(index, cursor, "Index.dat")? != 0 {
         bail!("expected 0 value at beginning of data page");
     }
-    cursor = i32_at(index, cursor + 4)? as usize;
-    if i32_at(index, cursor)? < 1 {
+    cursor = le_at::<i32>(index, cursor + 4, "Index.dat")? as usize;
+    if le_at::<i32>(index, cursor, "Index.dat")? < 1 {
         bail!("expected at least one data item");
     }
-    // Skip the "next page" pointer and two reserved zeroes.
-    let position = i32_at(index, cursor + 16)?;
-    let size = i32_at(index, cursor + 20)?;
-    let fileno = i32_at(index, cursor + 24)?;
+    // The data page is four i32 fields - next-page pointer, item count, and
+    // two reserved zeroes - so the payload triple starts 16 bytes in.
+    let position = le_at::<i32>(index, cursor + 16, "Index.dat")?;
+    let size = le_at::<i32>(index, cursor + 20, "Index.dat")?;
+    let fileno = le_at::<i32>(index, cursor + 24, "Index.dat")?;
     if position < 0 || size < 0 || fileno < 0 {
         bail!("invalid non-hierarchical record");
     }
-    Ok(Some((fileno as usize, position as u64, size as u64)))
+    Ok((fileno as usize, position as u64, size as u64))
 }
 
 /// Reads a non-hierarchical record that holds a JPEG image.
@@ -388,9 +376,9 @@ fn read_nonhier_image(
 ) -> Option<(ByteRange, u32, u32)> {
     let recordno = nonhier_recordno(ini, target_name, target_value)?;
     let slide_id = ini_text(ini, "general.slide_id")?;
-    let (fileno, offset, length) = read_nonhier_record(index, &slide_id, recordno)
-        .ok()
-        .flatten()?;
+    // A malformed record is not fatal here: the caller treats a missing
+    // label/macro image as "the container has none".
+    let (fileno, offset, length) = read_nonhier_record(index, &slide_id, recordno).ok()?;
     let file = data_files.get(fileno)?;
     if offset + length > file.length || length == 0 {
         return None;
@@ -466,22 +454,15 @@ fn read_slide_positions(
         (None, Some(recordno)) => (recordno, true),
         (None, None) => return Ok(None),
     };
-    let Some((fileno, offset, length)) = read_nonhier_record(index, &slide_id, recordno)? else {
-        return Ok(None);
-    };
+    let (fileno, offset, length) = read_nonhier_record(index, &slide_id, recordno)?;
     let file = data_files
         .get(fileno)
         .context("invalid position record file")?;
     if offset + length > file.length {
         bail!("position record exceeds its data file");
     }
-    let mut raw = vec![0u8; length as usize];
-    let mut handle = std::fs::File::open(&file.path)?;
-    use std::io::{Seek, SeekFrom};
-    handle.seek(SeekFrom::Start(offset))?;
-    handle
-        .read_exact(&mut raw)
-        .context("read position record")?;
+    let mut reader = Reader::open(&file.path)?;
+    let raw = reader.range(offset, length, "MRXS position record")?;
     let buffer = if compressed {
         let mut decoded = Vec::with_capacity(expected_size as usize);
         flate2::read::ZlibDecoder::new(raw.as_slice())
@@ -498,6 +479,8 @@ fn read_slide_positions(
     let mut positions = Vec::with_capacity(position_count);
     for record in buffer.as_chunks::<POSITION_RECORD_SIZE>().0 {
         let flag = record[0];
+        // Only bit 0 is defined ("this camera has an image"); the rest of the
+        // byte is reserved and must read as zero.
         if flag & 0xfe != 0 {
             bail!("unexpected slide position flag {flag}");
         }
@@ -537,23 +520,38 @@ fn base_dimensions(
     image_divisions: u32,
     section: &ZoomSection,
 ) -> (i64, i64) {
-    let mut width = 0i64;
-    for column in 0..images_across {
-        if column % image_divisions != image_divisions - 1 || column == images_across - 1 {
-            width += i64::from(section.image_width);
-        } else {
-            width += (section.image_width as f64 - section.overlap_x) as i64;
-        }
-    }
-    let mut height = 0i64;
-    for row in 0..images_down {
-        if row % image_divisions != image_divisions - 1 || row == images_down - 1 {
-            height += i64::from(section.image_height);
-        } else {
-            height += (section.image_height as f64 - section.overlap_y) as i64;
-        }
-    }
-    (width, height)
+    (
+        axis_extent(
+            images_across,
+            section.image_width,
+            section.overlap_x,
+            image_divisions,
+        ),
+        axis_extent(
+            images_down,
+            section.image_height,
+            section.overlap_y,
+            image_divisions,
+        ),
+    )
+}
+
+/// Length of one axis of the stitched base image.
+///
+/// Cameras overlap only inside a division; the seam at the end of a division
+/// and the very last camera contribute their full width, so `count - 1`
+/// cameras are shortened by the overlap.
+fn axis_extent(count: u32, image_size: u32, overlap: f64, divisions: u32) -> i64 {
+    (0..count)
+        .map(|index| {
+            let at_division_end = index % divisions == divisions - 1 && index != count - 1;
+            if at_division_end {
+                (image_size as f64 - overlap) as i64
+            } else {
+                i64::from(image_size)
+            }
+        })
+        .sum()
 }
 
 /// Reads one zoom level's page chain from `Index.dat`.
@@ -562,33 +560,33 @@ fn read_hier_records(index: &[u8], slide_id: &str, zoom_level: usize) -> Result<
     // addresses a `(0, page_pointer)` sentinel pair, and the page pointer
     // addresses the first `(page_len, next, records...)` page.
     let hier_root = INDEX_VERSION.len() + slide_id.len();
-    let table = i32_at(index, hier_root)?;
+    let table = le_at::<i32>(index, hier_root, "Index.dat")?;
     if table < 0 {
         bail!("invalid hierarchical root pointer");
     }
-    let level_pointer = i32_at(index, table as usize + 4 * zoom_level)?;
+    let level_pointer = le_at::<i32>(index, table as usize + 4 * zoom_level, "Index.dat")?;
     if level_pointer < 0 {
         bail!("invalid zoom level pointer");
     }
     let mut cursor = level_pointer as usize;
-    if i32_at(index, cursor)? != 0 {
+    if le_at::<i32>(index, cursor, "Index.dat")? != 0 {
         bail!("expected 0 value at beginning of data page");
     }
-    cursor = i32_at(index, cursor + 4)? as usize;
+    cursor = le_at::<i32>(index, cursor + 4, "Index.dat")? as usize;
 
     let mut records = Vec::new();
     loop {
-        let page_len = i32_at(index, cursor)?;
+        let page_len = le_at::<i32>(index, cursor, "Index.dat")?;
         if page_len < 0 {
             bail!("invalid tile page length");
         }
-        let next = i32_at(index, cursor + 4)?;
+        let next = le_at::<i32>(index, cursor + 4, "Index.dat")?;
         for entry in 0..page_len as usize {
             let record = cursor + 8 + entry * HIER_RECORD_SIZE;
-            let image_index = i32_at(index, record)?;
-            let offset = i32_at(index, record + 4)?;
-            let length = i32_at(index, record + 8)?;
-            let fileno = i32_at(index, record + 12)?;
+            let image_index = le_at::<i32>(index, record, "Index.dat")?;
+            let offset = le_at::<i32>(index, record + 4, "Index.dat")?;
+            let length = le_at::<i32>(index, record + 8, "Index.dat")?;
+            let fileno = le_at::<i32>(index, record + 12, "Index.dat")?;
             if image_index < 0 || offset < 0 || length < 0 || fileno < 0 {
                 bail!("invalid tile record");
             }
