@@ -10,6 +10,7 @@
 //! pathology pipelines writes `II` headers, and accepting the byte-swapped
 //! form would double the parsing code for no practical gain.
 
+use crate::binary::LittleEndian;
 use crate::jpeg::{EOI_MARKER, SOI_MARKER};
 use crate::model::{
     AssociatedImage, ByteRange, Compression, Level, Metadata, Slide, Thumbnail, TileLayout,
@@ -273,7 +274,7 @@ fn read_directory(
         entry(tag::TILE_BYTE_COUNTS),
         big,
         file_size,
-        "tile",
+        "TIFF tile",
     )?;
     let strips = pair_ranges(
         file,
@@ -281,7 +282,7 @@ fn read_directory(
         entry(tag::STRIP_BYTE_COUNTS),
         big,
         file_size,
-        "strip",
+        "TIFF strip",
     )?;
 
     let jpeg_tables = match entry(tag::JPEG_TABLES) {
@@ -331,14 +332,39 @@ pub(crate) struct Entry {
 impl Entry {
     /// Size in bytes of a single item of this field type.
     pub(crate) fn item_size(self) -> Option<u64> {
-        match self.kind {
-            1 | 2 | 6 | 7 => Some(1),
-            3 | 8 => Some(2),
-            4 | 9 | 11 => Some(4),
-            5 | 10 | 12 | 16 | 17 | 18 => Some(8),
-            _ => None,
-        }
+        item_size(self.kind)
     }
+}
+
+/// Size in bytes of one item of TIFF field type `kind`.
+///
+/// The numbers are the TIFF 6.0 field types: 1 BYTE, 2 ASCII, 3 SHORT,
+/// 4 LONG, 5 RATIONAL, 6 SBYTE, 7 UNDEFINED, 8 SSHORT, 9 SLONG,
+/// 10 SRATIONAL, 11 FLOAT, 12 DOUBLE, 16 LONG8, 17 SLONG8, 18 IFD8.
+/// SHORT and LONG read as unsigned because every field we use is a count,
+/// an offset or a positive dimension.
+fn item_size(kind: u16) -> Option<u64> {
+    match kind {
+        1 | 2 | 6 | 7 => Some(1),
+        3 | 8 => Some(2),
+        4 | 9 | 11 => Some(4),
+        5 | 10 | 12 | 16 | 17 | 18 => Some(8),
+        _ => None,
+    }
+}
+
+/// Decodes one little-endian item of field type `kind` starting at `start`.
+///
+/// Returns `None` when `kind` is unknown or the item runs past `raw`, which
+/// lets the readers treat a short payload as "no value" instead of failing.
+fn scalar_at(kind: u16, raw: &[u8], start: usize) -> Option<u64> {
+    let bytes = raw.get(start..start + item_size(kind)? as usize)?;
+    Some(match kind {
+        1 | 2 | 6 | 7 => u64::from(*bytes.first()?),
+        3 | 8 => u64::from(u16::from_le_bytes(bytes.try_into().ok()?)),
+        16..=18 => u64::from_le_bytes(bytes.try_into().ok()?),
+        _ => u64::from(u32::from_le_bytes(bytes.try_into().ok()?)),
+    })
 }
 
 /// Reads a field whose values are all scalars, returning the first one.
@@ -352,15 +378,7 @@ pub(crate) fn entry_scalar(file: &mut File, entry: Entry, big: bool) -> Result<u
         .item_size()
         .with_context(|| format!("unsupported TIFF field type {}", entry.kind))?;
     let raw = entry_bytes(file, entry, unit, big)?;
-    if raw.len() < unit as usize {
-        return Ok(0);
-    }
-    Ok(match entry.kind {
-        1 | 2 | 6 | 7 => u64::from(raw[0]),
-        3 | 8 => u64::from(u16::from_le_bytes([raw[0], raw[1]])),
-        16..=18 => u64::from_le_bytes(raw[..8].try_into().unwrap()),
-        _ => u64::from(u32::from_le_bytes(raw[..4].try_into().unwrap())),
-    })
+    Ok(scalar_at(entry.kind, &raw, 0).unwrap_or(0))
 }
 
 /// Reads a RATIONAL field (type 5) as a floating point value.
@@ -423,7 +441,7 @@ pub(crate) fn entry_bytes(file: &mut File, entry: Entry, unit: u64, big: bool) -
 
 /// Reads the parallel offset and byte-count arrays that describe tiles or
 /// strips, pairing them into validated ranges.
-fn pair_ranges(
+pub(crate) fn pair_ranges(
     file: &mut File,
     offsets: Option<Entry>,
     counts: Option<Entry>,
@@ -438,7 +456,7 @@ fn pair_ranges(
     let counts = entry_numbers(file, counts, big)?;
     if offsets.len() != counts.len() {
         bail!(
-            "TIFF {label} arrays disagree: {} offsets, {} byte counts",
+            "{label} arrays disagree: {} offsets, {} byte counts",
             offsets.len(),
             counts.len()
         );
@@ -458,20 +476,13 @@ pub(crate) fn entry_numbers(file: &mut File, entry: Entry, big: bool) -> Result<
     let raw = entry_bytes(file, entry, unit, big)?;
     let mut values = Vec::with_capacity(entry.count as usize);
     for index in 0..usize::try_from(entry.count)? {
-        let start = index * unit as usize;
-        if start + unit as usize > raw.len() {
+        // A payload shorter than the declared count ends the list; the entry
+        // is truncated, and `count` is the only thing telling us how long it
+        // should have been.
+        let Some(value) = scalar_at(entry.kind, &raw, index * unit as usize) else {
             break;
-        }
-        values.push(match entry.kind {
-            1 | 2 | 6 | 7 => u64::from(raw[start]),
-            3 | 8 => u64::from(u16::from_le_bytes(
-                raw[start..start + 2].try_into().unwrap(),
-            )),
-            16..=18 => u64::from_le_bytes(raw[start..start + 8].try_into().unwrap()),
-            _ => u64::from(u32::from_le_bytes(
-                raw[start..start + 4].try_into().unwrap(),
-            )),
-        });
+        };
+        values.push(value);
     }
     Ok(values)
 }
@@ -480,7 +491,7 @@ pub(crate) fn entry_numbers(file: &mut File, entry: Entry, big: bool) -> Result<
 /// "no tile here", which the writer turns into a blank cell.
 fn keep_valid_range(offset: u64, length: u64, file_size: u64) -> ByteRange {
     let range = ByteRange { offset, length };
-    if range.validate(file_size, "TIFF tile").is_ok() {
+    if range.fits(file_size) {
         range
     } else {
         ByteRange::EMPTY
@@ -664,32 +675,37 @@ fn u32_value(value: u64, label: &str) -> Result<u32> {
     u32::try_from(value).with_context(|| format!("{label} does not fit in 32 bits"))
 }
 
+/// Reads a little-endian integer of type `T` at the cursor.
+///
+/// The header is the one place this module reads raw scalars, and every one of
+/// them is little-endian, so the width comes from the type.
+fn read_le<T: LittleEndian>(file: &mut File) -> Result<T> {
+    let mut buffer = [0u8; 8];
+    let width = T::WIDTH;
+    file.read_exact(&mut buffer[..width])?;
+    Ok(T::from_le_bytes(&buffer[..width]))
+}
+
 fn read_u16(file: &mut File) -> Result<u16> {
-    let mut bytes = [0u8; 2];
-    file.read_exact(&mut bytes)?;
-    Ok(u16::from_le_bytes(bytes))
+    read_le(file)
 }
 
 fn read_u32(file: &mut File) -> Result<u32> {
-    let mut bytes = [0u8; 4];
-    file.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
+    read_le(file)
 }
 
 fn read_u64(file: &mut File) -> Result<u64> {
-    let mut bytes = [0u8; 8];
-    file.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
+    read_le(file)
 }
 
 fn read_at_u32(file: &mut File, offset: u64) -> Result<u32> {
     file.seek(SeekFrom::Start(offset))?;
-    read_u32(file)
+    read_le(file)
 }
 
 fn read_at_u64(file: &mut File, offset: u64) -> Result<u64> {
     file.seek(SeekFrom::Start(offset))?;
-    read_u64(file)
+    read_le(file)
 }
 
 #[cfg(test)]

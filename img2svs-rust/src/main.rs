@@ -12,6 +12,7 @@ mod gui;
 mod hevc;
 mod indexed;
 mod jpeg;
+mod loader;
 mod model;
 mod mrxs;
 mod ndpi;
@@ -20,12 +21,13 @@ mod sdpc;
 mod svs;
 mod tiff;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Accepted input formats, shared by both build variants.
+/// Accepted input formats, shared by both build variants. Kept in step with
+/// `loader::SUPPORTED_FORMATS`, which is what actually dispatches on them.
 #[cfg(feature = "gui")]
 const INPUT_HELP: &str =
     "Input .csp/.dmetrix/.kfb/.mdss/.mdsx/.msdx/.mrxs/.ndpi/.sdpc/.dyqx/.svs/.tif/.tiff file. \
@@ -89,28 +91,16 @@ fn run() -> Result<()> {
     let Some(input_arg) = args.input else {
         bail!("no input file given; pass a slide path and see --help");
     };
-    let input = input_arg
-        .canonicalize()
-        .with_context(|| format!("input not found: {}", input_arg.display()))?;
-    let backend = input
-        .extension()
-        .and_then(|v| v.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let slide = match backend.as_str() {
-        "dmetrix" => dmetrix::parse(&input)?,
-        "sdpc" | "dyqx" => sdpc::parse(&input)?,
-        "csp" | "kfb" | "mdss" | "mdsx" | "msdx" => indexed::parse(&input)?,
-        "mrxs" => mrxs::parse(&input)?,
-        "tif" | "tiff" | "svs" => tiff::parse(&input)?,
-        "ndpi" => ndpi::parse(&input)?,
-        other => bail!("unsupported input extension .{other}"),
-    };
+    let slide = loader::open_slide(&input_arg)?;
     report::print_slide(&slide);
     if args.info {
         return Ok(());
     }
-    let output = args.output.unwrap_or_else(|| with_extension(&input, "svs"));
+    // `slide.path` is the canonicalised input, so a default output lands next
+    // to the real file rather than next to whatever path was typed.
+    let output = args
+        .output
+        .unwrap_or_else(|| with_extension(&slide.path, "svs"));
     let quality = validate_quality(args.jpeg_quality.unwrap_or(slide.metadata.jpeg_quality))?;
     let started = Instant::now();
     svs::write_slide(

@@ -183,10 +183,11 @@ fn source_lens(file: &mut File, raw: &RawDirectory, big: bool) -> Result<Option<
 
 /// Reads the slide's micrometres per pixel from the finest level.
 fn physical_resolution(file: &mut File, page: &Page<'_>, context: &LevelContext) -> Option<f64> {
-    let resolution = match page.raw.entry(tag::X_RESOLUTION) {
-        Some(entry) => tiff::entry_rational(file, entry, context.big).ok()?,
-        None => None,
-    };
+    let resolution = page
+        .raw
+        .entry(tag::X_RESOLUTION)
+        .and_then(|entry| tiff::entry_rational(file, entry, context.big).ok())
+        .flatten();
     let unit =
         u16::try_from(coarse_scalar(file, page.raw, tag::RESOLUTION_UNIT, context.big).ok()?)
             .ok()?;
@@ -291,9 +292,12 @@ fn tiled_level(
         );
     }
 
-    let mut tiles = Vec::with_capacity(usize::try_from(expected)?);
-    for unit in 0..expected {
-        let unit = usize::try_from(unit)?;
+    let units = usize::try_from(expected)?;
+    let mut tiles = Vec::with_capacity(units);
+    for unit in 0..units {
+        // Each interval starts right after the previous restart marker, which
+        // is two bytes of `0xff 0xdN`; the first one starts at the entropy
+        // data itself.
         let start = match unit {
             0 => scan.entropy_start,
             _ => scan.restart_offsets[unit - 1] + 2,
@@ -311,21 +315,19 @@ fn tiled_level(
     let tile_width = scan.interval_width();
     let tile_height = scan.mcu_height;
     Ok(Level {
-        index,
         width: page.width,
         height: page.height,
         downsample,
         tile_cols: u32::try_from(columns).context("NDPI level has too many tile columns")?,
         tile_rows: u32::try_from(rows).context("NDPI level has too many tile rows")?,
         tiles,
-        tile_positions: Vec::new(),
-        tile_groups: Vec::new(),
         tiling: TileLayout {
             tile_width,
             tile_height,
             prefix: patched_header(file, strip, scan, tile_width, tile_height)?,
             suffix: EOI_MARKER.to_vec(),
         },
+        ..Level::new(index)
     })
 }
 
@@ -535,6 +537,8 @@ fn read_segments(probe: &[u8]) -> Result<Segments> {
         let code = *probe.get(marker_at + 1).context("truncated JPEG segment")?;
         let length_at = marker_at + 2;
         cursor = length_at;
+        // TEM (0x01), SOI (0xd8) and the restart markers (0xd0..0xd7) carry no
+        // length field, so nothing has to be skipped for them.
         if code == 0x01 || code == 0xd8 || (0xd0..=0xd7).contains(&code) {
             continue;
         }
@@ -616,29 +620,14 @@ fn strip_ranges(
     big: bool,
     file_size: u64,
 ) -> Result<Vec<ByteRange>> {
-    let (Some(offsets), Some(counts)) = (
+    tiff::pair_ranges(
+        file,
         raw.entry(tag::STRIP_OFFSETS),
         raw.entry(tag::STRIP_BYTE_COUNTS),
-    ) else {
-        return Ok(Vec::new());
-    };
-    let offsets = tiff::entry_numbers(file, offsets, big)?;
-    let counts = tiff::entry_numbers(file, counts, big)?;
-    if offsets.len() != counts.len() {
-        bail!("NDPI strip offsets and byte counts disagree");
-    }
-    Ok(offsets
-        .into_iter()
-        .zip(counts)
-        .map(|(offset, length)| {
-            let range = ByteRange { offset, length };
-            if range.validate(file_size, "NDPI strip").is_ok() {
-                range
-            } else {
-                ByteRange::EMPTY
-            }
-        })
-        .collect())
+        big,
+        file_size,
+        "NDPI strip",
+    )
 }
 
 /// Reads an unsigned scalar field, defaulting to zero when it is absent.
