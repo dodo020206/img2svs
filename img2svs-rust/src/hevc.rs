@@ -5,8 +5,9 @@
 //! runtime as well as a standalone `FFMPEG_HOME`/`ffmpeg` directory.
 
 use anyhow::{bail, Context, Result};
-use image::{Rgb, RgbImage};
+use image::RgbImage;
 use libloading::Library;
+use std::cell::Cell;
 use std::env;
 use std::ffi::CString;
 use std::fs;
@@ -52,7 +53,10 @@ type FlushBuffers = unsafe extern "C" fn(*mut CodecContext);
 type FrameAlloc = unsafe extern "C" fn() -> *mut FramePrefix;
 type FrameFree = unsafe extern "C" fn(*mut *mut FramePrefix);
 type FrameUnref = unsafe extern "C" fn(*mut FramePrefix);
-type SwsGetContext = unsafe extern "C" fn(
+/// `sws_getCachedContext` — reuses the previous context when the geometry and
+/// pixel format are unchanged, which is the common case for SDPC tiles.
+type SwsGetCachedContext = unsafe extern "C" fn(
+    *mut SwsContext,
     c_int,
     c_int,
     c_int,
@@ -101,10 +105,18 @@ pub struct Decoder {
     frame_alloc: FrameAlloc,
     frame_free: FrameFree,
     frame_unref: FrameUnref,
-    sws_get_context: SwsGetContext,
+    sws_get_cached_context: SwsGetCachedContext,
     sws_scale: SwsScale,
     sws_free_context: SwsFreeContext,
     codec_context: *mut CodecContext,
+    /// Reused across tiles; released only when the decoder is dropped.
+    ///
+    /// Behind a `Cell` so the pointer can be refreshed while `DecodeBuffers`
+    /// still holds a shared borrow of the decoder.
+    sws_context: Cell<*mut SwsContext>,
+    /// RGB scratch buffer reused across tiles so `sws_scale` writes into
+    /// already-committed memory instead of a freshly zeroed allocation.
+    rgb_scratch: Cell<Vec<u8>>,
 }
 
 /// Owns the FFmpeg packet and frame used by one [`Decoder::decode`] call.
@@ -184,13 +196,15 @@ impl Decoder {
                 frame_alloc: load(&avutil, b"av_frame_alloc\0")?,
                 frame_free: load(&avutil, b"av_frame_free\0")?,
                 frame_unref: load(&avutil, b"av_frame_unref\0")?,
-                sws_get_context: load(&swscale, b"sws_getContext\0")?,
+                sws_get_cached_context: load(&swscale, b"sws_getCachedContext\0")?,
                 sws_scale: load(&swscale, b"sws_scale\0")?,
                 sws_free_context: load(&swscale, b"sws_freeContext\0")?,
                 _avutil: avutil,
                 _avcodec: avcodec,
                 _swscale: swscale,
                 codec_context: ptr::null_mut(),
+                sws_context: Cell::new(ptr::null_mut()),
+                rgb_scratch: Cell::new(Vec::new()),
             };
             let name = CString::new("hevc")?;
             let codec = (decoder.find_decoder)(name.as_ptr());
@@ -217,6 +231,7 @@ impl Decoder {
             bail!("empty HEVC tile");
         }
         let size = c_int::try_from(data.len()).context("HEVC tile exceeds FFmpeg packet size")?;
+        let mut scratch = self.rgb_scratch.take();
         unsafe {
             let buffers = DecodeBuffers::allocate(self)?;
             let raw = (self.av_malloc)(data.len());
@@ -247,15 +262,20 @@ impl Decoder {
             let source_len = usize::try_from(source_width)
                 .and_then(|w| usize::try_from(source_height).map(|h| w * h * 3))
                 .context("HEVC frame is too large")?;
-            let mut source_rgb = vec![0u8; source_len];
+            // Grow-only: a reused buffer keeps its capacity, so the common
+            // case writes into memory that is already committed and mapped.
+            if scratch.len() < source_len {
+                scratch.resize(source_len, 0);
+            }
             let mut dst_data = [
-                source_rgb.as_mut_ptr(),
+                scratch.as_mut_ptr(),
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
             ];
             let dst_linesize = [i32::try_from(source_width * 3)?, 0, 0, 0];
-            let sws = (self.sws_get_context)(
+            let sws = (self.sws_get_cached_context)(
+                self.sws_context.get(),
                 prefix.width,
                 prefix.height,
                 prefix.format,
@@ -269,10 +289,11 @@ impl Decoder {
             );
             if sws.is_null() {
                 bail!(
-                    "sws_getContext failed for HEVC frame format {}",
+                    "sws_getCachedContext failed for HEVC frame format {}",
                     prefix.format
                 );
             }
+            self.sws_context.set(sws);
             let converted = (self.sws_scale)(
                 sws,
                 prefix.data.as_ptr() as *const *const u8,
@@ -282,20 +303,33 @@ impl Decoder {
                 dst_data.as_mut_ptr(),
                 dst_linesize.as_ptr(),
             );
-            (self.sws_free_context)(sws);
             if converted <= 0 {
                 bail!("sws_scale failed for HEVC frame");
             }
-            let source = RgbImage::from_raw(source_width, source_height, source_rgb)
-                .context("invalid RGB frame returned by swscale")?;
-            let mut result = RgbImage::from_pixel(width, height, Rgb([255, 255, 255]));
-            for y in 0..source_height.min(height) {
-                for x in 0..source_width.min(width) {
-                    result.put_pixel(x, y, *source.get_pixel(x, y));
+            // The frame is copied row by row into a white tile; when the frame
+            // already fills the tile this degenerates into a single memcpy.
+            let rows = source_height.min(height);
+            let copy_width = source_width.min(width);
+            let pixels = if source_width == width && source_height == height {
+                scratch[..source_len].to_vec()
+            } else {
+                let out_len = usize::try_from(width)? * usize::try_from(height)? * 3;
+                let mut padded = vec![0xFFu8; out_len];
+                for y in 0..rows {
+                    let destination = (y * width * 3) as usize;
+                    let origin = (y * source_width * 3) as usize;
+                    let count = (copy_width * 3) as usize;
+                    padded[destination..destination + count]
+                        .copy_from_slice(&scratch[origin..origin + count]);
                 }
-            }
+                padded
+            };
+            let image = RgbImage::from_raw(width, height, pixels)
+                .context("invalid RGB frame returned by swscale")?;
             (self.flush_buffers)(self.codec_context);
-            Ok(result)
+            drop(buffers);
+            self.rgb_scratch.set(scratch);
+            Ok(image)
         }
     }
 }
@@ -307,6 +341,11 @@ impl Drop for Decoder {
                 let mut context = self.codec_context;
                 (self.free_context)(&mut context);
                 self.codec_context = ptr::null_mut();
+            }
+            let sws = self.sws_context.get();
+            if !sws.is_null() {
+                (self.sws_free_context)(sws);
+                self.sws_context.set(ptr::null_mut());
             }
         }
     }
