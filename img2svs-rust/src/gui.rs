@@ -1132,8 +1132,8 @@ impl SvsGui {
                         .color(theme::TEXT_SECONDARY),
                 );
                 ui.add_space(2.0);
-                for (_, label) in SUPPORTED_FORMATS {
-                    chip(ui, *label, theme::TEXT_SECONDARY, theme::SUNKEN);
+                for label in loader::supported_labels() {
+                    chip(ui, label, theme::TEXT_SECONDARY, theme::SUNKEN);
                 }
             });
         });

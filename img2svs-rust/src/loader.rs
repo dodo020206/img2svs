@@ -37,6 +37,21 @@ pub fn supported_extensions() -> Vec<&'static str> {
         .collect()
 }
 
+/// Distinct labels in [`SUPPORTED_FORMATS`], for the GUI's format strip.
+///
+/// A label names the reader rather than the file name, so several extensions
+/// may share one - `.tif` and `.tiff` are the same format to a user. The strip
+/// lists readers, so those rows collapse into a single chip.
+pub fn supported_labels() -> Vec<&'static str> {
+    let mut labels: Vec<&'static str> = Vec::new();
+    for (_, label) in SUPPORTED_FORMATS {
+        if !labels.contains(label) {
+            labels.push(*label);
+        }
+    }
+    labels
+}
+
 /// Resolves `path` and parses it with the reader for its extension.
 ///
 /// The canonicalised path ends up in [`Slide::path`], which is what the writer
@@ -85,5 +100,19 @@ mod tests {
         let unique: HashSet<&str> = extensions.iter().copied().collect();
         assert_eq!(unique.len(), extensions.len());
         assert_eq!(extensions.len(), 13);
+    }
+
+    #[test]
+    fn format_labels_are_listed_once_each() {
+        // The strip lists readers, so `.tif` and `.tiff` must collapse into one
+        // `TIF/TIFF` chip instead of repeating.
+        let labels = supported_labels();
+        let unique: HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(unique.len(), labels.len());
+        assert_eq!(labels.len(), 12);
+        assert_eq!(
+            labels.iter().filter(|label| **label == "TIF/TIFF").count(),
+            1
+        );
     }
 }
