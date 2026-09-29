@@ -77,6 +77,10 @@ function Copy-RuntimeDirectory {
 cargo fmt --all -- --check
 cargo build --release
 
+# Cargo names the executable after the crate, so a local build is always
+# img2svs-rust.exe whatever the feature set. The distributed names
+# (img2svs-gui.exe / img2svs-cli.exe) are applied by
+# scripts\package_windows.ps1 and by the CI workflow when they copy it out.
 $binary = Join-Path $projectRoot "target\release\img2svs-rust.exe"
 $releaseRoot = Join-Path $projectRoot "target\release"
 

@@ -10,8 +10,8 @@
     Every input format is decoded by this repository, so the only native runtime
     a package needs is FFmpeg, and only for HEVC-compressed SDPC/DYQX sources:
 
-      dist\PathologySVSConverter-rust-gui\   img2svs-rust.exe + av.libs\
-      dist\PathologySVSConverter-rust-cli\   img2svs-cli.exe  + av.libs\
+      dist\PathologySVSConverter-rust-gui\   img2svs-gui.exe + av.libs\
+      dist\PathologySVSConverter-rust-cli\   img2svs-cli.exe + av.libs\
 
     Both directories are zipped and accompanied by a SHA256 checksum.
 
@@ -85,9 +85,11 @@ if (-not $ffmpeg) {
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
 # Each variant is built in turn and copied out immediately, because both share
-# the same target\release\img2svs-rust.exe path.
+# the same target\release\img2svs-rust.exe path. `Executable` is the name the
+# file is *renamed to* inside its package: cargo always emits img2svs-rust.exe
+# (the crate name), and only the packaged copies carry the gui/cli names.
 $variants = @(
-    @{ Name = "PathologySVSConverter-rust-gui"; Executable = "img2svs-rust.exe"; Arguments = @() },
+    @{ Name = "PathologySVSConverter-rust-gui"; Executable = "img2svs-gui.exe"; Arguments = @() },
     @{ Name = "PathologySVSConverter-rust-cli"; Executable = "img2svs-cli.exe"; Arguments = @("--no-default-features") }
 )
 
