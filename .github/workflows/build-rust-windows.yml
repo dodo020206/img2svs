@@ -81,7 +81,11 @@ jobs:
           $runtimeRoot = Join-Path $env:RUNNER_TEMP "img2svs-runtimes"
           New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 
-          Copy-Item -LiteralPath "img2svs-rust\target\release\img2svs-rust.exe" -Destination $packageRoot
+          # Cargo always emits img2svs-rust.exe (the crate name); the packaged
+          # copy is renamed so the GUI and console executables can be told apart
+          # by file name, the same way scripts\package_windows.ps1 does it.
+          Copy-Item -LiteralPath "img2svs-rust\target\release\img2svs-rust.exe" `
+            -Destination (Join-Path $packageRoot "img2svs-gui.exe")
           Copy-Item -LiteralPath "img2svs-rust\README.md" -Destination $packageRoot
 
           # Same acquisition path the local developer workflow uses, so the
@@ -105,7 +109,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $packageRoot = Join-Path $env:GITHUB_WORKSPACE "dist\PathologySVSConverter-rust"
-          $executable = Join-Path $packageRoot "img2svs-rust.exe"
+          $executable = Join-Path $packageRoot "img2svs-gui.exe"
           # GitHub-hosted Windows runners do not provide an interactive desktop,
           # so validate process startup through clap before exercising the real
           # packaged conversion below.
